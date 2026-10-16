@@ -376,6 +376,24 @@ const pool = computed(() => {
   });
 });
 
+/* ---------- 待排课程展开浮层（非模态可拖动；内含搜索与教师筛选） ---------- */
+const poolPanelVisible = ref(false);
+const panelKeyword = ref('');
+const panelTeacherId = ref('');
+/** 面板课程列表 = 当前待排池 + 面板内筛选（关键字匹配课程名；教师下拉筛选） */
+const panelPool = computed(() =>
+  pool.value.filter(c => {
+    if (panelKeyword.value && !(c.courseName ?? '').toLowerCase().includes(panelKeyword.value.trim().toLowerCase())) return false;
+    if (panelTeacherId.value && String(c.teacherId ?? '') !== panelTeacherId.value) return false;
+    return true;
+  })
+);
+function openPoolPanel() {
+  panelKeyword.value = '';
+  panelTeacherId.value = '';
+  poolPanelVisible.value = true;
+}
+
 const draggingCourse = ref<CourseBrief | null>(null);
 /** 正在拖动的**已有课次**（表内移动 C-19 / 互换 C-20） */
 const draggingCell = ref<ScheduleCell | null>(null);
@@ -824,7 +842,7 @@ const detailVisible = ref(false);
 const detailCell = ref<ScheduleCell | null>(null);
 const detailPeriod = computed(() => PERIODS.find(p => p.seq === detailCell.value?.periodNo));
 /** 详情弹窗里的可编辑项（C-19：只改教室与备注，上课时间不动） */
-const editForm = reactive({ classroomId: '', remark: '', clazzName: '' });
+const editForm = reactive({ classroomId: '', remark: '', clazzName: '', teacherId: '', major: '' });
 /** 全部班级名（基础数据班级列表）：详情弹窗「班级」下拉数据源 */
 const clazzNameList = ref<string[]>([]);
 /**
@@ -844,14 +862,38 @@ const detailDirty = computed(() => {
   const c = detailCell.value;
   if (!c) return false;
   const cur = c.classroomId === undefined || c.classroomId === null ? '' : String(c.classroomId);
-  return editForm.classroomId !== cur || editForm.remark !== (c.note ?? '') || editForm.clazzName !== (c.clazzName ?? '');
+  const curT = c.teacherId === undefined || c.teacherId === null ? '' : String(c.teacherId);
+  return (
+    editForm.classroomId !== cur ||
+    editForm.remark !== (c.note ?? '') ||
+    editForm.clazzName !== (c.clazzName ?? '') ||
+    editForm.teacherId !== curT
+  );
 });
+
+/** 详情弹窗班级选项：按选中专业过滤（专业来自班级主表映射或班级名前缀推断）；未选专业=全部 */
+const filteredClassOptions = computed(() => {
+  if (!editForm.major) return classListOptions.value;
+  return classListOptions.value.filter(n => clazzMajorMap.value[n] === editForm.major || majorOf(n) === editForm.major);
+});
+/** 切换专业后，已选班级若不属于新专业则清空 */
+watch(
+  () => editForm.major,
+  () => {
+    if (editForm.clazzName && editForm.major && !filteredClassOptions.value.includes(editForm.clazzName)) {
+      editForm.clazzName = '';
+    }
+  }
+);
 
 function openDetail(cell: ScheduleCell) {
   detailCell.value = cell;
   editForm.classroomId = cell.classroomId === undefined || cell.classroomId === null ? '' : String(cell.classroomId);
   editForm.remark = cell.note ?? '';
   editForm.clazzName = cell.clazzName ?? '';
+  editForm.teacherId = cell.teacherId === undefined || cell.teacherId === null ? '' : String(cell.teacherId);
+  // 联动初值：优先班级主表映射，映射不到按班级名前缀推断
+  editForm.major = (cell.clazzName && clazzMajorMap.value[cell.clazzName]) || (cell.clazzName ? majorOf(cell.clazzName) : '') || '';
   detailVisible.value = true;
 }
 
@@ -878,7 +920,8 @@ async function saveDetail() {
       periodNo: period.seq,
       classroomId: editForm.classroomId ? Number(editForm.classroomId) : undefined,
       remark: editForm.remark,
-      targetClass: editForm.clazzName.trim()
+      targetClass: editForm.clazzName.trim(),
+      teacherId: editForm.teacherId ? Number(editForm.teacherId) : undefined
     });
     if (res?.conflict) {
       ElMessage.warning(`调整未保存：${res.conflictMsg || '该时段教师或教室已被占用'}`);
@@ -1184,6 +1227,9 @@ watch(
       <span class="card-title"><ZkIcon name="list-checks" :size="16" />待排课程</span>
       <span class="small muted">共 {{ pool.length }} 门未排入本周课表 —— 拖到下方课表格子完成排课</span>
       <span class="spacer" style="flex: 1"></span>
+      <button class="btn btn-outline btn-sm" title="展开全部待排课程（可搜索筛选、可拖动）" @click="openPoolPanel">
+        <ZkIcon name="eye" :size="13" style="margin-right: 4px" />展开
+      </button>
       <button class="btn btn-outline btn-sm" @click="openCreate(null, null)">
         <ZkIcon name="plus" :size="13" style="margin-right: 4px" />添加课程
       </button>
@@ -1375,6 +1421,19 @@ watch(
       <div class="detail-row"><span class="detail-k">课程</span><span>{{ detailCell.courseName || '—' }}</span></div>
       <div class="detail-row"><span class="detail-k">课程码</span><span>{{ detailCell.courseCode || '—' }}</span></div>
       <div class="detail-row">
+        <span class="detail-k">专业</span>
+        <el-select
+          v-model="editForm.major"
+          placeholder="全部专业（可先选专业再选班级）"
+          clearable
+          filterable
+          size="small"
+          style="flex: 1; min-width: 0"
+        >
+          <el-option v-for="m in majorNames" :key="m" :label="m" :value="m" />
+        </el-select>
+      </div>
+      <div class="detail-row">
         <span class="detail-k">班级</span>
         <el-select
           v-model="editForm.clazzName"
@@ -1386,10 +1445,21 @@ watch(
           size="small"
           style="flex: 1; min-width: 0"
         >
-          <el-option v-for="n in classListOptions" :key="n" :label="n" :value="n" />
+          <el-option v-for="n in filteredClassOptions" :key="n" :label="n" :value="n" />
         </el-select>
       </div>
-      <div class="detail-row"><span class="detail-k">教师</span><span>{{ detailCell.teacherName || '—' }}</span></div>
+      <div class="detail-row">
+        <span class="detail-k">教师</span>
+        <el-select
+          v-model="editForm.teacherId"
+          placeholder="未指定教师"
+          filterable
+          size="small"
+          style="flex: 1; min-width: 0"
+        >
+          <el-option v-for="o in teacherList" :key="o.value" :label="o.label" :value="o.value" />
+        </el-select>
+      </div>
       <div class="detail-row">
         <span class="detail-k">教室</span>
         <el-select
@@ -1473,6 +1543,54 @@ watch(
     <template #footer>
       <el-button @click="choiceVisible = false">取消（什么都不改）</el-button>
     </template>
+  </el-dialog>
+
+  <!-- 待排课程展开浮层：非模态 + 可拖动，方便与课表对照着拖课排课 -->
+  <el-dialog
+    v-model="poolPanelVisible"
+    title="全部待排课程"
+    width="640px"
+    :modal="false"
+    draggable
+    append-to-body
+  >
+    <div class="panel-tools">
+      <el-input v-model="panelKeyword" placeholder="搜索课程名" clearable size="small" style="flex: 1">
+        <template #prefix><ZkIcon name="search" :size="13" /></template>
+      </el-input>
+      <el-select v-model="panelTeacherId" placeholder="全部教师" clearable filterable size="small" style="width: 150px">
+        <el-option v-for="o in teacherOptions" :key="o.value" :label="o.label" :value="o.value" />
+      </el-select>
+      <span class="small muted" style="white-space: nowrap">共 {{ panelPool.length }} 门</span>
+    </div>
+    <div class="panel-list">
+      <div
+        v-for="c in panelPool"
+        :key="c.courseId"
+        class="panel-card"
+        draggable="true"
+        :title="`拖到课表格子完成排课：${c.courseName}`"
+        @dragstart="onDragStart(c, $event)"
+        @dragend="onDragEnd"
+      >
+        <ZkIcon name="grip-vertical" :size="13" class="grip" />
+        <div class="panel-info">
+          <b>{{ c.courseName }}</b>
+          <span class="small muted">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
+        </div>
+        <button
+          class="btn btn-outline btn-sm"
+          @click="openCreate(null, null, { courseId: String(c.courseId) }); poolPanelVisible = false"
+        >排课</button>
+      </div>
+      <div v-if="!panelPool.length" class="pool-empty">
+        <ZkIcon name="check" :size="14" />没有匹配的待排课程
+      </div>
+    </div>
+    <p class="move-hint" style="margin-top: 10px">
+      <ZkIcon name="move" :size="14" />
+      <span>把课程<b>拖到课表的空格子</b>即可排课；也可以点「排课」按钮手动选时间。</span>
+    </p>
   </el-dialog>
 
   <!-- 新增课次（C-17 真接口，带冲突检查） -->
@@ -1747,6 +1865,9 @@ watch(
   gap: 2px;
   cursor: grab;
   transition: 0.12s;
+  /* ★ 叠牌态卡片是固定高度（deckGeom），课程名/班级名变长换行会把内容顶出卡片、
+     连带超出浅灰格子 —— 内容一律单行省略 + 卡片裁边，双保险 */
+  overflow: hidden;
 }
 /* 同一个节次格里的第 2、3… 节课 */
 .cblock + .cblock {
@@ -1880,6 +2001,9 @@ watch(
 }
 .cblock b {
   font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .cblock .who {
   display: flex;
@@ -1887,6 +2011,11 @@ watch(
   gap: 4px;
   font-size: 11px;
   opacity: 0.85;
+  /* 单行省略：班级/教师名过长时不换行撑高卡片（叠牌态高度固定） */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .c-ok {
   background: var(--brand-100);
@@ -2102,8 +2231,14 @@ watch(
 }
 .pool-list {
   display: flex;
-  flex-wrap: wrap;
+  /* ★ 单排横向滑动：课程多时不再折行撑高卡片，超出的左右滑动浏览；
+     全部浏览/筛选请点「展开」按钮打开浮层 */
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
   gap: 8px;
+  padding-bottom: 4px;
+  scrollbar-width: thin;
 }
 .pool-chip {
   display: inline-flex;
@@ -2118,10 +2253,51 @@ watch(
   cursor: grab;
   user-select: none;
   transition: 0.12s;
+  white-space: nowrap;
+  flex: none;
 }
 .pool-chip:hover {
   transform: translateY(-1px);
   box-shadow: var(--sh-1);
+}
+/* ---- 待排课程展开浮层 ---- */
+.panel-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 56vh;
+  overflow-y: auto;
+}
+.panel-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--brand-300);
+  background: var(--brand-100);
+  border-radius: 8px;
+  cursor: grab;
+  transition: 0.12s;
+}
+.panel-card:hover {
+  box-shadow: var(--sh-1);
+}
+.panel-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.panel-info b {
+  font-size: 13px;
+  color: var(--brand-800);
 }
 .pool-chip:active {
   cursor: grabbing;

@@ -300,6 +300,8 @@ export interface ScheduleUpdateBo {
   remark?: string;
   /** 上课班级（schedule.target_class）：null/缺省=不改，空串=清空 */
   targetClass?: string;
+  /** 授课教师：null/缺省=沿用原教师 */
+  teacherId?: number;
 }
 
 /**
