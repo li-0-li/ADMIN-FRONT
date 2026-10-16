@@ -1917,6 +1917,10 @@ watch(
      66px 静态兜底；节数多时模板内联 style 按 deckGeom 压缩露边/卡高，
      整叠永远 ≤ 68px ⇒ 压在格内 */
   height: 66px;
+  /* ★ min-height 必须归零：基础 .cblock { min-height:68px } 会压过内联 height，
+     压缩形同虚设（实测卡高恒 68）——节数 ≥4 时整叠必然冲出浅灰格（17:55 实测）。
+     折叠态 .who 行已隐藏，只剩标题行，压到 44px 也能看清课程名 */
+  min-height: 0;
   padding: 3px 8px;
   overflow: hidden;
 }
