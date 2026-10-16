@@ -422,14 +422,19 @@ function toggleCellExpand(weekday: number, periodNo: number) {
 function isCollapsedCell(weekday: number, periodNo: number, count: number) {
   return count > 1 && !isCellExpanded(weekday, periodNo);
 }
-/** 折叠叠牌几何：浅灰格内容区只有 88px（td 98 − 上下 padding 5×2）。
- * 顶卡最多 84px；节数多时顶卡按 88 − 3×(n−1) 压矮，保证整叠永远不出格子。 */
-const CELL_CONTENT_H = 88;
-const CARD_MAX_H = 84;
-const REVEAL_PX = 3;
+/** 折叠叠牌几何：浅灰格 td.cell 高 78px（全局 border-box）− 上下 padding 5×2 = 内容区仅 68px
+ *（此前按 88px 计算，顶卡 84px + 露边必然向下冲出格子 —— 就是"折叠课程超出浅灰框"的根因）。
+ * 顶卡最多 66px；节数多时先压缩露边（最少 1px）、露边压不动再压顶卡到 44px 下限，
+ * 保证任意节数整叠永远压在 68px 内容区内。 */
+const CELL_CONTENT_H = 68;
+const CARD_MAX_H = 66;
+const MIN_CARD_H = 44;
+const REVEAL_PX = 2;
 function deckGeom(n: number) {
-  const cardH = Math.max(48, Math.min(CARD_MAX_H, CELL_CONTENT_H - (n - 1) * REVEAL_PX));
-  return { cardH, deckH: cardH + (n - 1) * REVEAL_PX };
+  const step =
+    n > 1 ? Math.max(1, Math.min(REVEAL_PX, Math.floor((CELL_CONTENT_H - MIN_CARD_H) / (n - 1)))) : REVEAL_PX;
+  const cardH = Math.max(MIN_CARD_H, Math.min(CARD_MAX_H, CELL_CONTENT_H - (n - 1) * step));
+  return { cardH, deckH: cardH + (n - 1) * step, step };
 }
 /** 压缩态点击卡片＝展开该格；展开态点击卡片＝打开详情 */
 function onCardClick(s: ScheduleCell, weekday: number, periodNo: number, count: number) {
@@ -1332,7 +1337,7 @@ watch(
                   ]"
                   :style="
                     isCollapsedCell(c.weekday, row.period.seq, c.list.length)
-                      ? { top: idx * 3 + 'px', zIndex: c.list.length - idx, height: deckGeom(c.list.length).cardH + 'px' }
+                      ? { top: idx * deckGeom(c.list.length).step + 'px', zIndex: c.list.length - idx, height: deckGeom(c.list.length).cardH + 'px' }
                       : undefined
                   "
                   draggable="true"
@@ -1545,12 +1550,17 @@ watch(
     </template>
   </el-dialog>
 
-  <!-- 待排课程展开浮层：非模态 + 可拖动，方便与课表对照着拖课排课 -->
+  <!-- 待排课程展开浮层：非模态 + 可拖动，方便与课表对照着拖课排课。
+       ★ modal-penetrable 必须加：EP 的 :modal="false" 仍会渲染一个全屏 fixed 透明层
+        （el-overlay 的 mask=false 分支），把底下课表格子的 dragover/drop 全部拦掉 ——
+        从浮层拖课到课表永远落不下去。加穿透后 overlay 变 pointer-events:none、
+        对话框本体恢复 auto，拖拽/点击都能到达课表 -->
   <el-dialog
     v-model="poolPanelVisible"
     title="全部待排课程"
     width="640px"
     :modal="false"
+    modal-penetrable
     draggable
     append-to-body
   >
@@ -1887,7 +1897,7 @@ watch(
   width: 100%;
 }
 /* 叠牌态：整层绝对定位悬浮在格子内（不占布局流 ⇒ 不改变浅灰格子大小）；
-   卡片全部同位重叠，第 idx 张下移 idx*4px（模板内联 style），
+   卡片全部同位重叠，第 idx 张下移 idx*step px（模板内联 style，step 由 deckGeom 按节数算），
    顶卡显示全部内容，下面每张只露出自己的底边框 —— 一叠纸的效果 */
 .cell-stack.is-collapsed {
   position: absolute;
@@ -1903,10 +1913,10 @@ watch(
   position: absolute;
   left: 0;
   right: 0;
-  /* 必须定高：自然高 87.5px 会顶穿浅灰格（内容区仅 88px）。
-     84px = 4 行内容 72 + 间距 6 + 内边距 6（上下各 3，行距/间距仍与普通卡一致）；
-     84 + 下层露边 3px×(n-1) ≤ 88 ⇒ 整叠永远压在格内 */
-  height: 84px;
+  /* 必须定高：td.cell 78px（border-box）− 上下 padding 5×2 = 内容区仅 68px。
+     66px 静态兜底；节数多时模板内联 style 按 deckGeom 压缩露边/卡高，
+     整叠永远 ≤ 68px ⇒ 压在格内 */
+  height: 66px;
   padding: 3px 8px;
   overflow: hidden;
 }
@@ -1914,7 +1924,7 @@ watch(
 .cell-stack.is-collapsed .cards-deck .cblock:not(:first-child) {
   box-shadow: 0 0 0 1px var(--border);
 }
-/* ★ 折叠卡是绝对定位（top: idx*3px），基础样式里的 .cblock + .cblock { margin-top:4px }
+/* ★ 折叠卡是绝对定位（top: idx*step px），基础样式里的 .cblock + .cblock { margin-top:4px }
    会额外下压 4px ⇒ 下层底缘冲出叠牌容器。折叠态必须归零。 */
 .cell-stack.is-collapsed .cards-deck .cblock + .cblock {
   margin-top: 0;
@@ -2231,14 +2241,30 @@ watch(
 }
 .pool-list {
   display: flex;
-  /* ★ 单排横向滑动：课程多时不再折行撑高卡片，超出的左右滑动浏览；
+  /* ★ 竖向滑动：课程多时折行显示，超出约三行的高度后上下滚动浏览；
+     滚动条自绘成品牌色细条，Windows Chrome 上不会"隐形"。
      全部浏览/筛选请点「展开」按钮打开浮层 */
-  flex-wrap: nowrap;
-  overflow-x: auto;
-  overflow-y: hidden;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  max-height: 112px;
+  overflow-y: auto;
   gap: 8px;
-  padding-bottom: 4px;
-  scrollbar-width: thin;
+  padding-right: 4px;
+  scrollbar-width: auto;
+  scrollbar-color: var(--brand-400, var(--brand-300)) transparent;
+}
+.pool-list::-webkit-scrollbar {
+  width: 8px;
+}
+.pool-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+.pool-list::-webkit-scrollbar-thumb {
+  background: var(--brand-300);
+  border-radius: 4px;
+}
+.pool-list::-webkit-scrollbar-thumb:hover {
+  background: var(--brand-400, var(--brand-300));
 }
 .pool-chip {
   display: inline-flex;
