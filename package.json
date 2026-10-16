@@ -1,0 +1,30 @@
+{
+  "name": "zhike-admin-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "智课平台 · 管理端前端（全新最小工程，Vite + Vue3 + TS）",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "build:check": "vue-tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "axios": "^1.18.1",
+    "element-plus": "^2.14.3",
+    "lucide-vue-next": "^0.577.0",
+    "pinia": "^4.0.2",
+    "vue": "^3.5.40",
+    "vue-router": "^5.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "sass": "^1.102.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.5",
+    "vue-tsc": "^3.3.8"
+  }
+}

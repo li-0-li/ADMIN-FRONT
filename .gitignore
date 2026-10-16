@@ -1,0 +1,25 @@
+# 依赖
+node_modules/
+
+# 本机构建中转（vite build 前把旧 dist 移到这里，规避 Windows 删除护栏）
+.workbuddy-tmp-dist-prev/
+
+# TS 增量构建缓存
+tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# 本地覆盖环境变量（不进仓）
+.env.local
+.env.*.local
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+npm-debug.log*
+
+# 注意：dist/ 是刻意纳入版本管理的（运维直接取产物部署），不要在此忽略。

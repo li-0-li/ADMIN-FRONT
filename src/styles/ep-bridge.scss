@@ -1,0 +1,105 @@
+/* =============================================================================
+   原型 token → Element Plus 变量桥接
+   -----------------------------------------------------------------------------
+   原型 theme.css 已经定义了一整套 :root token（--primary / --brand-* / --ink-*
+   / --border / --r-* 等）。这里只做一件事：把 EP 的变量指到同一批 token 上，
+   让 EP 组件的颜色/圆角/字体跟原型一致，而不用去改原型文件。
+   注意：本文件必须在 element-plus/dist/index.css 与 theme.css 之后加载。
+   ============================================================================= */
+
+:root {
+  /* 主色（原型 --primary = teal-600 #0d9488） */
+  --el-color-primary: var(--primary);
+  --el-color-primary-light-3: var(--brand-400);
+  --el-color-primary-light-5: var(--brand-300);
+  --el-color-primary-light-7: var(--brand-200);
+  --el-color-primary-light-8: var(--brand-100);
+  --el-color-primary-light-9: var(--brand-50);
+  --el-color-primary-dark-2: var(--primary-hover);
+
+  /* 语义色 */
+  --el-color-success: var(--success);
+  --el-color-warning: var(--warning);
+  --el-color-danger: var(--error);
+  --el-color-error: var(--error);
+  --el-color-info: var(--ink-500);
+  --el-color-success-light-9: var(--success-soft);
+  --el-color-warning-light-9: var(--warning-soft);
+  --el-color-danger-light-9: var(--error-soft);
+
+  /* 文本 */
+  --el-text-color-primary: var(--ink-900);
+  --el-text-color-regular: var(--ink-700);
+  --el-text-color-secondary: var(--ink-500);
+  --el-text-color-placeholder: var(--ink-400);
+  --el-text-color-disabled: var(--ink-300);
+
+  /* 边框与背景 */
+  --el-border-color: var(--border);
+  --el-border-color-light: var(--border);
+  --el-border-color-lighter: var(--border);
+  --el-border-color-extra-light: var(--border);
+  --el-border-color-dark: var(--border-strong);
+  --el-border-color-darker: var(--border-strong);
+  --el-bg-color: var(--bg);
+  --el-bg-color-page: var(--bg-subtle);
+  --el-bg-color-overlay: #fff;
+  --el-fill-color-blank: #fff;
+  --el-fill-color-light: var(--bg-soft);
+
+  /* 圆角与字体 */
+  --el-border-radius-base: var(--r-md);
+  --el-border-radius-small: var(--r-sm);
+  --el-border-radius-round: var(--r-full);
+  --el-font-family: var(--font-sans);
+  --el-font-size-base: 14px;
+
+  --el-box-shadow-light: var(--sh-1);
+  --el-box-shadow: var(--sh-2);
+}
+
+/* 表格：对齐原型 .tbl 的观感（浅灰表头 + 细边框 + 行内边距） */
+.el-table {
+  --el-table-border-color: var(--border);
+  --el-table-header-bg-color: var(--bg-subtle);
+  --el-table-header-text-color: var(--ink-500);
+  --el-table-text-color: var(--ink-700);
+  --el-table-row-hover-bg-color: var(--primary-softer);
+  font-size: 14px;
+}
+
+.el-table th.el-table__cell {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* 分页：与原型 .pagination 的观感靠拢 */
+.el-pagination {
+  --el-pagination-font-size: 13px;
+  --el-pagination-button-bg-color: #fff;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* 弹窗 */
+.el-dialog {
+  --el-dialog-border-radius: var(--r-lg);
+}
+
+.el-dialog__header {
+  margin-right: 0;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.el-dialog__title {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+/* 表单标签 */
+.el-form-item__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-700);
+}
