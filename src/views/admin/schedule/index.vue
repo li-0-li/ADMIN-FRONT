@@ -1928,14 +1928,17 @@ watch(
   margin-top: 14px;
   padding: 0 4px;
 }
-/* 周日期范围：课表外、悬在左上角「节次」列正上方 */
+/* 周日期范围：课表外、悬在左上角「节次」列正上方（加亮突出显示） */
 .sched-week {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--ink-600, var(--ink-500, var(--ink-400)));
+  display: inline-block;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--brand-700, var(--brand-600, #15803d));
+  background: var(--brand-100);
+  padding: 4px 14px;
+  border-radius: 8px;
   white-space: nowrap;
   margin-bottom: 6px;
-  padding-left: 4px;
 }
 /* 日期选择器与「本周」按钮高度对齐右侧筛选框（38px）。
    ★ 必须 :deep()：EP date-picker 根元素不带本组件 scoped 属性，
