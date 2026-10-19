@@ -184,19 +184,43 @@ async function submitReview(action: 'approve' | 'reject') {
     ElMessage.warning('驳回必须填写原因');
     return;
   }
+  if (action === 'approve') {
+    // 二次确认：通过后解锁教师备课，明确告知后果
+    try {
+      await ElMessageBox.confirm(
+        `确认课程「${row.courseName}」审核通过？通过后教师即可开始备课。`,
+        '审核通过确认',
+        { type: 'warning', confirmButtonText: '确认通过', cancelButtonText: '再想想' }
+      );
+    } catch {
+      return; // 用户取消
+    }
+  }
   submitting.value = true;
   try {
-    const res = await reviewCertification(row.certId, {
+    await reviewCertification(row.certId, {
       action,
       rejectReason: action === 'reject' ? rejectReason.value.trim() : undefined
     });
     ElMessage.success(
       action === 'approve'
-        ? `已通过：课程「${row.courseName}」，状态 ${res?.status ?? 'approved'}`
+        ? `已通过：课程「${row.courseName}」`
         : `已驳回：课程「${row.courseName}」`
     );
     rejectReason.value = '';
-    await fetchList();
+    /**
+     * 就地更新该行状态：不重查列表 → 不重算排序，行位置保持不动；
+     * 点顶部「刷新」按钮才全量重查（排序生效，已裁决课程沉底）。
+     */
+    const i = rows.value.findIndex((r) => r.certId === row.certId);
+    if (i >= 0) {
+      const wasPending = !isDecided(rows.value[i].certStatus);
+      rows.value[i] = {
+        ...rows.value[i],
+        certStatus: action === 'approve' ? 'approved' : 'rejected'
+      };
+      if (wasPending) pendingTotal.value = Math.max(0, pendingTotal.value - 1);
+    }
     await openReview(row);
   } finally {
     submitting.value = false;
@@ -242,7 +266,11 @@ async function reReject() {
   try {
     await reviewCertification(row.certId, { action: 'reject', rejectReason: reason });
     ElMessage.success(`已重新驳回：课程「${row.courseName}」已退回「认证中」`);
-    await fetchList();
+    // 就地更新（同 submitReview）：不重查列表，行位置不动；点「刷新」才全量重查
+    const i = rows.value.findIndex((r) => r.certId === row.certId);
+    if (i >= 0) {
+      rows.value[i] = { ...rows.value[i], certStatus: 'rejected' };
+    }
     await openReview(row);
   } finally {
     submitting.value = false;
@@ -406,7 +434,7 @@ onMounted(fetchList);
       <div class="row mt8" style="justify-content: flex-end; gap: 10px">
         <button class="btn btn-outline" :disabled="submitting" @click="submitReview('reject')">驳回</button>
         <button class="btn btn-primary" :disabled="submitting" @click="submitReview('approve')">
-          逐项通过并解锁备课
+          审核通过
         </button>
       </div>
     </template>
