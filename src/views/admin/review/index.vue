@@ -47,9 +47,9 @@ const loading = ref(false);
 const rows = ref<CertReviewItem[]>([]);
 const total = ref(0);
 const pendingTotal = ref(0);
-const query = reactive({ page: 1, pageSize: 10, status: '' });
+const query = reactive({ page: 1, pageSize: 10 });
 
-/* ---------------- 自定义合并式分页器（‹ [页码] / N 页 ›，尺寸统一 32px） ---------------- */
+/* ---------------- 自定义合并式分页器（‹ [页码] / N 页 | 跳转 ›，整框四段，高统一 32px） ---------------- */
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / query.pageSize)));
 const pageInput = ref(1);
 watch(
@@ -62,9 +62,6 @@ function goPage(n: number) {
   if (target === query.page) { pageInput.value = target; return; }
   query.page = target;
   fetchList();
-}
-function syncPageInput() {
-  pageInput.value = query.page;
 }
 
 /** 搜索：按课程名 / 教师名。后端 C-13 无关键字参数 ⇒ 全量拉回前端过滤（缺口已登记台账）。 */
@@ -83,34 +80,52 @@ function doSearch() {
   fetchList();
 }
 
+/**
+ * 排序：需要人工审核的课程排最上面。
+ * 优先级：① 待审核且 AI 需人工复核 → ② 其他待审核 → ③ 已裁决（通过/驳回）沉底；
+ * 同组内按提交时间倒序。演示库量级小，配合全量拉回在本地排（后端 C-13 固定按提交时间排序，
+ * 改 ORDER BY 需重打 jar 重启，缺口已登记台账）。
+ */
+const SORT_ORDER: Record<string, number> = { manual: 0, none: 1, pass: 2 };
+function sortRows(list: CertReviewItem[]): CertReviewItem[] {
+  return [...list].sort((a, b) => {
+    const pa = isDecided(a.certStatus) ? 1 : 0;
+    const pb = isDecided(b.certStatus) ? 1 : 0;
+    if (pa !== pb) return pa - pb;
+    if (pa === 0 && a.aiDecision !== b.aiDecision) {
+      return (SORT_ORDER[a.aiDecision] ?? 3) - (SORT_ORDER[b.aiDecision] ?? 3);
+    }
+    return (b.submittedAt ?? '').localeCompare(a.submittedAt ?? '');
+  });
+}
+
 async function fetchList() {
   loading.value = true;
   try {
+    // 全量拉回（演示库量级小）：搜索态按课程名/教师名过滤；列表态按「需人工审核置顶」排序
     const kw = keyword.value.trim();
+    const [all, pending] = await Promise.all([
+      listCertifications({ page: 1, pageSize: 500 }),
+      // 顶部「N 门待审核」计数：后端 status=pending 时只取 status in ('pending','reviewing')
+      listCertifications({ status: 'pending', page: 1, pageSize: 1 })
+    ]);
+    let list = all?.list ?? [];
     if (kw) {
-      // 搜索态：一次拉全量（演示库量级小），前端按课程名/教师名过滤，本地分页失效
-      const all = await listCertifications({ page: 1, pageSize: 500 });
       const k = kw.toLowerCase();
-      const list = (all?.list ?? []).filter(
+      list = list.filter(
         (r) =>
           (r.courseName ?? '').toLowerCase().includes(k) ||
           (r.teacherName ?? '').toLowerCase().includes(k)
       );
-      total.value = list.length;
-      // 搜索结果本地分页：与底部 mini-pager 共用 query.page/pageSize
-      const start = (query.page - 1) * query.pageSize;
-      rows.value = list.slice(start, start + query.pageSize);
       filteredNote.value = `按「${kw}」过滤：${list.length} / ${all?.total ?? 0} 条`;
-      return;
+    } else {
+      filteredNote.value = '';
     }
-    filteredNote.value = '';
-    const [all, pending] = await Promise.all([
-      listCertifications({ page: query.page, pageSize: query.pageSize, status: query.status || undefined }),
-      // 顶部「N 门待审核」计数：后端 status=pending 时只取 status in ('pending','reviewing')
-      listCertifications({ status: 'pending', page: 1, pageSize: 1 })
-    ]);
-    rows.value = all?.list ?? [];
-    total.value = all?.total ?? 0;
+    list = sortRows(list);
+    total.value = list.length;
+    // 本地分页：与底部 mini-pager 共用 query.page/pageSize
+    const start = (query.page - 1) * query.pageSize;
+    rows.value = list.slice(start, start + query.pageSize);
     pendingTotal.value = pending?.total ?? 0;
   } finally {
     loading.value = false;
@@ -283,7 +298,11 @@ onMounted(fetchList);
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="row.certId">
+        <tr
+          v-for="row in rows"
+          :key="row.certId"
+          :class="{ 'row-active': current?.certId === row.certId }"
+        >
           <td style="font-weight: 600; color: var(--ink-900)">{{ row.courseName }}</td>
           <td>{{ row.teacherName || '—' }}</td>
           <td>{{ row.submittedAt || '—' }}</td>
@@ -300,7 +319,7 @@ onMounted(fetchList);
         <tr v-if="!loading && rows.length === 0">
           <td colspan="6">
             <div class="muted small" style="padding: 22px 0; text-align: center">
-              {{ filteredNote ? '无匹配结果，试试其他关键字或清空搜索' : '暂无认证数据（当前演示库 certification 表为空）' }}
+              {{ filteredNote ? '无匹配结果，试试其他关键字或清空搜索' : '暂无认证数据' }}
             </div>
           </td>
         </tr>
@@ -326,7 +345,6 @@ onMounted(fetchList);
           :max="pageCount"
           title="输入页码后按回车跳转"
           @keyup.enter="goPage(pageInput)"
-          @blur="syncPageInput"
         />
         <span class="mp-total">/ {{ pageCount }} 页</span>
         <button class="mp-go" title="跳转到输入的页码" @click="goPage(pageInput)">跳转</button>
@@ -393,7 +411,7 @@ onMounted(fetchList);
       </div>
     </template>
     <!-- 已通过 → 可重新驳回（双重确认）；已驳回 → 只读 -->
-    <div v-else-if="activeCertStatus === 'approved'" class="m-card mt16" style="background: var(--warning-50, #fffbeb); border-color: var(--warning-200, #fde68a)">
+    <div v-else-if="activeCertStatus === 'approved'" class="m-card mt16" style="background: var(--warning-soft); border-color: var(--warning-soft)">
       <div class="row" style="align-items: flex-start">
         <span class="icon-box"><ZkIcon name="alert-triangle" :size="18" /></span>
         <div>
@@ -420,7 +438,7 @@ onMounted(fetchList);
 </template>
 
 <style scoped>
-/* 刷新反馈：图标旋转 + 最近更新时间 */
+/* 刷新反馈：图标旋转 + 「刷新中…」文案切换 + 防连点 */
 .spin-anim {
   animation: su-spin 0.8s linear infinite;
 }
@@ -594,6 +612,14 @@ onMounted(fetchList);
 }
 .link:hover {
   text-decoration: underline;
+}
+
+/* 选中课程高亮：品牌浅底 + 行首左侧色条，与详情卡对应 */
+.tbl tbody tr.row-active td {
+  background: var(--brand-50);
+}
+.tbl tbody tr.row-active td:first-child {
+  box-shadow: inset 3px 0 0 var(--brand-500);
 }
 
 /*
