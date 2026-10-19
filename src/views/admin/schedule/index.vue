@@ -6,7 +6,7 @@ import { createSchedule, deleteSchedule, listCoursePool, listSchedules, moveSche
 import { deleteCourse } from '@/api/admin/courses';
 import { listClasses, listClassrooms, listMajors, listTerms, updateClassroom } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
-import type { Classroom, CourseBrief, ScheduleCell } from '@/types/admin';
+import type { Classroom, CourseBrief, ScheduleCell, ScheduleCreateBo, ScheduleUpdateBo } from '@/types/admin';
 
 /**
  * 节次表（库表 class_period 无查询接口 ⇒ 前端恒定一份）。
@@ -87,11 +87,11 @@ async function load(soft = false) {
     });
     const rows = res?.list ?? [];
     allCells.value = rows.filter(c => !c.deleted);
-    // 软删行 = 本周被放回待排的课次 → 这些课程即使还有别的课次在课表也显示在待排池
-    returnedCourseIds.value = new Set(rows.filter(c => c.deleted).map(c => String(c.courseId)));
+    // 软删行 = 本周被放回待排的课次：每条 = 待排池里的一张签（1 节课 1 签，可拖 1 次）
+    returnedCells.value = rows.filter(c => !!c.deleted);
   } catch {
     allCells.value = [];
-    returnedCourseIds.value = new Set();
+    returnedCells.value = [];
   } finally {
     if (soft) refreshing.value = false;
     else loading.value = false;
@@ -325,7 +325,6 @@ const grid = computed(() =>
     cells: WEEKDAYS.map(d => ({ weekday: d.v, list: cellMap.value[keyOf(d.v, period.seq)] ?? [] }))
   }))
 );
-const conflictCells = computed(() => filtered.value.filter(c => !!c.conflict));
 
 /* ================= 拖动排课 =================
  * 拖动落点与对应操作（都真实落库）：
@@ -349,27 +348,50 @@ const conflictCells = computed(() => filtered.value.filter(c => !!c.conflict));
  */
 const poolCourses = ref<CourseBrief[]>([]);
 
-/** 本周被「放回待排」过的课程 id 集（软删课次的课程）：这些课程即使还有别的课次在课表也显示在池里 */
-const returnedCourseIds = ref(new Set<string>());
+/** 本周被「放回待排」的课次（软删行全集）：每条 = 待排池里的一张签 */
+const returnedCells = ref<ScheduleCell[]>([]);
 
 /** 当前学期 id（loadPickers 拉学期列表时记录）：未选学期（=全部学期）时池子按它判定「已排」 */
 const currentTermId = ref('');
 
+/** 待排池条目：1 条 = 1 节课（放回课次逐条成签）或 1 门本周未排的课程 */
+interface PoolEntry extends CourseBrief {
+  /** 唯一键：lesson-{scheduleId} / course-{courseId} */
+  key: string;
+}
+
 /**
- * 未排课程 = 课程池中「**学期口径内**本周课表里没出现过」或「本周有被放回的课次」的课程；
- * 跟随课程/教师筛选一起收窄。
+ * 待排池（2026-10-18 改版：1 节课 1 张签，每张可拖 1 次）。
  * ★ 口径一（学期）：「已排」判定锁定学期（选中学期；全部学期按当前学期），否则全部学期视图池恒空。
- * ★ 口径二（放回即回池）：拖回一节课 = 那节课待重排 ⇒ 课程立刻回池，不必等全部课次放回
- *   （2026-10-16 按用户要求改的语义；从池里重新排课时后端会消费掉那条软删槽位）。
+ * ★ 口径二（放回即回池，10-16 拍板）：本周每条软删课次 = 1 张签，拖一次后端消费一条
+ *   （防重复排课堆积），签随刷新逐张消失；本周完全未排的课程仍按课程出 1 张签。
  */
-const pool = computed(() => {
+const poolEntries = computed<PoolEntry[]>(() => {
   const scope = filters.termId || currentTermId.value;
   const inScope = scope
     ? allCells.value.filter(c => c.termId !== undefined && c.termId !== null && String(c.termId) === String(scope))
     : allCells.value;
   const used = new Set(inScope.map(c => String(c.courseId)));
-  return poolCourses.value.filter(c => {
-    if (used.has(String(c.courseId)) && !returnedCourseIds.value.has(String(c.courseId))) return false;
+  // courseId -> 本周放回的课次列表
+  const returned = new Map<number, ScheduleCell[]>();
+  for (const r of returnedCells.value) {
+    const list = returned.get(r.courseId);
+    if (list) list.push(r);
+    else returned.set(r.courseId, [r]);
+  }
+  const out: PoolEntry[] = [];
+  for (const c of poolCourses.value) {
+    const rows = returned.get(c.courseId);
+    if (rows?.length) {
+      // 放回即回池：每条放回课次 1 张签（拖一次排回一节）
+      for (const r of rows) {
+        out.push({ ...c, key: `lesson-${r.scheduleId}` });
+      }
+    } else if (!used.has(String(c.courseId))) {
+      out.push({ ...c, key: `course-${c.courseId}` });
+    }
+  }
+  return out.filter(c => {
     if (filters.courseId && String(c.courseId) !== filters.courseId) return false;
     if (filters.teacherId && String(c.teacherId) !== filters.teacherId) return false;
     return true;
@@ -381,8 +403,8 @@ const poolPanelVisible = ref(false);
 const panelKeyword = ref('');
 const panelTeacherId = ref('');
 /** 面板课程列表 = 当前待排池 + 面板内筛选（关键字匹配课程名；教师下拉筛选） */
-const panelPool = computed(() =>
-  pool.value.filter(c => {
+const panelEntries = computed(() =>
+  poolEntries.value.filter(c => {
     if (panelKeyword.value && !(c.courseName ?? '').toLowerCase().includes(panelKeyword.value.trim().toLowerCase())) return false;
     if (panelTeacherId.value && String(c.teacherId ?? '') !== panelTeacherId.value) return false;
     return true;
@@ -422,19 +444,15 @@ function toggleCellExpand(weekday: number, periodNo: number) {
 function isCollapsedCell(weekday: number, periodNo: number, count: number) {
   return count > 1 && !isCellExpanded(weekday, periodNo);
 }
-/** 折叠叠牌几何：浅灰格 td.cell 高 78px（全局 border-box）− 上下 padding 5×2 = 内容区仅 68px
- *（此前按 88px 计算，顶卡 84px + 露边必然向下冲出格子 —— 就是"折叠课程超出浅灰框"的根因）。
- * 顶卡最多 66px；节数多时先压缩露边（最少 1px）、露边压不动再压顶卡到 44px 下限，
- * 保证任意节数整叠永远压在 68px 内容区内。 */
-const CELL_CONTENT_H = 68;
-const CARD_MAX_H = 66;
-const MIN_CARD_H = 44;
-const REVEAL_PX = 2;
+/** 折叠叠牌几何：浅灰格 td.cell 97px（border-box）− 上下 padding 5×2 = 内容区 87px。
+ * 顶卡最多 84px（n≤2 时全高不压缩，即「之前的样子」）；节数多时顶卡按 87 − 3×(n−1) 压矮，
+ * 压到 48px 下限为止，保证整叠永远不出格子。 */
+const CELL_CONTENT_H = 87;
+const CARD_MAX_H = 84;
+const REVEAL_PX = 3;
 function deckGeom(n: number) {
-  const step =
-    n > 1 ? Math.max(1, Math.min(REVEAL_PX, Math.floor((CELL_CONTENT_H - MIN_CARD_H) / (n - 1)))) : REVEAL_PX;
-  const cardH = Math.max(MIN_CARD_H, Math.min(CARD_MAX_H, CELL_CONTENT_H - (n - 1) * step));
-  return { cardH, deckH: cardH + (n - 1) * step, step };
+  const cardH = Math.max(48, Math.min(CARD_MAX_H, CELL_CONTENT_H - (n - 1) * REVEAL_PX));
+  return { cardH, deckH: cardH + (n - 1) * REVEAL_PX };
 }
 /** 压缩态点击卡片＝展开该格；展开态点击卡片＝打开详情 */
 function onCardClick(s: ScheduleCell, weekday: number, periodNo: number, count: number) {
@@ -689,6 +707,41 @@ async function handleDrop(weekday: number, periodNo: number, targetCardId: numbe
   }
 }
 
+/* ---------- 撤回（2026-10-18）：每步写操作落库成功后记一条逆向动作，撤回按钮回退上一步 ---------- */
+/** 撤回条目：move/edit 记原坐标与原教室班级；swap 对称（再换一次即还原）；
+ *  putback 记完整新建参数（原时间原教师原班级）；create 记新建的课次 id（撤回=放回待排） */
+type UndoAction =
+  | { kind: 'move' | 'edit'; scheduleId: number; label: string; prev: ScheduleUpdateBo }
+  | { kind: 'swap'; fromScheduleId: number; toScheduleId: number; label: string }
+  | { kind: 'putback'; label: string; restore: ScheduleCreateBo }
+  | { kind: 'create'; scheduleId: number; label: string };
+const MAX_UNDO = 30;
+const historyStack = ref<UndoAction[]>([]);
+function pushUndo(a: UndoAction) {
+  historyStack.value.push(a);
+  if (historyStack.value.length > MAX_UNDO) historyStack.value.shift();
+}
+/** 撤回按钮 tooltip：显示将被撤回的那步是什么 */
+const undoLabel = computed(() => historyStack.value[historyStack.value.length - 1]?.label ?? '');
+async function undoLast() {
+  const entry = historyStack.value[historyStack.value.length - 1];
+  if (!entry || busy.value) return;
+  busy.value = true;
+  try {
+    if (entry.kind === 'move' || entry.kind === 'edit') await moveSchedule(entry.scheduleId, entry.prev);
+    else if (entry.kind === 'swap') await swapSchedules({ fromScheduleId: entry.fromScheduleId, toScheduleId: entry.toScheduleId });
+    else if (entry.kind === 'putback') await createSchedule(entry.restore);
+    else await deleteSchedule(entry.scheduleId);
+    historyStack.value.pop();
+    ElMessage.success(`已撤回：${entry.label}`);
+  } catch {
+    /* 请求层已弹提示；撤回失败保留记录，可再点重试 */
+  } finally {
+    busy.value = false;
+  }
+  await load(true);
+}
+
 /**
  * 执行移动（C-19，落到空白格）。★ 不做乐观更新：先落库、成功后再刷新视图。
  * 冲突/失败时视图本就未变，避免「看着动了、其实没存」的假象。
@@ -701,6 +754,14 @@ async function doMove(cell: ScheduleCell, weekday: number, periodNo: number) {
   const siblings = (cellMap.value[keyOf(weekday, periodNo)] ?? []).filter(
     s => s.scheduleId !== cell.scheduleId
   );
+  // 撤回快照：原时间坐标（classTime 由 weekday/periodNo 精确重算）
+  const prevPeriod = PERIODS.find(p => p.seq === cell.periodNo);
+  const prev: ScheduleUpdateBo = {
+    classTime: `${dateOf(cell.weekday ?? 1)} ${prevPeriod?.start ?? '08:00'}:00`,
+    durationMin: prevPeriod?.duration ?? 110,
+    weekday: cell.weekday ?? 1,
+    periodNo: cell.periodNo ?? 1
+  };
   busy.value = true;
   try {
     const res = await moveSchedule(cell.scheduleId, {
@@ -715,6 +776,12 @@ async function doMove(cell: ScheduleCell, weekday: number, periodNo: number) {
       );
       return;
     }
+    pushUndo({
+      kind: 'move',
+      scheduleId: cell.scheduleId,
+      label: `移动「${cell.courseName ?? '该课次'}」到${target}`,
+      prev
+    });
     ElMessage.success(
       siblings.length
         ? `已把「${cell.courseName ?? '该课次'}」也排到${target}，与该节原有 ${siblings.length} 节课次同时段`
@@ -752,6 +819,13 @@ async function doSwap(from: ScheduleCell, to: ScheduleCell) {
       );
       return;
     }
+    // 撤回：互换是对称操作，再换一次即还原
+    pushUndo({
+      kind: 'swap',
+      fromScheduleId: from.scheduleId,
+      toScheduleId: to.scheduleId,
+      label: `互换「${fromLabel}」⇄「${toLabel}」`
+    });
     ElMessage.success(`已把「${fromLabel}」与「${toLabel}」互换：${fromSlot} ⇄ ${toSlot}`);
   } catch {
     /* 请求层已弹提示 */
@@ -790,6 +864,23 @@ async function returnToPool(cell: ScheduleCell) {
   returning.value = true;
   try {
     await deleteSchedule(cell.scheduleId);
+    // 撤回快照：按原时间/教师/教室/班级新建一节（后端会消费本条软删槽位）
+    const backPeriod = PERIODS.find(p => p.seq === cell.periodNo);
+    pushUndo({
+      kind: 'putback',
+      label: `放回「${name}」（${slot}）`,
+      restore: {
+        courseId: cell.courseId,
+        // 原课次必有授课教师；极端脏数据缺失时传 0，撤回会被后端拒绝并明确提示
+        teacherId: cell.teacherId ?? 0,
+        classroomId: cell.classroomId,
+        classTime: `${dateOf(cell.weekday ?? 1)} ${backPeriod?.start ?? '08:00'}:00`,
+        durationMin: backPeriod?.duration ?? 110,
+        weekday: cell.weekday ?? 1,
+        periodNo: cell.periodNo ?? 1,
+        targetClass: cell.clazzName || undefined
+      }
+    });
     ElMessage.success(`「${name}」已回到待排课程池，可拖到新时间重新排课`);
     detailVisible.value = false;
     await load(true);
@@ -916,6 +1007,17 @@ async function saveDetail() {
     return;
   }
   const weekday = c.weekday ?? 1;
+  // 撤回快照：保存前的教室/备注/班级/教师原值（detailCell 尚未被写回，c 就是原值）
+  const prevBo: ScheduleUpdateBo = {
+    classTime: `${dateOf(weekday)} ${period.start}:00`,
+    durationMin: period.duration,
+    weekday,
+    periodNo: period.seq,
+    classroomId: c.classroomId ?? undefined,
+    remark: c.note ?? '',
+    targetClass: c.clazzName ?? '',
+    teacherId: c.teacherId ?? undefined
+  };
   detailSaving.value = true;
   try {
     const res = await moveSchedule(c.scheduleId, {
@@ -932,6 +1034,12 @@ async function saveDetail() {
       ElMessage.warning(`调整未保存：${res.conflictMsg || '该时段教师或教室已被占用'}`);
       return;
     }
+    pushUndo({
+      kind: 'edit',
+      scheduleId: c.scheduleId,
+      label: `调整「${c.courseName ?? '该课次'}」的教室/班级/教师`,
+      prev: prevBo
+    });
     ElMessage.success('课次已调整');
     detailVisible.value = false;
   } catch {
@@ -1097,6 +1205,19 @@ async function submitCreate() {
       // 若该格原来已有课（并入式新建），自动展开让多节并存立刻可见
       expandCell(form.weekday, form.periodNo);
       await load(true);
+      // 撤回：定位刚新建的课次（同课程同格取最大 scheduleId；接口若已回传 id 则直接用）
+      const created =
+        allCells.value
+          .filter(x => x.courseId === Number(form.courseId) && x.weekday === form.weekday && x.periodNo === form.periodNo)
+          .sort((a, b) => b.scheduleId - a.scheduleId)[0] ?? null;
+      const newId = res.scheduleId ?? created?.scheduleId;
+      if (newId) {
+        pushUndo({
+          kind: 'create',
+          scheduleId: newId,
+          label: `新增「${courseList.value.find(o => o.value === form.courseId)?.label ?? '课次'}」课次`
+        });
+      }
     }
   } catch {
     /* 已在请求层提示 */
@@ -1164,6 +1285,14 @@ watch(
   <div class="page-head">
     <h1>智能排课</h1>
     <div class="actions">
+      <button
+        class="btn btn-outline"
+        :disabled="!historyStack.length || busy"
+        :title="undoLabel ? `撤回上一步：${undoLabel}` : '暂无可撤回的调整（仅记录本次打开页面后的操作）'"
+        @click="undoLast"
+      >
+        <ZkIcon name="undo-2" :size="16" style="margin-right: 4px" />撤回
+      </button>
       <button class="btn btn-outline" @click="exportCsv">
         <ZkIcon name="download" :size="16" style="margin-right: 4px" />导出课表
       </button>
@@ -1182,11 +1311,14 @@ watch(
           placeholder="选择日期"
           style="width: 140px; height: 38px; --el-component-size: 38px"
           :clearable="false"
+          :editable="false"
           @update:model-value="onDatePick"
         />
         <button class="btn btn-outline" @click="gotoThisWeek">本周</button>
       </div>
-      <el-select v-model="filters.termId" class="f-sel-term" placeholder="全部学期" clearable filterable style="width: 150px">
+      <!-- 学期：不带 clearable —— 有值时悬停会显示叉叉、箭头消失，与其他空筛选框观感不一；
+           且学期是主口径筛选，误清空会整页换数据，只留下拉箭头 -->
+      <el-select v-model="filters.termId" class="f-select" placeholder="全部学期" filterable>
         <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="String(t.termId)" />
       </el-select>
       <!-- 筛选下拉：filterable = 输入关键字搜索选项；clearable = 一键清空该维度 -->
@@ -1210,10 +1342,6 @@ watch(
           <ZkIcon name="list-checks" :size="14" style="margin-right: 4px" />打开
         </button>
       </div>
-      <span class="badge" :class="conflictCells.length ? 'badge-error' : 'badge-neutral'">
-        <ZkIcon v-if="conflictCells.length" name="alert-triangle" :size="12" style="margin-right: 4px" />
-        {{ conflictCells.length ? `${conflictCells.length} 处冲突待调整` : '本周无冲突' }}
-      </span>
     </div>
   </div>
 
@@ -1230,7 +1358,7 @@ watch(
     </span>
     <div class="pool-head">
       <span class="card-title"><ZkIcon name="list-checks" :size="16" />待排课程</span>
-      <span class="small muted">共 {{ pool.length }} 门未排入本周课表 —— 拖到下方课表格子完成排课</span>
+      <span class="small muted">共 {{ poolEntries.length }} 条待排（1 条 = 1 节课）—— 拖到下方课表格子完成排课</span>
       <span class="spacer" style="flex: 1"></span>
       <button class="btn btn-outline btn-sm" title="展开全部待排课程（可搜索筛选、可拖动）" @click="openPoolPanel">
         <ZkIcon name="eye" :size="13" style="margin-right: 4px" />展开
@@ -1245,13 +1373,13 @@ watch(
         <ZkIcon name="move" :size="12" style="margin-right: 4px" />正在拖动：{{ draggingCell.courseName }}
       </span>
     </div>
-    <div v-if="pool.length" class="pool-list">
+    <div v-if="poolEntries.length" class="pool-list">
       <div
-        v-for="c in pool"
-        :key="c.courseId"
+        v-for="c in poolEntries"
+        :key="c.key"
         class="pool-chip"
         draggable="true"
-        :title="`拖动排课，或点击打开新增表单：${c.courseName}`"
+        :title="`拖动排课（${c.key.startsWith('lesson') ? '排回这 1 节' : '新建 1 节课次'}），或点击打开新增表单：${c.courseName}`"
         @dragstart="onDragStart(c, $event)"
         @dragend="onDragEnd"
         @click="openCreate(null, null, { courseId: String(c.courseId) })"
@@ -1337,7 +1465,7 @@ watch(
                   ]"
                   :style="
                     isCollapsedCell(c.weekday, row.period.seq, c.list.length)
-                      ? { top: idx * deckGeom(c.list.length).step + 'px', zIndex: c.list.length - idx, height: deckGeom(c.list.length).cardH + 'px' }
+                      ? { top: idx * 3 + 'px', zIndex: c.list.length - idx, height: deckGeom(c.list.length).cardH + 'px' }
                       : undefined
                   "
                   draggable="true"
@@ -1571,12 +1699,12 @@ watch(
       <el-select v-model="panelTeacherId" placeholder="全部教师" clearable filterable size="small" style="width: 150px">
         <el-option v-for="o in teacherOptions" :key="o.value" :label="o.label" :value="o.value" />
       </el-select>
-      <span class="small muted" style="white-space: nowrap">共 {{ panelPool.length }} 门</span>
+      <span class="small muted" style="white-space: nowrap">共 {{ panelEntries.length }} 条</span>
     </div>
     <div class="panel-list">
       <div
-        v-for="c in panelPool"
-        :key="c.courseId"
+        v-for="c in panelEntries"
+        :key="c.key"
         class="panel-card"
         draggable="true"
         :title="`拖到课表格子完成排课：${c.courseName}`"
@@ -1593,7 +1721,7 @@ watch(
           @click="openCreate(null, null, { courseId: String(c.courseId) }); poolPanelVisible = false"
         >排课</button>
       </div>
-      <div v-if="!panelPool.length" class="pool-empty">
+      <div v-if="!panelEntries.length" class="pool-empty">
         <ZkIcon name="check" :size="14" />没有匹配的待排课程
       </div>
     </div>
@@ -1763,8 +1891,10 @@ watch(
   align-items: center;
   gap: 6px;
 }
-/* 日期选择器与「本周」按钮高度对齐右侧筛选框（38px） */
-.week-nav .el-date-editor {
+/* 日期选择器与「本周」按钮高度对齐右侧筛选框（38px）。
+   ★ 必须 :deep()：EP date-picker 根元素不带本组件 scoped 属性，
+   普通 .week-nav .el-date-editor 选择器匹配不上 */
+.week-nav :deep(.el-date-editor) {
   height: 38px;
 }
 .week-nav :deep(.el-input__inner) {
@@ -1852,10 +1982,18 @@ watch(
 .sched td.cell {
   background: var(--bg-soft);
   border-radius: 8px;
-  height: 78px;
+  /* ★ 97px = 折叠叠牌 84px 顶卡 + 露边 3px + 上下 padding 5×2 —— 给「大卡」留足高度，
+     整叠（87px ≤ 内容区 87px）完整压在浅灰格内。
+     ⚠️ 不能回到 78px：内容区只剩 68px，84px 大卡物理上放不下，
+     行高一旦不被别的内容撑起就向下溢出 14px（10-18 04:00 实测）。
+     行高是表格行的下限，所有行统一 97px，课表观感整齐 */
+  height: 97px;
   vertical-align: top;
   padding: 5px;
   min-width: 140px;
+  /* ★ 空格子的虚线框用绝对定位撑满（见 .c-empty）：
+     定高内容块贴不住格子底 —— 用户看到"虚线框下面离浅灰框很远"就是这么来的 */
+  position: relative;
   /* 压缩叠加态的卡片层用绝对定位悬浮在格子内（不占布局流），
      数学上保证多课格**永远不会撑大**浅灰格子 —— 格子大小只由 78px 与行内其他格决定 */
   position: relative;
@@ -1897,7 +2035,7 @@ watch(
   width: 100%;
 }
 /* 叠牌态：整层绝对定位悬浮在格子内（不占布局流 ⇒ 不改变浅灰格子大小）；
-   卡片全部同位重叠，第 idx 张下移 idx*step px（模板内联 style，step 由 deckGeom 按节数算），
+   卡片全部同位重叠，第 idx 张下移 idx*3px（模板内联 style），
    顶卡显示全部内容，下面每张只露出自己的底边框 —— 一叠纸的效果 */
 .cell-stack.is-collapsed {
   position: absolute;
@@ -1913,13 +2051,11 @@ watch(
   position: absolute;
   left: 0;
   right: 0;
-  /* 必须定高：td.cell 78px（border-box）− 上下 padding 5×2 = 内容区仅 68px。
-     66px 静态兜底；节数多时模板内联 style 按 deckGeom 压缩露边/卡高，
-     整叠永远 ≤ 68px ⇒ 压在格内 */
-  height: 66px;
-  /* ★ min-height 必须归零：基础 .cblock { min-height:68px } 会压过内联 height，
-     压缩形同虚设（实测卡高恒 68）——节数 ≥4 时整叠必然冲出浅灰格（17:55 实测）。
-     折叠态 .who 行已隐藏，只剩标题行，压到 44px 也能看清课程名 */
+  /* 定高兜底 84px（内联 style 会按 deckGeom 覆盖）：td.cell 97px（border-box）− padding 5×2
+     = 内容区 87px，84 + 露边 3px×(n−1) ≤ 87 ⇒ 整叠永远压在格内。
+     ⚠️ 基础 .cblock 的 min-height:68px 会压过更矮的内联卡高（节数 ≥8 时），
+     折叠态 .who 行已隐藏，必须归零 */
+  height: 84px;
   min-height: 0;
   padding: 3px 8px;
   overflow: hidden;
@@ -2082,6 +2218,14 @@ watch(
   min-width: 0;
 }
 .c-empty {
+  /* ★ 绝对定位撑满格子（td.cell 已 position:relative）：上下左右各留 5px 与 padding 对齐，
+     虚线框永远贴住浅灰格四壁，行头把行撑多高它就跟着多高 */
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  right: 5px;
+  bottom: 5px;
+  min-height: 0;
   background: transparent;
   border: 1px dashed var(--border-strong);
   color: var(--ink-400);
@@ -2245,30 +2389,29 @@ watch(
 }
 .pool-list {
   display: flex;
-  /* ★ 竖向滑动：课程多时折行显示，超出约三行的高度后上下滚动浏览；
-     滚动条自绘成品牌色细条，Windows Chrome 上不会"隐形"。
-     全部浏览/筛选请点「展开」按钮打开浮层 */
+  /* ★ 竖向滑动：课程多时折行显示，超出约三行的高度后上下滚动浏览。
+     ⛔ 不能写 scrollbar-width / scrollbar-color 标准属性：Chrome 121+ 一旦设置，
+     ::-webkit-scrollbar 自绘整体失效，回落 Win11 悬浮滚动条 —— 不滚动时完全隐形
+     （10-18「超过四个就看不到」的根因）。删掉后自绘条强制常显 */
   flex-wrap: wrap;
   align-content: flex-start;
-  max-height: 112px;
+  max-height: 132px;
   overflow-y: auto;
   gap: 8px;
   padding-right: 4px;
-  scrollbar-width: auto;
-  scrollbar-color: var(--brand-400, var(--brand-300)) transparent;
 }
 .pool-list::-webkit-scrollbar {
   width: 8px;
 }
 .pool-list::-webkit-scrollbar-track {
-  background: transparent;
+  background: var(--bg-soft);
 }
 .pool-list::-webkit-scrollbar-thumb {
-  background: var(--brand-300);
+  background: var(--brand-400, var(--brand-300));
   border-radius: 4px;
 }
 .pool-list::-webkit-scrollbar-thumb:hover {
-  background: var(--brand-400, var(--brand-300));
+  background: var(--brand-500, var(--brand-400));
 }
 .pool-chip {
   display: inline-flex;
@@ -2303,6 +2446,23 @@ watch(
   gap: 8px;
   max-height: 56vh;
   overflow-y: auto;
+  /* ⛔ 与 .pool-list 同理：不能设 scrollbar-width/color，否则 Chrome 121+ 自绘失效、
+     Win11 悬浮条隐形。自绘常显滚动条与池子条带同款 */
+  padding-right: 4px;
+}
+.panel-list::-webkit-scrollbar {
+  width: 8px;
+}
+.panel-list::-webkit-scrollbar-track {
+  background: var(--bg-soft);
+  border-radius: 4px;
+}
+.panel-list::-webkit-scrollbar-thumb {
+  background: var(--brand-400, var(--brand-300));
+  border-radius: 4px;
+}
+.panel-list::-webkit-scrollbar-thumb:hover {
+  background: var(--brand-500, var(--brand-400));
 }
 .panel-card {
   display: flex;
