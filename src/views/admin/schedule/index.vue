@@ -45,6 +45,16 @@ function mondayOf(d: Date) {
 
 const weekStart = ref(mondayOf(new Date()));
 const weekStartStr = computed(() => fmt(weekStart.value));
+/** 当前显示周的日期范围文案（周一 ~ 周日）：跨年时两端都带年份 */
+const weekRangeLabel = computed(() => {
+  const s = weekStart.value;
+  const e = new Date(s);
+  e.setDate(e.getDate() + 6);
+  if (s.getFullYear() !== e.getFullYear()) {
+    return `${s.getFullYear()}年${s.getMonth() + 1}月${s.getDate()}日 ~ ${e.getFullYear()}年${e.getMonth() + 1}月${e.getDate()}日`;
+  }
+  return `${s.getMonth() + 1}月${s.getDate()}日 ~ ${e.getMonth() + 1}月${e.getDate()}日`;
+});
 const weekEndStr = computed(() => {
   const e = new Date(weekStart.value);
   e.setDate(e.getDate() + 6);
@@ -110,6 +120,14 @@ function onDatePick(v: string | Date | null) {
   if (Number.isNaN(d.getTime())) return;
   const m = mondayOf(d);
   if (fmt(m) === weekStartStr.value) return;
+  weekStart.value = m;
+  load();
+}
+
+/** 翻周：±7 天对齐到相邻一周的周一 */
+function shiftWeek(delta: number) {
+  const m = mondayOf(weekStart.value);
+  m.setDate(m.getDate() + delta);
   weekStart.value = m;
   load();
 }
@@ -1408,6 +1426,8 @@ watch(
         放到<b>同一教师的课次</b>上，只能<b>互换上课时间</b>
       </span>
     </div>
+    <!-- 当前显示周的日期范围（周一 ~ 周日）：课表外、对齐左上角「节次」列 -->
+    <div class="sched-week">{{ weekRangeLabel }}</div>
     <table class="sched">
       <thead>
         <tr>
@@ -1529,6 +1549,16 @@ watch(
         </tr>
       </tbody>
     </table>
+
+    <!-- 翻周条：课表下方居中，上/下一周 -->
+    <div class="week-pager">
+      <button class="btn btn-outline" @click="shiftWeek(-7)">
+        <ZkIcon name="chevron-left" :size="15" style="margin-right: 4px" />上一周
+      </button>
+      <button class="btn btn-outline" @click="shiftWeek(7)">
+        下一周<ZkIcon name="chevron-right" :size="15" style="margin-left: 4px" />
+      </button>
+    </div>
 
     <div class="row mt16" style="gap: 16px; flex-wrap: wrap">
       <span class="row small"><i class="legend-dot ok"></i>正常</span>
@@ -1890,6 +1920,22 @@ watch(
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+/* 翻周条：课表下方两端对齐——上一周贴左、下一周贴右 */
+.week-pager {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 14px;
+  padding: 0 4px;
+}
+/* 周日期范围：课表外、悬在左上角「节次」列正上方 */
+.sched-week {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--ink-600, var(--ink-500, var(--ink-400)));
+  white-space: nowrap;
+  margin-bottom: 6px;
+  padding-left: 4px;
 }
 /* 日期选择器与「本周」按钮高度对齐右侧筛选框（38px）。
    ★ 必须 :deep()：EP date-picker 根元素不带本组件 scoped 属性，
