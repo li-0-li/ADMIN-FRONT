@@ -358,10 +358,57 @@ export interface AnalyticsBucket {
   count: number;
 }
 
+/** 院系及格率行（按任课教师所属院系聚合） */
+export interface AnalyticsDeptPass {
+  deptId: number;
+  deptName: string;
+  /** 该口径下已批改成绩份数 */
+  scoreCount: number;
+  /** 0-100 */
+  passRate: number;
+}
+
+/** 院系下拉选项（有任课教师的部门，供筛选条渲染） */
+export interface AnalyticsDeptOption {
+  deptId: number;
+  deptName: string;
+  courseCount: number;
+}
+
 /** 成绩趋势点（近 8 周） */
 export interface AnalyticsTrendPoint {
   week: string;
   avgScore: number;
+}
+
+/** 教师教学排行行（按批改份数降序） */
+export interface AnalyticsTeacherRank {
+  teacherId: number;
+  teacher: string;
+  dept?: string | null;
+  courseCount: number;
+  scoreCount: number;
+  avgScore: number;
+  passRate: number;
+}
+
+/** 课程及格率排行行（倒数 TOP：薄弱课先冒头） */
+export interface AnalyticsCourseRank {
+  courseId: number;
+  course: string;
+  dept?: string | null;
+  scoreCount: number;
+  avgScore: number;
+  passRate: number;
+}
+
+/** 学期环比（当前学期 vs 上一学期；任一段无数据为 null，前端显示「无对比」） */
+export interface AnalyticsTermCompare {
+  prevSemester: string;
+  curAvg?: number | null;
+  curPass?: number | null;
+  prevAvg?: number | null;
+  prevPass?: number | null;
 }
 
 /** 备课与实验进度明细（教师 × 课程，前端按院系/课程聚合） */
@@ -387,12 +434,17 @@ export interface AnalyticsLiveClass {
 
 /** 预警名单行 */
 export interface AnalyticsAlert {
+  alertId?: number;
   student: string;
   course: string;
   dept: string;
   type: string;
   score: number;
   level: string;
+  /** open 待处理 / closed 已处理（旧包无此字段时按 open 处理） */
+  status?: string;
+  /** 已处理时间，yyyy-MM-dd HH:mm */
+  handledAt?: string | null;
 }
 
 /** 全校学情聚合 VO */
@@ -400,6 +452,16 @@ export interface SchoolAnalyticsVo {
   summary: AnalyticsSummary;
   categories: AnalyticsCategory[];
   distribution: AnalyticsBucket[];
+  /** 院系及格率对比（后端旧包无此字段，置空展示） */
+  deptPassRates?: AnalyticsDeptPass[];
+  /** 院系下拉选项（有任课教师的部门；后端旧包无此字段） */
+  deptOptions?: AnalyticsDeptOption[];
+  /** 教师教学排行（后端旧包无此字段，置空展示） */
+  teacherRankings?: AnalyticsTeacherRank[];
+  /** 课程及格率倒数 TOP（后端旧包无此字段，置空展示） */
+  courseRankings?: AnalyticsCourseRank[];
+  /** 学期环比（选中学期才有；后端旧包无此字段） */
+  termCompare?: AnalyticsTermCompare | null;
   trend: AnalyticsTrendPoint[];
   /** 0-100 */
   experimentRate: number;
@@ -442,4 +504,49 @@ export interface AdminRoleVo {
   menuCount: number;
   /** 内置超级管理员（role_id=1）：禁用配置权限 */
   builtIn: boolean;
+}
+
+/** 账号批量导入结果（B-8 POST /api/v1/admin/users/import 出参） */
+export interface ImportResultVo {
+  created: number;
+  updated: number;
+  skipped: number;
+  failed: number;
+  errors: string[];
+}
+
+/** 账号足迹 · 登录记录项（F-1，sys_logininfor 行） */
+export interface FootprintLoginItem {
+  infoId: number;
+  ipaddr: string;
+  browser: string;
+  os: string;
+  /** 0 成功 / 1 失败 */
+  status: string;
+  msg: string;
+  loginTime: string;
+}
+
+/** 账号足迹 · 操作记录项（F-1，sys_oper_log 行） */
+export interface FootprintOperItem {
+  operId: number;
+  /** 模块标题（如「账号管理」） */
+  title: string;
+  /** 业务类型：0 其它 1 新增 2 修改 3 删除 4 授权 5 导出 6 导入 7 强退 8 生成 9 清空 */
+  businessType: number;
+  requestMethod: string;
+  operIp: string;
+  /** 0 正常 / 1 异常 */
+  status: string;
+  errorMsg: string | null;
+  operTime: string;
+}
+
+/** 账号足迹（F-1 GET /api/v1/admin/users/{userId}/footprint 出参） */
+export interface FootprintVo {
+  userName: string;
+  loginTotal: number;
+  weekOperCount: number;
+  logins: FootprintLoginItem[];
+  opers: FootprintOperItem[];
 }

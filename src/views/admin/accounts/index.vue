@@ -1,20 +1,27 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue';
+import { useRoute } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import type { FormInstance, FormRules } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import {
   createUser,
   deleteUser,
+  downloadImportTemplate,
+  exportUsers,
+  getUserFootprint,
+  importUsers,
   listUsers,
   resetUserPassword,
   updateUser,
   updateUserStatus
 } from '@/api/admin/users';
-import type { AdminUserVo } from '@/types/admin';
+import type { AdminUserVo, FootprintVo, ImportResultVo } from '@/types/admin';
 import { useUserStore } from '@/store/user';
 
 /* ---------------- 词典 ---------------- */
+const route = useRoute();
+
 const ROLE_LABEL: Record<string, string> = {
   admin: '管理员',
   teacher: '教师',
@@ -27,12 +34,13 @@ const ROLE_BADGE: Record<string, string> = {
   student: 'badge-success',
   common: 'badge-neutral'
 };
-/** 角色下拉选项（口径取自演示库实际存在的 roleKey） */
+/** 角色下拉选项（口径取自演示库实际存在的 roleKey；common 来自角色页成员反查入口） */
 const ROLE_OPTIONS = [
   { value: '', label: '全部角色' },
   { value: 'admin', label: '管理员' },
   { value: 'teacher', label: '教师' },
-  { value: 'student', label: '学生' }
+  { value: 'student', label: '学生' },
+  { value: 'common', label: '普通用户' }
 ];
 
 /* ---------------- 列表 ---------------- */
@@ -87,7 +95,24 @@ function clearKeyword() {
   fetchList();
 }
 
-onMounted(fetchList);
+onMounted(() => {
+  // 角色成员反查入口：/admin/accounts?roleKey=teacher（来自角色管理页成员数点击）
+  const v = route.query.roleKey;
+  if (typeof v === 'string') query.roleKey = v;
+  fetchList();
+});
+
+/** 已挂载期间入口参数变化（如角色页再点另一角色）→ 同步筛选 */
+watch(
+  () => route.query.roleKey,
+  (v) => {
+    if (typeof v === 'string' && v !== query.roleKey) {
+      query.roleKey = v;
+      query.page = 1;
+      fetchList();
+    }
+  }
+);
 
 /** 若依字典 sys_normal_disable：'0' 正常/启用，'1' 停用；统一转字符串比较，兼容后端返回数字 */
 const statusLabel = (s: unknown) => (String(s) === '0' ? '启用' : '停用');
@@ -227,6 +252,74 @@ async function submitForm() {
   }
 }
 
+/* ---------------- Excel 导入 / 导出（B-7 / B-8 / B-8a） ---------------- */
+const exporting = ref(false);
+
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function onExport() {
+  exporting.value = true;
+  try {
+    const blob = await exportUsers({ keyword: query.keyword || undefined, roleKey: query.roleKey || undefined });
+    saveBlob(blob, `账号数据_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    ElMessage.success('导出完成（含当前筛选条件）');
+  } catch {
+    /* requestBlob 已提示 */
+  } finally {
+    exporting.value = false;
+  }
+}
+
+const importVisible = ref(false);
+const importing = ref(false);
+const importUpdateSupport = ref(false);
+const importFile = ref<File | null>(null);
+const importResult = ref<ImportResultVo | null>(null);
+
+function openImport() {
+  importFile.value = null;
+  importResult.value = null;
+  importUpdateSupport.value = false;
+  importVisible.value = true;
+}
+
+function onFilePick(e: Event) {
+  const input = e.target as HTMLInputElement;
+  importFile.value = input.files && input.files[0] ? input.files[0] : null;
+}
+
+async function onDownloadTemplate() {
+  const blob = await downloadImportTemplate();
+  saveBlob(blob, '账号导入模板.xlsx');
+}
+
+async function onSubmitImport() {
+  if (!importFile.value) {
+    ElMessage.warning('请先选择 .xlsx 文件');
+    return;
+  }
+  importing.value = true;
+  try {
+    const r = await importUsers(importFile.value, importUpdateSupport.value);
+    importResult.value = r;
+    ElMessage.success(`导入完成：新建 ${r.created}，更新 ${r.updated}，跳过 ${r.skipped}，失败 ${r.failed}`);
+    await fetchList();
+  } catch {
+    /* 已提示 */
+  } finally {
+    importing.value = false;
+  }
+}
+
 /* ---------------- 启停 / 重置密码 / 删除 ---------------- */
 async function toggleStatus(row: AdminUserVo) {
   const next = row.status === '0' ? '1' : '0';
@@ -293,6 +386,35 @@ function openDetail(row: AdminUserVo) {
   detailRow.value = row;
   detailVisible.value = true;
 }
+
+/* ---------------- F-1 账号足迹（登录记录 + 操作记录） ---------------- */
+const fpVisible = ref(false);
+const fpLoading = ref(false);
+const fpTab = ref<'logins' | 'opers'>('logins');
+const fpData = ref<FootprintVo | null>(null);
+
+/** sys_oper_log.business_type → 中文 */
+const BIZ_TYPES: Record<number, string> = {
+  0: '其它', 1: '新增', 2: '修改', 3: '删除', 4: '授权',
+  5: '导出', 6: '导入', 7: '强退', 8: '生成代码', 9: '清空'
+};
+function bizTypeLabel(t: number | undefined) {
+  return t === undefined || t === null ? '其它' : BIZ_TYPES[t] ?? `类型${t}`;
+}
+
+async function openFootprint(row: AdminUserVo) {
+  fpVisible.value = true;
+  fpLoading.value = true;
+  fpTab.value = 'logins';
+  fpData.value = null;
+  try {
+    fpData.value = await getUserFootprint(row.userId);
+  } catch {
+    ElMessage.error('足迹加载失败');
+  } finally {
+    fpLoading.value = false;
+  }
+}
 </script>
 
 <template>
@@ -312,6 +434,12 @@ function openDetail(row: AdminUserVo) {
     <div class="right" style="gap: 10px">
       <el-button type="primary" @click="openCreate">
         <ZkIcon name="plus" :size="15" style="margin-right: 4px" />新增账号
+      </el-button>
+      <el-button @click="openImport">
+        <ZkIcon name="upload" :size="15" style="margin-right: 4px" />导入
+      </el-button>
+      <el-button :loading="exporting" @click="onExport">
+        <ZkIcon name="download" :size="15" style="margin-right: 4px" />导出
       </el-button>
     </div>
     <div class="right">
@@ -371,6 +499,9 @@ function openDetail(row: AdminUserVo) {
         <template #default="{ row }">
           <el-button text size="small" @click="openDetail(row)">
             <ZkIcon name="eye" :size="14" style="margin-right: 3px" />查看
+          </el-button>
+          <el-button text size="small" @click="openFootprint(row)">
+            <ZkIcon name="history" :size="14" style="margin-right: 3px" />足迹
           </el-button>
           <el-button
             text size="small"
@@ -512,9 +643,177 @@ function openDetail(row: AdminUserVo) {
       <el-button @click="detailVisible = false">关闭</el-button>
     </template>
   </el-dialog>
+
+  <!-- 批量导入（B-8） -->
+  <el-dialog v-model="importVisible" title="批量导入账号" width="520px">
+    <div class="stack" style="gap: 12px">
+      <div class="small muted" style="line-height: 1.7">
+        1. 先<a href="javascript:void(0)" style="color: var(--brand-600)" @click="onDownloadTemplate">下载导入模板</a>，
+        按列头填好（登录账号、角色标识必填，角色取值 teacher / student / admin）；<br />
+        2. 新导入的账号一律发默认密码 <b>zk123456</b>，首次登录强制改密，与手工新建口径一致；<br />
+        3. 单次最多 500 行；导入 admin（管理员）角色行需要超级管理员身份。
+      </div>
+      <label class="imp-file" :class="{ active: importFile }">
+        <input type="file" accept=".xlsx,.xls" @change="onFilePick" />
+        <ZkIcon name="upload" :size="18" />
+        <span>{{ importFile ? importFile.name : '点击选择 Excel 文件' }}</span>
+      </label>
+      <div class="row" style="gap: 8px">
+        <el-switch v-model="importUpdateSupport" />
+        <span class="small">账号已存在时执行更新（关闭则跳过该行）</span>
+      </div>
+      <div v-if="importResult" class="imp-result">
+        <div>
+          结果：新建 <b>{{ importResult.created }}</b>，更新 <b>{{ importResult.updated }}</b>，
+          跳过 <b>{{ importResult.skipped }}</b>，失败 <b>{{ importResult.failed }}</b>
+        </div>
+        <ul v-if="importResult.errors.length" class="imp-errors">
+          <li v-for="(e, i) in importResult.errors" :key="i">{{ e }}</li>
+        </ul>
+      </div>
+    </div>
+    <template #footer>
+      <el-button @click="importVisible = false">关闭</el-button>
+      <el-button type="primary" :loading="importing" :disabled="!importFile" @click="onSubmitImport">开始导入</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- F-1 账号足迹抽屉（登录记录 + 操作记录，复用若依自带日志表） -->
+  <el-drawer v-model="fpVisible" size="460px" :with-header="true">
+    <template #header>
+      <div>
+        <div style="font-size: 15px; font-weight: 500">账号足迹 · {{ fpData?.userName || '…' }}</div>
+        <div class="small muted" style="margin-top: 2px">登录与操作历史（数据来自系统日志）</div>
+      </div>
+    </template>
+    <div v-loading="fpLoading">
+      <template v-if="fpData">
+        <div class="fp-metrics">
+          <div class="fp-metric">
+            <span class="k">累计登录</span>
+            <span class="v">{{ fpData.loginTotal }}</span>
+          </div>
+          <div class="fp-metric">
+            <span class="k">近 7 天操作</span>
+            <span class="v">{{ fpData.weekOperCount }}</span>
+          </div>
+        </div>
+        <div class="fp-tabs">
+          <button :class="{ on: fpTab === 'logins' }" @click="fpTab = 'logins'">登录记录</button>
+          <button :class="{ on: fpTab === 'opers' }" @click="fpTab = 'opers'">操作记录</button>
+        </div>
+        <div v-if="fpTab === 'logins'" class="fp-list">
+          <div v-for="it in fpData.logins" :key="it.infoId" class="fp-item">
+            <div class="fp-item-head">
+              <span :class="it.status === '0' ? 'fp-ok' : 'fp-bad'">{{ it.status === '0' ? '登录成功' : '登录失败' }}</span>
+              <span class="fp-time">{{ it.loginTime }}</span>
+            </div>
+            <div class="fp-item-sub">
+              {{ [it.browser, it.os, it.ipaddr].filter(Boolean).join(' · ') || '—' }}
+            </div>
+          </div>
+          <div v-if="!fpData.logins.length" class="small muted" style="padding: 12px 0">暂无登录记录</div>
+        </div>
+        <div v-else class="fp-list">
+          <div v-for="it in fpData.opers" :key="it.operId" class="fp-item">
+            <div class="fp-item-head">
+              <span :class="it.status === '0' ? 'fp-ok' : 'fp-bad'">
+                {{ bizTypeLabel(it.businessType) }} · {{ it.title }}{{ it.status === '0' ? '' : '（失败）' }}
+              </span>
+              <span class="fp-time">{{ it.operTime }}</span>
+            </div>
+            <div class="fp-item-sub">
+              {{ [it.requestMethod, it.operIp].filter(Boolean).join(' · ') }}
+              <span v-if="it.errorMsg" class="fp-bad">{{ it.errorMsg }}</span>
+            </div>
+          </div>
+          <div v-if="!fpData.opers.length" class="small muted" style="padding: 12px 0">暂无操作记录</div>
+        </div>
+      </template>
+    </div>
+  </el-drawer>
 </template>
 
 <style scoped>
+/* F-1 足迹抽屉 */
+.fp-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.fp-metric {
+  background: var(--surface-2, #f6f7f9);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.fp-metric .k {
+  font-size: 12px;
+  color: var(--muted, #8a8f99);
+}
+.fp-metric .v {
+  font-size: 22px;
+  font-weight: 500;
+  line-height: 1.2;
+}
+.fp-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.fp-tabs button {
+  border: 0.5px solid var(--border, #e2e4e9);
+  background: transparent;
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 12px;
+  color: var(--muted, #8a8f99);
+  cursor: pointer;
+}
+.fp-tabs button.on {
+  background: var(--brand-50, #eef4ff);
+  color: var(--brand-600, #2f6bff);
+  border-color: transparent;
+}
+.fp-list {
+  display: flex;
+  flex-direction: column;
+}
+.fp-item {
+  padding: 8px 0 8px 12px;
+  border-left: 2px solid var(--border, #e2e4e9);
+  margin-left: 2px;
+}
+.fp-item + .fp-item {
+  margin-top: 4px;
+}
+.fp-item-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+.fp-time {
+  font-size: 12px;
+  color: var(--muted, #8a8f99);
+  white-space: nowrap;
+}
+.fp-item-sub {
+  font-size: 12px;
+  color: var(--muted, #8a8f99);
+  margin-top: 2px;
+  word-break: break-all;
+}
+.fp-ok {
+  color: var(--success, #22a06b);
+}
+.fp-bad {
+  color: var(--error, #e5484d);
+  margin-left: 6px;
+}
 /* 操作列有 5 个动作，窄列会把按钮挤成两行、撑高行高 —— 强制单行 */
 :deep(.op-col) .cell {
   white-space: nowrap;
@@ -734,5 +1033,42 @@ function openDetail(row: AdminUserVo) {
 }
 .su-btn:hover {
   background: var(--brand-200);
+}
+
+.imp-file {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 18px 12px;
+  border: 1px dashed var(--line-400, #ccc);
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--ink-600, #666);
+  transition: border-color 0.15s;
+}
+.imp-file:hover {
+  border-color: var(--brand-600, #4a7dff);
+}
+.imp-file.active {
+  border-color: var(--brand-600, #4a7dff);
+  color: var(--ink-900, #111);
+}
+.imp-file input {
+  display: none;
+}
+.imp-result {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-100, #f6f7fa);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.imp-errors {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--danger-600, #d54941);
+  max-height: 140px;
+  overflow: auto;
 }
 </style>

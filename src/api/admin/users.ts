@@ -1,5 +1,6 @@
-import { request } from '@/api/request';
-import type { AdminUserVo, PageResult, UserCreateVo, UserQuery, UserSaveBo } from '@/types/admin';
+import { request, requestBlob } from '@/api/request';
+import type { ImportResultVo } from '@/types/admin';
+import type { AdminUserVo, FootprintVo, PageResult, UserCreateVo, UserQuery, UserSaveBo } from '@/types/admin';
 
 const BASE = '/api/v1/admin/users';
 
@@ -34,4 +35,27 @@ export function updateUserStatus(userId: number, status: string) {
 /** 重置密码：返回一次性临时口令 */
 export function resetUserPassword(userId: number) {
   return request<UserCreateVo>({ url: `${BASE}/${userId}/password/reset`, method: 'post' });
+}
+
+/** B-7 导出账号 Excel（按当前筛选；返回文件流） */
+export function exportUsers(query: { keyword?: string; roleKey?: string; status?: string }) {
+  return requestBlob({ url: `${BASE}/export`, method: 'post', data: query });
+}
+
+/** B-8a 下载账号导入模板（返回文件流） */
+export function downloadImportTemplate() {
+  return requestBlob({ url: `${BASE}/import-template`, method: 'get' });
+}
+
+/** B-8 批量导入账号（multipart 上传） */
+export function importUsers(file: File, updateSupport: boolean) {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('updateSupport', String(updateSupport));
+  return request<ImportResultVo>({ url: `${BASE}/import`, method: 'post', data: form });
+}
+
+/** F-1 账号足迹（登录记录 + 操作记录，复用若依自带日志表） */
+export function getUserFootprint(userId: number) {
+  return request<FootprintVo>({ url: `${BASE}/${userId}/footprint`, method: 'get' });
 }

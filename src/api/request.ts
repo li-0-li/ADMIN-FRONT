@@ -68,4 +68,41 @@ export async function request<T = unknown>(config: AxiosRequestConfig): Promise<
   throw new Error(message);
 }
 
+/**
+ * 二进制下载（Excel 导出/模板）：后端直接回文件流（无 JSON 壳），
+ * 所以这里不能走 request 的解包逻辑，直接拿 Blob。
+ * 注意：若后端报业务错（如 403），HTTP 层是 200 + JSON 壳 —— 此时返回的 Blob
+ * 是 JSON 文本，靠 type 判别后抛错。
+ */
+export async function requestBlob(config: AxiosRequestConfig): Promise<Blob> {
+  let res: Awaited<ReturnType<typeof http.request<Blob>>>;
+  try {
+    res = await http.request<Blob>({ ...config, responseType: 'blob' });
+  } catch (error) {
+    const status = (error as { response?: { status?: number } })?.response?.status;
+    if (status === 401) {
+      ElMessage.error('登录已失效，请重新登录');
+      gotoLogin();
+    } else {
+      ElMessage.error((error as Error)?.message ?? '下载失败');
+    }
+    throw error;
+  }
+  const blob = res.data;
+  if (blob instanceof Blob && blob.type.includes('application/json')) {
+    // 业务错误被包成了 JSON：解析并提示
+    const text = await blob.text();
+    try {
+      const body = JSON.parse(text) as { code?: number; message?: string; msg?: string };
+      const message = String(body.message ?? body.msg ?? '下载失败');
+      ElMessage.error(message);
+      throw new Error(message);
+    } catch (e) {
+      if (e instanceof SyntaxError) throw new Error('下载失败');
+      throw e;
+    }
+  }
+  return blob;
+}
+
 export default http;

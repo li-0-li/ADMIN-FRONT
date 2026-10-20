@@ -92,7 +92,11 @@ onMounted(fetchList);
     <el-table v-loading="loading" :data="rows" style="margin-top: 10px">
       <el-table-column label="角色" min-width="140">
         <template #default="{ row }">
-          <div class="role-name">{{ row.roleName }}</div>
+          <div class="role-name">
+            {{ row.roleName }}
+            <!-- 若依基座出厂演示角色（role_id=2），业务上未使用 -->
+            <span v-if="row.roleId === 2" class="badge badge-neutral ry-tag">若依内置</span>
+          </div>
           <div class="small muted">{{ row.roleKey }}</div>
         </template>
       </el-table-column>
@@ -101,8 +105,26 @@ onMounted(fetchList);
           <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="成员数" width="100" align="center" prop="memberCount" />
-      <el-table-column label="已授权限数" width="110" align="center" prop="menuCount" />
+      <el-table-column label="成员数" width="100" align="center">
+        <template #default="{ row }">
+          <!-- 成员反查：点击跳账号管理页并自动按该角色过滤 -->
+          <el-link
+            type="primary"
+            :underline="false"
+            :title="`查看「${row.roleName}」的账号列表`"
+            @click="$router.push({ path: '/admin/accounts', query: { roleKey: row.roleKey } })"
+          >
+            {{ row.memberCount }}
+          </el-link>
+        </template>
+      </el-table-column>
+      <el-table-column label="已授权限数" width="130">
+        <template #default="{ row }">
+          <!-- 超管权力来自代码硬编码 *:*:*，不读授权表：64 只是管理端业务登记数，别误导 -->
+          <span v-if="row.builtIn" class="small muted">全部权限（硬编码）</span>
+          <span v-else>{{ row.menuCount }}</span>
+        </template>
+      </el-table-column>
       <el-table-column label="备注" min-width="220" prop="remark">
         <template #default="{ row }">{{ row.remark || '—' }}</template>
       </el-table-column>
@@ -168,6 +190,10 @@ onMounted(fetchList);
 }
 .perm-code {
   font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+.ry-tag {
+  margin-left: 6px;
   font-size: 11px;
 }
 </style>
