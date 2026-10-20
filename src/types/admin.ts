@@ -240,6 +240,11 @@ export interface ScheduleCell {
    * 保留字段仅为对齐 VO 契约，页面按空值渲染（不显示冲突样式）。
    */
   conflict?: string;
+  /**
+   * 发布状态（C-24 起）：draft=未发布（学生/教师端不可见，卡片带「未发布」标识）、
+   * published=已发布、normal=历史存量（与 published 同义）。
+   */
+  status?: string;
   /** 后端取 schedule.remark */
   note?: string;
 }
@@ -249,6 +254,8 @@ export interface ScheduleQuery {
   startDate: string;
   endDate: string;
   termId?: string | number;
+  /** 院系过滤（course.school_id），空 = 全部 */
+  schoolId?: string | number;
   courseId?: string | number;
   teacherId?: string | number;
   classroomId?: string | number;

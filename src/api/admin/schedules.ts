@@ -107,11 +107,19 @@ export async function deleteSchedule(scheduleId: number) {
   });
 }
 
+/**
+ * C-24 发布课表（整学期口径）：全部未发布（draft）课次一次性置为 published。
+ * ★ 发布后学生/教师端才可见新排课次；已发布课次再改动保持已发布。
+ */
+export async function publishSchedules() {
+  return request<{ published: number }>({ url: `${await schedulePath()}/publish`, method: 'post' });
+}
+
 /** 课程池数据源（拖动排课的「未排课程」来源） */
-export async function listCoursePool() {
+export async function listCoursePool(schoolId?: string | number) {
   return request<PageResult<CourseBrief>>({
     url: await coursePath(),
     method: 'get',
-    params: { page: 1, pageSize: 200 }
+    params: { page: 1, pageSize: 200, schoolId: schoolId || undefined }
   });
 }

@@ -2,9 +2,9 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
-import { createSchedule, deleteSchedule, listCoursePool, listSchedules, moveSchedule, swapSchedules } from '@/api/admin/schedules';
+import { createSchedule, deleteSchedule, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules } from '@/api/admin/schedules';
 import { deleteCourse } from '@/api/admin/courses';
-import { listClasses, listClassrooms, listMajors, listTerms, updateClassroom } from '@/api/admin/basicdata';
+import { listClasses, listClassrooms, listMajors, listSchools, listTerms, updateClassroom } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
 import type { Classroom, CourseBrief, ScheduleCell, ScheduleCreateBo, ScheduleUpdateBo } from '@/types/admin';
 
@@ -72,9 +72,11 @@ const loading = ref(false);
  * 而首次加载 / 切周是**整体替换**，保留阻挡：否则会被人把旧周的课拖到新周日期的格子上。
  */
 const refreshing = ref(false);
-const filters = reactive({ courseId: '', teacherId: '', clazzName: '', classroomId: '', major: '', termId: '' });
+const filters = reactive({ courseId: '', teacherId: '', clazzName: '', classroomId: '', major: '', termId: '', schoolId: '' });
 /** 学期下拉（后端 ScheduleQueryBo 支持 termId 过滤 ⇒ 服务端筛，变化即重查） */
 const terms = ref<{ termId: number; name: string }[]>([]);
+/** 院系列表（基础数据 school 表）：≥2 个才显示院系筛选，单院系无筛选意义 */
+const schools = ref<{ schoolId: number; name: string }[]>([]);
 /** 班级名 → 专业名 映射（schedule.target_class 是冗余字符串、无 clazzId 外键，
  *  专业信息只能借基础数据的班级列表接口按名称映射） */
 const clazzMajorMap = ref<Record<string, string>>({});
@@ -91,6 +93,7 @@ async function load(soft = false) {
       startDate: weekStartStr.value,
       endDate: weekEndStr.value,
       termId: filters.termId || undefined,
+      schoolId: filters.schoolId || undefined,
       page: 1,
       pageSize: PAGE_SIZE,
       includeDeleted: true
@@ -132,27 +135,35 @@ function shiftWeek(delta: number) {
   load();
 }
 
-/* ---------- 下拉选项：从本周数据去重推导（学期字段 VO 未提供 ⇒ 学期下拉只读） ---------- */
-type IdKey = 'courseId' | 'teacherId' | 'classroomId';
-type NameKey = 'courseName' | 'teacherName' | 'roomName';
-function deriveOptions(rows: ScheduleCell[], idKey: IdKey, nameKey: NameKey) {
-  const m = new Map<string, string>();
-  for (const r of rows) {
-    const id = r[idKey];
-    if (id === undefined || id === null) continue;
-    const k = String(id);
-    if (!m.has(k)) m.set(k, String(r[nameKey] ?? k));
-  }
-  return Array.from(m, ([value, label]) => ({ value, label }));
-}
-/** 课程选项：选中专业后只保留**教给该专业班级**的课程（联动收窄）；未选专业 = 全部 */
+/* ---------- 下拉选项：课程/教师/专业/班级 = 主表全量 ∪ 本周课次推导（见各 computed） ---------- */
+/** 课程选项 = **课程主表全量**（courseList，listCoursePool 拉取）∪ 本周课次出现的课程。
+ *  ⛔ 只从课次推导的旧口径：本周没排到的课程在下拉里"消失"——新增的课程尤其如此。
+ *  主表全量保证「全部课程」始终完整；选专业后的收窄只作用于课次推导部分（主表课程无专业关联）。 */
 const courseOptions = computed(() => {
+  const m = new Map<string, string>();
+  const put = (v?: string | number, l?: string) => {
+    if (v === undefined || v === null || v === '') return;
+    const k = String(v);
+    if (!m.has(k)) m.set(k, l || k);
+  };
+  for (const o of courseList.value) put(o.value, o.label);
   const rows = filters.major
     ? allCells.value.filter(r => majorOf(r.clazzName) === filters.major)
     : allCells.value;
-  return deriveOptions(rows, 'courseId', 'courseName');
+  for (const r of rows) put(r.courseId, r.courseName);
+  return Array.from(m, ([value, label]) => ({ value, label }));
 });
-const teacherOptions = computed(() => deriveOptions(allCells.value, 'teacherId', 'teacherName'));
+/** 教师选项 = **教师主表全量**（teacherList，账号接口按 teacher 角色拉取）∪ 本周课次的教师 */
+const teacherOptions = computed(() => {
+  const m = new Map<string, string>();
+  for (const o of teacherList.value) m.set(o.value, o.label);
+  for (const r of allCells.value) {
+    if (r.teacherId === undefined || r.teacherId === null || r.teacherId === 0) continue;
+    const k = String(r.teacherId);
+    if (!m.has(k)) m.set(k, r.teacherName || k);
+  }
+  return Array.from(m, ([value, label]) => ({ value, label }));
+});
 
 /**
  * 教室下拉 = **真数据源**（C-21 `GET /api/v1/admin/classrooms`，随 loadPickers 拉全量）。
@@ -244,17 +255,18 @@ async function saveRoomEdit() {
   }
 }
 
-/** 班级筛选：schedule.target_class 是冗余字符串列（VO 只有 clazzName、无 clazzId）⇒ 按名称去重与过滤。
- *  ⛔ clazzName 为空的课次（「未填班级」）**不生成选项** —— 空字符串选项没有筛选意义，且下拉里出现空白项。 */
+/** 班级筛选：**班级主表全量**（listClasses → clazzNameList）∪ 本周课次出现过的班级名。
+ *  旧口径只从课次推导，课次没登记班级时下拉为空；主表兜底保证「全部班级」始终有完整选项。
+ *  空字符串仍不生成选项（空白项没有筛选意义）。 */
 const clazzOptions = computed(() => {
   const m = new Map<string, string>();
-  for (const r of allCells.value) {
-    const n = r.clazzName;
-    if (!n) continue;
-    // 选中专业后只保留该专业的班级（联动收窄）
-    if (filters.major && majorOf(n) !== filters.major) continue;
-    if (!m.has(n)) m.set(n, n);
-  }
+  const put = (n?: string) => {
+    if (!n || m.has(n)) return;
+    if (filters.major && majorOf(n) !== filters.major) return;
+    m.set(n, n);
+  };
+  for (const n of clazzNameList.value) put(n);
+  for (const r of allCells.value) put(r.clazzName);
   return Array.from(m, ([value, label]) => ({ value, label }));
 });
 /** 切换专业时，已选的班级/课程若不在新专业范围内则自动清空，避免筛出空集 */
@@ -296,13 +308,17 @@ function majorOf(clazzName?: string): string | undefined {
   if (!prefix) return undefined;
   return MAJOR_ABBR[prefix] || majorNames.value.find(n => n.startsWith(prefix)) || prefix;
 }
-/** 专业选项：课次班级推导出的专业去重；「未填班级」不产生选项 */
+/** 专业选项 = **专业主表全量**（listMajors）∪ 本周课次班级推导出的专业。
+ *  ⛔ 只从课次推导的旧口径有致命缺陷：本周课次没登记班级（target_class 空）时下拉直接空——
+ *  「全部专业」本就该列出所有可选专业，与本周有没有对应课无关。 */
 const majorOptions = computed(() => {
   const m = new Map<string, string>();
+  for (const n of majorNames.value) {
+    if (n) m.set(n, n);
+  }
   for (const r of allCells.value) {
     const major = majorOf(r.clazzName);
-    if (!major) continue;
-    if (!m.has(major)) m.set(major, major);
+    if (major && !m.has(major)) m.set(major, major);
   }
   return Array.from(m, ([value, label]) => ({ value, label }));
 });
@@ -428,10 +444,18 @@ const panelEntries = computed(() =>
     return true;
   })
 );
-function openPoolPanel() {
+async function openPoolPanel() {
   panelKeyword.value = '';
   panelTeacherId.value = '';
   poolPanelVisible.value = true;
+  // 待排池/教师/班级强制刷新：别处刚新增的课程、教师、班级立即可见（loadPickers 内部有缓存判定，清空才重拉）
+  courseList.value = [];
+  poolCourses.value = [];
+  teacherList.value = [];
+  clazzNameList.value = [];
+  clazzMajorMap.value = {};
+  majorNames.value = [];
+  await loadPickers();
 }
 
 const draggingCourse = ref<CourseBrief | null>(null);
@@ -1009,6 +1033,12 @@ function openDetail(cell: ScheduleCell) {
   // 联动初值：优先班级主表映射，映射不到按班级名前缀推断
   editForm.major = (cell.clazzName && clazzMajorMap.value[cell.clazzName]) || (cell.clazzName ? majorOf(cell.clazzName) : '') || '';
   detailVisible.value = true;
+  // 教师/班级/专业下拉强制刷新：别处（账号/基础数据）刚新增的立即可选（异步补拉，不阻塞弹窗打开）
+  teacherList.value = [];
+  clazzNameList.value = [];
+  clazzMajorMap.value = {};
+  majorNames.value = [];
+  void loadPickers();
 }
 
 /**
@@ -1085,7 +1115,7 @@ const presetCourseId = ref('');
 async function loadPickers() {
   if (!courseList.value.length) {
     try {
-      const res = await listCoursePool();
+      const res = await listCoursePool(filters.schoolId || undefined);
       poolCourses.value = res?.list ?? [];
       courseList.value = poolCourses.value
         .map(c => ({ value: String(c.courseId), label: c.courseName || String(c.courseId) }))
@@ -1119,6 +1149,16 @@ async function loadPickers() {
       // 记录当前学期：池子「已排」判定在「全部学期」视图下按它收口
       const curTerm = res?.list?.find(t => t.isCurrent === 1) ?? res?.list?.[0];
       currentTermId.value = curTerm?.termId !== undefined ? String(curTerm.termId) : '';
+    } catch {
+      /* 已在请求层提示 */
+    }
+  }
+  if (!schools.value.length) {
+    try {
+      const res = await listSchools({ page: 1, pageSize: 50 });
+      schools.value = (res?.list ?? [])
+        .filter(s => s.schoolId !== undefined)
+        .map(s => ({ schoolId: s.schoolId as number, name: s.name || String(s.schoolId) }));
     } catch {
       /* 已在请求层提示 */
     }
@@ -1163,6 +1203,13 @@ async function openCreate(
   periodNo: number | null,
   preset: { courseId?: string; classroomId?: string } = {}
 ) {
+  // 课程/教师/班级下拉强制刷新：别处（基础数据/审核/账号）刚新增的无需刷新页面即可选到
+  courseList.value = [];
+  poolCourses.value = [];
+  teacherList.value = [];
+  clazzNameList.value = [];
+  clazzMajorMap.value = {};
+  majorNames.value = [];
   await loadPickers();
   form.classroomId = preset.classroomId ?? '';
   form.clazzName = '';
@@ -1194,6 +1241,10 @@ async function submitCreate() {
   }
   if (!form.teacherId) {
     ElMessage.warning('请选择授课教师');
+    return;
+  }
+  if (!form.clazzName.trim()) {
+    ElMessage.warning('请选择上课班级');
     return;
   }
   const period = PERIODS.find(x => x.seq === form.periodNo);
@@ -1248,8 +1299,23 @@ async function submitCreate() {
 function onAuto() {
   ElMessage.info('后端未提供自动排课接口（/schedules/auto 属既定不实现范围），本按钮不发起请求。');
 }
-function onPublish() {
-  ElMessage.info('后端未提供课表发布接口（/schedules/publish 属既定不实现范围），本按钮不发起请求。');
+
+/* ---------- 发布课表（C-24）：draft→published，整学期口径 ----------
+ * ★ 新建课次 = 未发布（学生/教师端不可见，卡片带「未发布」灰标）；
+ *   点发布后其他端才可见。已发布课次再改动保持已发布（2026-10-19 拍板）。 */
+async function onPublish() {
+  try {
+    await ElMessageBox.confirm(
+      '将把全部未发布的课次设为已发布（整学期范围），学生端/教师端即可看到。已发布过的课次不受影响。确定发布？',
+      '发布课表',
+      { confirmButtonText: '发布', cancelButtonText: '取消', type: 'warning' }
+    );
+  } catch {
+    return; // 用户取消
+  }
+  const res = await publishSchedules();
+  ElMessage.success(res.published > 0 ? `已发布 ${res.published} 条课次` : '没有需要发布的课次');
+  await load(true);
 }
 
 /* ---------- 导出：前端本地 CSV ---------- */
@@ -1294,7 +1360,7 @@ onMounted(async () => {
 
 /** 学期切换（服务端过滤）⇒ 重查本周课次 */
 watch(
-  () => filters.termId,
+  () => [filters.termId, filters.schoolId],
   () => load()
 );
 </script>
@@ -1332,12 +1398,22 @@ watch(
           :editable="false"
           @update:model-value="onDatePick"
         />
-        <button class="btn btn-outline" @click="gotoThisWeek">本周</button>
       </div>
       <!-- 学期：不带 clearable —— 有值时悬停会显示叉叉、箭头消失，与其他空筛选框观感不一；
            且学期是主口径筛选，误清空会整页换数据，只留下拉箭头 -->
-      <el-select v-model="filters.termId" class="f-select" placeholder="全部学期" filterable>
+      <el-select v-model="filters.termId" class="f-select" placeholder="全部学期">
         <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="String(t.termId)" />
+      </el-select>
+      <!-- 院系：≥2 个院系才显示（单院系筛选无意义），按课程的 school_id 过滤课表与待排池 -->
+      <el-select
+        v-if="schools.length > 1"
+        v-model="filters.schoolId"
+        class="f-select"
+        placeholder="全部院系"
+        clearable
+        filterable
+      >
+        <el-option v-for="s in schools" :key="s.schoolId" :label="s.name" :value="String(s.schoolId)" />
       </el-select>
       <!-- 筛选下拉：filterable = 输入关键字搜索选项；clearable = 一键清空该维度 -->
       <el-select v-model="filters.major" class="f-select" placeholder="全部专业" clearable filterable>
@@ -1426,8 +1502,19 @@ watch(
         放到<b>同一教师的课次</b>上，只能<b>互换上课时间</b>
       </span>
     </div>
-    <!-- 当前显示周的日期范围（周一 ~ 周日）：课表外、对齐左上角「节次」列 -->
-    <div class="sched-week">{{ weekRangeLabel }}</div>
+    <!-- 翻周条：课表上方——上一周贴左 · 日期范围+本周按钮居中 · 下一周贴右 -->
+    <div class="week-pager">
+      <button class="btn btn-outline" @click="shiftWeek(-7)">
+        <ZkIcon name="chevron-left" :size="15" style="margin-right: 4px" />上一周
+      </button>
+      <div class="week-center">
+        <div class="sched-week">{{ weekRangeLabel }}</div>
+        <button class="btn btn-outline" @click="gotoThisWeek">本周</button>
+      </div>
+      <button class="btn btn-outline" @click="shiftWeek(7)">
+        下一周<ZkIcon name="chevron-right" :size="15" style="margin-left: 4px" />
+      </button>
+    </div>
     <table class="sched">
       <thead>
         <tr>
@@ -1496,6 +1583,8 @@ watch(
                   @drop.stop="onBlockDrop(c.weekday, row.period.seq, s, $event)"
                   @click="onCardClick(s, c.weekday, row.period.seq, c.list.length)"
                 >
+                  <!-- 未发布标识（C-24）：draft 课次学生/教师端不可见，点「发布课表」后才可见 -->
+                  <span v-if="s.status === 'draft'" class="draft-tag">未发布</span>
                   <!-- 悬停反馈：不同教师 ⇒ 放下后可选「并入 / 互换」；同一教师 ⇒ 只能互换 -->
                   <span v-if="isChoiceHover(c.weekday, row.period.seq, s)" class="card-tag">
                     <ZkIcon name="plus" :size="11" />{{ draggingCell ? '可并入 / 可互换' : '也排到这一节' }}
@@ -1550,16 +1639,6 @@ watch(
       </tbody>
     </table>
 
-    <!-- 翻周条：课表下方居中，上/下一周 -->
-    <div class="week-pager">
-      <button class="btn btn-outline" @click="shiftWeek(-7)">
-        <ZkIcon name="chevron-left" :size="15" style="margin-right: 4px" />上一周
-      </button>
-      <button class="btn btn-outline" @click="shiftWeek(7)">
-        下一周<ZkIcon name="chevron-right" :size="15" style="margin-left: 4px" />
-      </button>
-    </div>
-
     <div class="row mt16" style="gap: 16px; flex-wrap: wrap">
       <span class="row small"><i class="legend-dot ok"></i>正常</span>
       <span class="row small"><i class="legend-dot conf"></i>冲突</span>
@@ -1590,7 +1669,6 @@ watch(
           placeholder="全部专业（可先选专业再选班级）"
           clearable
           filterable
-          size="small"
           style="flex: 1; min-width: 0"
         >
           <el-option v-for="m in majorNames" :key="m" :label="m" :value="m" />
@@ -1603,9 +1681,6 @@ watch(
           placeholder="未填班级"
           clearable
           filterable
-          allow-create
-          default-first-option
-          size="small"
           style="flex: 1; min-width: 0"
         >
           <el-option v-for="n in filteredClassOptions" :key="n" :label="n" :value="n" />
@@ -1617,7 +1692,6 @@ watch(
           v-model="editForm.teacherId"
           placeholder="未指定教师"
           filterable
-          size="small"
           style="flex: 1; min-width: 0"
         >
           <el-option v-for="o in teacherList" :key="o.value" :label="o.label" :value="o.value" />
@@ -1630,7 +1704,6 @@ watch(
           placeholder="未指定教室"
           clearable
           filterable
-          size="small"
           style="flex: 1; min-width: 0"
         >
           <el-option v-for="o in roomOptions" :key="o.value" :label="o.label" :value="o.value" />
@@ -1642,7 +1715,6 @@ watch(
           v-model="editForm.remark"
           placeholder="如：本周由助教代课 / 调换至机房"
           maxlength="200"
-          size="small"
           style="flex: 1; min-width: 0"
         />
       </div>
@@ -1774,22 +1846,19 @@ watch(
           <el-option v-for="o in teacherList" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
       </el-form-item>
-      <el-form-item label="上课教室">
-        <el-select v-model="form.classroomId" placeholder="可不填" clearable style="width: 100%">
-          <el-option v-for="o in roomOptions" :key="o.value" :label="o.label" :value="o.value" />
-        </el-select>
-      </el-form-item>
-      <el-form-item label="上课班级">
+      <el-form-item label="上课班级" required>
         <el-select
           v-model="form.clazzName"
-          placeholder="可不填"
-          clearable
+          placeholder="请选择班级"
           filterable
-          allow-create
-          default-first-option
           style="width: 100%"
         >
           <el-option v-for="n in classListOptions" :key="n" :label="n" :value="n" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="上课教室">
+        <el-select v-model="form.classroomId" placeholder="可不填" clearable style="width: 100%">
+          <el-option v-for="o in roomOptions" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
       </el-form-item>
       <el-form-item label="节次">
@@ -1921,26 +1990,51 @@ watch(
   align-items: center;
   gap: 6px;
 }
-/* 翻周条：课表下方两端对齐——上一周贴左、下一周贴右 */
+/* 翻周条：三列网格——上一周贴左、日期范围严格居中、下一周贴右（1fr auto 1fr 保证居中不受两侧按钮宽度差影响） */
 .week-pager {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 14px;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  margin-bottom: 16px;
   padding: 0 4px;
 }
-/* 周日期范围：课表外、悬在左上角「节次」列正上方（加亮突出显示） */
+.week-pager > button {
+  justify-self: start;
+}
+.week-pager > button:last-child {
+  justify-self: end;
+}
+/* 翻周条中列：日期范围标签 + 本周按钮成组，grid 1fr auto 1fr 下该列整体居中 */
+.week-center {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+/* 两个框统一尺寸：同高 36px、同内边距，观感成一对 */
+.week-center .sched-week {
+  display: inline-flex;
+  align-items: center;
+  height: 36px;
+  padding: 0 14px;
+}
+.week-center .btn {
+  height: 36px;
+  padding: 0 14px;
+}
+/* 周日期范围：翻周条中间的块状标签。
+   ★ 中性深灰描边样式，刻意与课程签（品牌绿底）区分——两者都是"块状"，同色系会混淆 */
 .sched-week {
   display: inline-block;
   font-size: 16px;
   font-weight: 700;
-  color: var(--brand-700, var(--brand-600, #15803d));
-  background: var(--brand-100);
+  color: var(--ink-900);
+  background: var(--bg-soft);
+  border: 1px solid var(--border-strong);
   padding: 4px 14px;
   border-radius: 8px;
   white-space: nowrap;
-  margin-bottom: 6px;
 }
-/* 日期选择器与「本周」按钮高度对齐右侧筛选框（38px）。
+/* 日期选择器与右侧筛选框高度对齐（38px）。
    ★ 必须 :deep()：EP date-picker 根元素不带本组件 scoped 属性，
    普通 .week-nav .el-date-editor 选择器匹配不上 */
 .week-nav :deep(.el-date-editor) {
@@ -1952,6 +2046,11 @@ watch(
 }
 /* 筛选下拉弹性等分剩余宽度（日期组之外）：
    宽度由 flex 决定、与选项文本无关 ⇒ 展开下拉/切换选项都不会引起工具栏回流变形 */
+/* 工具栏窄视口兜底：筛选框放不下时整组换行（否则教室组被挤出可视区、要横向滚动才能看到） */
+.toolbar {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
 .toolbar .select.grow {
   flex: 1 1 0;
   min-width: 96px;
@@ -1969,8 +2068,8 @@ watch(
    按钮从属于下拉一眼可见；组内含按钮 ⇒ 分配比纯下拉稍多的宽度 */
 .room-filter {
   display: inline-flex;
-  flex: 1.35 1 0;
-  min-width: 150px;
+  flex: 1.5 1 0;
+  min-width: 172px;
 }
 .room-filter .f-select {
   flex: 1 1 auto;
@@ -2332,6 +2431,20 @@ watch(
 .card-tag.is-warn {
   background: var(--warning);
 }
+/* 未发布（draft）标识：中性灰、左上角 —— 避开右上角的拖拽悬停标签 */
+.draft-tag {
+  position: absolute;
+  top: -1px;
+  left: -1px;
+  padding: 1px 6px;
+  border-radius: 8px 0 8px 0;
+  background: var(--ink-500);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  z-index: 1;
+}
 .sched td.cell.drop-ok .c-empty {
   opacity: 1;
   border-color: var(--brand-600);
@@ -2579,7 +2692,7 @@ watch(
   align-items: center;
   gap: 10px;
   padding: 6px 0;
-  font-size: 13px;
+  font-size: 14px;
 }
 .detail-k {
   width: 56px;
