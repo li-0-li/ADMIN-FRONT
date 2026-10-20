@@ -1,8 +1,8 @@
 import { request } from '@/api/request';
 import type { ReportFileVo, SchoolAnalyticsVo } from '@/types/admin';
 
-/** 全校学情聚合（#13）：一次拉全看板数据，termId / schoolId 可选过滤 */
-export function getSchoolAnalytics(params: { termId?: number; schoolId?: number } = {}) {
+/** 全校学情聚合（#13）：一次拉全看板数据，termId / schoolId / major（专业名，空=全部）可选过滤 */
+export function getSchoolAnalytics(params: { termId?: number; schoolId?: number; major?: string } = {}) {
   return request<SchoolAnalyticsVo>({ url: '/api/v1/admin/analytics/school', method: 'get', params });
 }
 

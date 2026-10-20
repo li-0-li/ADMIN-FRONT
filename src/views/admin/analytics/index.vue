@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import { exportReport, getSchoolAnalytics } from '@/api/admin/analytics';
-import { listSchools, listTerms } from '@/api/admin/basicdata';
+import { listMajors, listSchools, listTerms } from '@/api/admin/basicdata';
 import type {
   AnalyticsPrepDetail,
   ReportFileVo,
@@ -22,7 +22,8 @@ const data = ref<SchoolAnalyticsVo | null>(null);
 /* ---------- 筛选：学期 / 院系（真数据源来自基础数据接口） ---------- */
 const terms = ref<{ termId: number; name: string }[]>([]);
 const schools = ref<{ schoolId: number; name: string }[]>([]);
-const filters = reactive({ termId: '', schoolId: '' });
+const majors = ref<string[]>([]);
+const filters = reactive({ termId: '', schoolId: '', major: '' });
 
 const dimBadge = computed(() => {
   const t = terms.value.find(o => String(o.termId) === filters.termId)?.name ?? '全部学期';
@@ -32,13 +33,19 @@ const dimBadge = computed(() => {
 
 async function loadPickers() {
   try {
-    const [tRes, sRes] = await Promise.all([listTerms({ page: 1, pageSize: 50 }), listSchools({ page: 1, pageSize: 50 })]);
+    const [tRes, sRes, mRes] = await Promise.all([
+      listTerms({ page: 1, pageSize: 50 }),
+      listSchools({ page: 1, pageSize: 50 }),
+      listMajors({ page: 1, pageSize: 100 })
+    ]);
     terms.value = (tRes?.list ?? [])
       .filter(t => t.termId !== undefined)
       .map(t => ({ termId: t.termId as number, name: t.name || String(t.termId) }));
     schools.value = (sRes?.list ?? [])
       .filter(s => s.schoolId !== undefined)
       .map(s => ({ schoolId: s.schoolId as number, name: s.name || String(s.schoolId) }));
+    // 专业选项 = 专业主表全量的名称（course.major 是文本列，直接按名匹配）
+    majors.value = (mRes?.list ?? []).map(m => m.name || '').filter(Boolean);
     // 学期默认选中「当前学期」，没有标记就取第一个
     if (!filters.termId) {
       const cur = tRes?.list?.find(t => t.isCurrent === 1) ?? tRes?.list?.[0];
@@ -54,7 +61,8 @@ async function load() {
   try {
     data.value = await getSchoolAnalytics({
       termId: filters.termId ? Number(filters.termId) : undefined,
-      schoolId: filters.schoolId ? Number(filters.schoolId) : undefined
+      schoolId: filters.schoolId ? Number(filters.schoolId) : undefined,
+      major: filters.major || undefined
     });
   } catch {
     data.value = null;
@@ -64,7 +72,7 @@ async function load() {
 }
 
 watch(
-  () => [filters.termId, filters.schoolId],
+  () => [filters.termId, filters.schoolId, filters.major],
   () => load()
 );
 
@@ -109,7 +117,9 @@ const catText = (v: string) => CAT_TEXT[String(v)] ?? v;
 
 /* ---------- 成绩分布柱状图：纯 CSS 柱，高度按最大值归一 ---------- */
 const distMax = computed(() => Math.max(1, ...(data.value?.distribution ?? []).map(b => b.count)));
-const barH = (c: number) => Math.max(4, Math.round((c / distMax.value) * 120));
+const distTotal = computed(() => (data.value?.distribution ?? []).reduce((s, b) => s + b.count, 0));
+const distPct = (c: number) => (distTotal.value ? `${Math.round((c / distTotal.value) * 1000) / 10}%` : '0%');
+const barH = (c: number) => Math.max(6, Math.round((c / distMax.value) * 150));
 
 /* ---------- 备课与实验进度监控：按院系 / 按课程聚合 + 行下钻 ---------- */
 const prepDim = ref<'dept' | 'course'>('dept');
@@ -245,6 +255,10 @@ onMounted(async () => {
       <el-select v-model="filters.schoolId" class="f-sel" placeholder="全部院系" clearable filterable style="width: 220px">
         <el-option v-for="s in schools" :key="s.schoolId" :label="s.name" :value="String(s.schoolId)" />
       </el-select>
+      <!-- 专业：与智能排课页同维度；course.major 是文本列，按专业名过滤 -->
+      <el-select v-model="filters.major" class="f-sel" placeholder="全部专业" clearable filterable style="width: 220px">
+        <el-option v-for="m in majors" :key="m" :label="m" :value="m" />
+      </el-select>
       <span class="badge badge-info dim-badge">{{ dimBadge }}</span>
     </div>
 
@@ -297,11 +311,32 @@ onMounted(async () => {
         </div>
         <div class="card card-pad">
           <div class="card-title">成绩分布（当前筛选维度）</div>
+          <!-- 汇总指标：同一筛选维度下的成绩总览，填充卡片上部并给出读数锚点 -->
+          <div v-if="data.distribution?.length" class="dist-meta">
+            <div class="dm-item">
+              <span class="dm-num">{{ distTotal }}</span>
+              <span class="dm-label">已批改成绩</span>
+            </div>
+            <div class="dm-item">
+              <span class="dm-num">{{ num(data.summary?.avgScore) }}</span>
+              <span class="dm-label">平均分</span>
+            </div>
+            <div class="dm-item">
+              <span class="dm-num">{{ num(data.summary?.passRate, '%') }}</span>
+              <span class="dm-label">及格率</span>
+            </div>
+          </div>
           <div class="dist">
-            <div v-for="b in data.distribution ?? []" :key="b.range" class="dist-col">
-              <span class="small muted">{{ b.count }}</span>
+            <div
+              v-for="b in data.distribution ?? []"
+              :key="b.range"
+              class="dist-col"
+              :class="{ top: b.count === distMax && distMax > 0 }"
+            >
+              <span class="dist-val">{{ b.count }}</span>
               <i :style="{ height: barH(b.count) + 'px' }"></i>
               <span class="small">{{ b.range }}</span>
+              <span class="tiny muted">{{ distPct(b.count) }}</span>
             </div>
             <p v-if="!data.distribution?.length" class="muted small" style="padding: 24px 0">暂无分布数据</p>
           </div>
@@ -516,33 +551,76 @@ onMounted(async () => {
   margin-left: auto;
 }
 /* 成绩分布：纯 CSS 柱状图 */
+/* 汇总指标行：同一维度的成绩总览三格 */
+.dist-meta {
+  display: flex;
+  gap: 10px;
+  margin: 10px 0 2px;
+}
+.dm-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 10px 0 8px;
+  background: var(--bg-50, #f6f7f9);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.dm-num {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--ink-900, #1c2333);
+  line-height: 1.2;
+}
+.dm-label {
+  font-size: 12px;
+  color: var(--ink-500);
+}
 .dist {
   display: flex;
   align-items: flex-end;
   gap: 18px;
-  min-height: 170px;
+  min-height: 210px;
   padding: 6px 4px 0;
 }
 .dist-col {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   flex: 1;
+}
+.dist-val {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-900, #1c2333);
 }
 .dist-col i {
   display: block;
   width: 100%;
   max-width: 56px;
-  background: var(--brand-500);
+  background: linear-gradient(180deg, var(--brand-300, #9db8f7), var(--brand-500));
   border-radius: 6px 6px 2px 2px;
-  opacity: 0.88;
+  opacity: 0.82;
+  transition: opacity 0.15s;
+}
+/* 最高柱高亮：视觉锚点 */
+.dist-col.top i {
+  opacity: 1;
+  background: linear-gradient(180deg, var(--brand-400, #7c9df2), var(--brand-600, #4a6fd6));
 }
 .dist-col:hover i {
   opacity: 1;
 }
-.dist-col .small:last-child {
+.dist-col .small:last-of-type {
   color: var(--ink-500);
+}
+.dist-col .tiny {
+  font-size: 11px;
+  line-height: 1;
+  padding-bottom: 2px;
 }
 /* 下钻明细表嵌在浅灰行里：白底 + 边框，圆角裁切 */
 .drill-tbl {
