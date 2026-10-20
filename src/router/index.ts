@@ -65,7 +65,7 @@ const router = createRouter({
   scrollBehavior: () => ({ left: 0, top: 0 })
 });
 
-router.beforeEach(to => {
+router.beforeEach(async to => {
   const userStore = useUserStore();
 
   if (to.path === '/login') {
@@ -74,6 +74,17 @@ router.beforeEach(to => {
 
   if (!userStore.token) {
     return { path: '/login', query: { redirect: to.fullPath } };
+  }
+
+  // 刷新后 pinia 是空壳（仅 token 在 localStorage）：补拉用户信息，
+  // 身份判定（是否超管）与权限校验 hasPermi 都依赖它。失败则踢回登录。
+  if (!userStore.permissions.length) {
+    try {
+      await userStore.fetchUserInfo();
+    } catch {
+      userStore.logout();
+      return { path: '/login', query: { redirect: to.fullPath } };
+    }
   }
 
   return true;

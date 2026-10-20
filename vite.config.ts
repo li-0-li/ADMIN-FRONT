@@ -42,6 +42,8 @@ export default defineConfig(({ mode }) => {
         '/getInfo': { target: proxyTarget, changeOrigin: true, bypass: bypassHtmlNavigation },
         '/captchaImage': { target: proxyTarget, changeOrigin: true, bypass: bypassHtmlNavigation },
         '/register': { target: proxyTarget, changeOrigin: true, bypass: bypassHtmlNavigation },
+        // ②+ 若依原生业务端点（/system/**：个人改密 /system/user/profile/updatePwd 等）
+        '/system': { target: proxyTarget, changeOrigin: true, bypass: bypassHtmlNavigation },
         // ③ 上传文件的静态资源前缀。这几个**绝不能加 bypassHtmlNavigation**：
         //    浏览器加载 iframe / video 时会带 Accept: text/html，一旦 bypass 就会
         //    被交回 SPA fallback、拿到 index.html，文件反而打不开。

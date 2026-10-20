@@ -1,4 +1,4 @@
-import { rawRequest, TOKEN_KEY, type ApiEnvelope } from '@/api/request';
+import { rawRequest, request, TOKEN_KEY, type ApiEnvelope } from '@/api/request';
 
 export interface LoginPayload {
   username: string;
@@ -32,6 +32,14 @@ export function apiLogin(data: LoginPayload) {
 /** 取用户信息：roles / permissions / user 也在顶层平铺 */
 export function apiGetInfo() {
   return rawRequest<UserInfoPayload>({ url: '/getInfo', method: 'get' });
+}
+
+/**
+ * 修改当前登录用户自己的密码：若依原生端点 /system/user/profile/updatePwd。
+ * 后端校验 oldPassword 正确、新旧不同；成功返回 { code: 200 }（无 data）。
+ */
+export function apiUpdatePwd(oldPassword: string, newPassword: string) {
+  return request<never>({ url: '/system/user/profile/updatePwd', method: 'put', data: { oldPassword, newPassword } });
 }
 
 /**
