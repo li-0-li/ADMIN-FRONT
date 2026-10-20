@@ -300,12 +300,17 @@ onMounted(fetchList);
       <div class="row" style="gap: 8px">
         <div class="search-unit">
           <ZkIcon name="search" :size="14" class="su-icon" />
-          <input
-            v-model="keyword"
-            class="su-input"
-            placeholder="搜索课程名 / 教师名"
-            @keyup.enter="doSearch"
-          />
+          <!-- 占位文案用覆盖层实现（不用原生 placeholder）：Chromium 里占位文本可被拖选复制，
+               覆盖层 pointer-events:none + user-select:none 物理杜绝；有值时隐藏 -->
+          <div class="su-field">
+            <input
+              v-model="keyword"
+              class="su-input"
+              aria-label="搜索课程名 / 教师名"
+              @keyup.enter="doSearch"
+            />
+            <span v-if="!keyword" class="su-ph">搜索课程名 / 教师名</span>
+          </div>
           <button v-if="keyword" class="su-clear" title="清空" aria-label="清空搜索" @click="resetSearch">
             <ZkIcon name="x" :size="13" />
           </button>
@@ -588,18 +593,34 @@ onMounted(fetchList);
   color: var(--ink-400);
   flex: none;
 }
-.su-input {
+.su-field {
+  position: relative;
   flex: 1;
   min-width: 0;
+}
+.su-input {
+  display: block;
+  width: 100%;
+  height: 100%;
   border: none;
   outline: none;
   background: transparent;
-  font-size: 13px;
+  font-size: 14px;
+  line-height: 28px;
   color: var(--ink-900);
   padding: 0 4px;
 }
-.su-input::placeholder {
+/* 自绘占位文案：不响应鼠标事件、不可选中复制 */
+.su-ph {
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 14px;
   color: var(--ink-400);
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
 }
 .su-clear {
   flex: none;
