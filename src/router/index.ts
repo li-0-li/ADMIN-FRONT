@@ -29,6 +29,15 @@ const adminChildren: RouteRecordRaw[] = ADMIN_MENUS.map(
   })
 );
 
+// 角色管理：独立页但刻意不进 ADMIN_MENUS（左侧菜单无此项），
+// 入口在账号管理页头部「角色管理」按钮跳入
+adminChildren.push({
+  path: 'roles',
+  name: 'AdminRoles',
+  component: () => import('@/views/admin/roles/index.vue'),
+  meta: { title: '角色管理', icon: 'shield-check' }
+});
+
 export const routes: RouteRecordRaw[] = [
   {
     path: '/login',
@@ -42,6 +51,13 @@ export const routes: RouteRecordRaw[] = [
     name: 'ResourcePreview',
     component: () => import('@/views/ResourcePreview.vue'),
     meta: { title: '资源预览' }
+  },
+  {
+    // 非管理员登录提示页：教师/学生账号登进管理端时落地
+    path: '/not-admin',
+    name: 'NotAdmin',
+    component: () => import('@/views/admin/NotAdmin.vue'),
+    meta: { title: '无管理端权限' }
   },
   {
     path: '/admin',
@@ -85,6 +101,17 @@ router.beforeEach(async to => {
       userStore.logout();
       return { path: '/login', query: { redirect: to.fullPath } };
     }
+  }
+
+  // 非管理员（教师/学生等业务角色）登进管理端：导流提示页，
+  // 管理端菜单对他们本就近乎空白。超管（*:*:*）与管理员角色（admin）放行。
+  const isAdminAccount =
+    userStore.roles.includes('admin') || userStore.permissions.includes('*:*:*');
+  if (!isAdminAccount && to.path !== '/not-admin') {
+    return { path: '/not-admin' };
+  }
+  if (isAdminAccount && to.path === '/not-admin') {
+    return { path: '/admin/dashboard' };
   }
 
   return true;

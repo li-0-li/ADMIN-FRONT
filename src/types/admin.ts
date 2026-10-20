@@ -23,6 +23,8 @@ export interface AdminUserVo {
   bizStatus: string;
   mustChangePwd: boolean;
   createTime: string;
+  /** 最近登录时间（sys_user.login_date），从未登录为 null */
+  loginDate?: string | null;
   roleKeys: string[];
   roleIds: number[];
 }
@@ -410,4 +412,34 @@ export interface SchoolAnalyticsVo {
 export interface ReportFileVo {
   fileUrl: string;
   fileName: string;
+}
+
+/** 权限点树节点（B-7 GET /api/v1/admin/permissions） */
+export interface PermissionNodeVo {
+  menuId: number;
+  menuName: string;
+  perms: string;
+  /** M 目录 / C 菜单 / F 按钮 */
+  menuType: 'M' | 'C' | 'F';
+  parentId: number;
+  path: string;
+  icon: string;
+  orderNum: number;
+  children: PermissionNodeVo[];
+}
+
+/** 角色管理行（R-1 GET /api/v1/admin/roles） */
+export interface AdminRoleVo {
+  roleId: number;
+  roleName: string;
+  roleKey: string;
+  status: string;
+  remark: string;
+  createTime: string;
+  /** 成员数（关联该角色的未删账号数） */
+  memberCount: number;
+  /** 已授权菜单数（sys_role_menu 行数） */
+  menuCount: number;
+  /** 内置超级管理员（role_id=1）：禁用配置权限 */
+  builtIn: boolean;
 }

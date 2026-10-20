@@ -3,6 +3,7 @@ import { computed, type Component } from 'vue';
 import {
   Activity,
   AlertTriangle,
+  ArrowLeft,
   ArrowLeftRight,
   BadgeCheck,
   BarChart3,
@@ -62,6 +63,7 @@ import {
 const ICONS: Record<string, Component> = {
   activity: Activity,
   'alert-triangle': AlertTriangle,
+  'arrow-left': ArrowLeft,
   'arrow-left-right': ArrowLeftRight,
   'badge-check': BadgeCheck,
   'bar-chart-3': BarChart3,

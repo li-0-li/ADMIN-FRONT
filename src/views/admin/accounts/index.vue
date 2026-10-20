@@ -299,6 +299,9 @@ function openDetail(row: AdminUserVo) {
   <div class="page-head">
     <h1>账号管理</h1>
     <div class="actions">
+      <a class="btn btn-outline" href="javascript:void(0)" @click="$router.push('/admin/roles')">
+        <ZkIcon name="shield-check" :size="16" />角色管理
+      </a>
       <a class="btn btn-outline" href="javascript:void(0)" @click="$router.push('/admin/logs')">
         <ZkIcon name="history" :size="16" />操作日志
       </a>
@@ -361,6 +364,9 @@ function openDetail(row: AdminUserVo) {
         </template>
       </el-table-column>
       <el-table-column label="创建时间" width="170" prop="createTime" />
+      <el-table-column label="最近登录" width="170" prop="loginDate">
+        <template #default="{ row }">{{ row.loginDate || '—' }}</template>
+      </el-table-column>
       <el-table-column label="操作" width="400" align="right" class-name="op-col">
         <template #default="{ row }">
           <el-button text size="small" @click="openDetail(row)">
