@@ -75,7 +75,7 @@ const refreshing = ref(false);
 const filters = reactive({ courseId: '', teacherId: '', clazzName: '', classroomId: '', major: '', termId: '', schoolId: '' });
 /** 学期下拉（后端 ScheduleQueryBo 支持 termId 过滤 ⇒ 服务端筛，变化即重查） */
 const terms = ref<{ termId: number; name: string }[]>([]);
-/** 院系列表（基础数据 school 表）：≥2 个才显示院系筛选，单院系无筛选意义 */
+/** 学校列表（基础数据 school 表，学校级）：≥2 个才显示学校筛选，单校无筛选意义 */
 const schools = ref<{ schoolId: number; name: string }[]>([]);
 /** 班级名 → 专业名 映射（schedule.target_class 是冗余字符串、无 clazzId 外键，
  *  专业信息只能借基础数据的班级列表接口按名称映射） */
@@ -335,6 +335,77 @@ const filtered = computed(() =>
   )
 );
 
+/* ---------- 冲突本地推导（2026-10-20）：后端 conflict 列从不回填（恒空）⇒ 前端按同款规则推导 ----------
+ * 规则与后端 countConflict 一致：同一节次「同教师」或「同教室」= 冲突（同节次不同教师/教室并行合法）。
+ * 推导只用于可视化标红与计数；落库拦截仍以真实接口返回为准。 */
+const conflictInfo = computed(() => {
+  const reasons = new Map<number, string[]>();
+  const add = (id: number, why: string) => {
+    const list = reasons.get(id);
+    if (list) {
+      if (!list.includes(why)) list.push(why);
+    } else reasons.set(id, [why]);
+  };
+  const scan = (keyOfCell: (c: ScheduleCell) => string | null, whyOf: (first: ScheduleCell) => string) => {
+    const groups = new Map<string, ScheduleCell[]>();
+    for (const c of filtered.value) {
+      if (!c.weekday || !c.periodNo) continue;
+      const k = keyOfCell(c);
+      if (!k) continue;
+      const gk = `${c.weekday}-${c.periodNo}-${k}`;
+      const list = groups.get(gk);
+      if (list) list.push(c);
+      else groups.set(gk, [c]);
+    }
+    for (const list of groups.values()) {
+      if (list.length < 2) continue;
+      for (const c of list) add(c.scheduleId, whyOf(list[0]));
+    }
+  };
+  scan(
+    c =>
+      c.teacherId !== undefined && c.teacherId !== null
+        ? `t${c.teacherId}`
+        : c.teacherName && c.teacherName.trim()
+          ? `n${c.teacherName.trim()}`
+          : null,
+    first => `与「${first.courseName ?? '另一节课'}」同教师`
+  );
+  scan(
+    c => (c.classroomId !== undefined && c.classroomId !== null ? `r${c.classroomId}` : null),
+    first => `与「${first.courseName ?? '另一节课'}」同教室`
+  );
+  return reasons;
+});
+/** 该课次命中的冲突原因列表（空 = 无冲突） */
+function conflictOf(s: ScheduleCell): string[] {
+  return conflictInfo.value.get(s.scheduleId) ?? [];
+}
+/** 冲突课次总数（工具栏徽标） */
+const conflictCount = computed(() => conflictInfo.value.size);
+
+/* ---------- 教室容量校验（2026-10-20）：行业标配「人数→容量匹配」，数据都有、此前没用 ---------- */
+/** 新增课次：所选教室容量 < 所选课程选课人数 ⇒ 提示（不硬拦，教室紧张时管理员自行取舍） */
+const createCapacityWarn = computed(() => {
+  const room = classroomsAll.value.find(r => String(r.classroomId) === form.classroomId);
+  const course = poolCourses.value.find(c => String(c.courseId) === form.courseId);
+  if (!room || course?.studentCount === undefined || course.studentCount === null) return '';
+  return (course.studentCount ?? 0) > (room.capacity ?? Number.MAX_SAFE_INTEGER)
+    ? `该教室容量 ${room.capacity} 人，小于「${course.courseName ?? '该课程'}」的 ${course.studentCount} 名学生`
+    : '';
+});
+/** 课次详情：同口径 */
+const detailCapacityWarn = computed(() => {
+  const c = detailCell.value;
+  if (!c) return '';
+  const room = classroomsAll.value.find(r => String(r.classroomId) === editForm.classroomId);
+  const course = poolCourses.value.find(x => x.courseId === c.courseId);
+  if (!room || course?.studentCount === undefined || course.studentCount === null) return '';
+  return (course.studentCount ?? 0) > (room.capacity ?? Number.MAX_SAFE_INTEGER)
+    ? `该教室容量 ${room.capacity} 人，小于选课人数 ${course.studentCount}`
+    : '';
+});
+
 const keyOf = (weekday: number, periodNo: number) => `${weekday}-${periodNo}`;
 
 /**
@@ -402,8 +473,11 @@ interface PoolEntry extends CourseBrief {
  */
 const poolEntries = computed<PoolEntry[]>(() => {
   const scope = filters.termId || currentTermId.value;
+  // termId 为 NULL 的课次（演示数据课程未关联学期）按「在范围内」处理，否则选中学期后池子误判全未排
   const inScope = scope
-    ? allCells.value.filter(c => c.termId !== undefined && c.termId !== null && String(c.termId) === String(scope))
+    ? allCells.value.filter(
+        c => c.termId === undefined || c.termId === null || String(c.termId) === String(scope)
+      )
     : allCells.value;
   const used = new Set(inScope.map(c => String(c.courseId)));
   // courseId -> 本周放回的课次列表
@@ -514,6 +588,114 @@ function dateOf(weekday: number) {
   d.setDate(d.getDate() + (weekday - 1));
   return fmt(d);
 }
+
+/* ---------- 调整课次 · 每周节数核对（2026-10-20，只读提示，补齐靠手动拖）----------
+ * 单个课次没有"每周几节"属性（schedule 一行 = 一个日期），所以这里反过来做：
+ * 拉该课程未来 25 周的真实课次，按周计数并压缩成区间（如「第1~16周 2节；第17~18周 1节」），
+ * 让"哪些周缺节"一眼可见；补齐方式 = 把待排池签拖到缺节那周的空格。 */
+const weeklyCheck = ref<{ loading: boolean; text: string; uneven: boolean } | null>(null);
+async function loadWeeklyCheck(courseId: number) {
+  weeklyCheck.value = { loading: true, text: '', uneven: false };
+  try {
+    // 统计窗口 = 重复排课同款锚定：当前显示周为第 1 周，向后 25 周
+    const end = new Date(weekStart.value);
+    end.setDate(end.getDate() + 25 * 7 - 1);
+    const res = await listSchedules({
+      startDate: fmt(weekStart.value),
+      endDate: fmt(end),
+      page: 1,
+      pageSize: 500,
+      includeDeleted: true
+    });
+    if (!weeklyCheck.value?.loading) return; // 弹窗已关或换了课次，丢弃过期结果
+    // ★ 适配层：契约 ScheduleCell 无 classTime，但后端实际返回该字段（实测确认）——
+    //   页内扩展类型读取，不动 types.ts；字段缺失时降级为"无法按周统计"。
+    type RowWithDate = ScheduleCell & { classTime?: string };
+    const rows = ((res?.list ?? []) as RowWithDate[]).filter(c => c.courseId === courseId && !c.deleted);
+    const byWeek = new Map<number, number>();
+    let sawDate = false;
+    for (const c of rows) {
+      const d = new Date(String(c.classTime ?? '').slice(0, 10).replace(/-/g, '/'));
+      if (Number.isNaN(d.getTime())) continue;
+      sawDate = true;
+      const w = Math.floor((d.getTime() - weekStart.value.getTime()) / (7 * 86400000)) + 1;
+      if (w >= 1 && w <= 25) byWeek.set(w, (byWeek.get(w) ?? 0) + 1);
+    }
+    if (!sawDate) {
+      weeklyCheck.value = { loading: false, text: '接口未返回课次日期，无法按周统计（可翻周肉眼核对）', uneven: false };
+      return;
+    }
+    if (!byWeek.size) {
+      weeklyCheck.value = { loading: false, text: '未来 25 周内没有该课程的课次', uneven: false };
+      return;
+    }
+    const maxWeek = Math.max(...byWeek.keys());
+    const runs: Array<{ from: number; to: number; n: number }> = [];
+    for (let w = 1; w <= maxWeek; w++) {
+      const n = byWeek.get(w) ?? 0;
+      const last = runs[runs.length - 1];
+      if (last && last.n === n) last.to = w;
+      else runs.push({ from: w, to: w, n });
+    }
+    weeklyCheck.value = {
+      loading: false,
+      text: runs.map(r => (r.from === r.to ? `第${r.from}周 ${r.n} 节` : `第${r.from}~${r.to}周 ${r.n} 节`)).join('；'),
+      uneven: runs.length > 1
+    };
+  } catch {
+    if (weeklyCheck.value?.loading) weeklyCheck.value = { loading: false, text: '统计失败（接口异常），可稍后重开弹窗重试', uneven: false };
+  }
+}
+
+/* ---------- 2026-10-20 UI 惯例对标（Google Calendar / WebUntis / UniTime）----------
+ * ① 今天列高亮 ② 课程卡一门课一色 ③ hover 同课程联动 + 完整信息 tooltip ④ 本周摘要条 */
+
+/** 今天是显示周的周几（1=周一…7=周日；0=不在本周）——weekStart 恒为周一，按天数差直接算 */
+const todayWeekday = computed(() => {
+  const n = new Date();
+  const diff = (new Date(n.getFullYear(), n.getMonth(), n.getDate()).getTime() - weekStart.value.getTime()) / 86400000;
+  return diff >= 0 && diff < 7 ? diff + 1 : 0;
+});
+
+/** 课程配色：10 色低饱和调色板，按 courseId 取模 ⇒ 同一课程跨格、跨周稳定同色。
+ *  冲突红优先级更高（冲突卡走 c-conf，不叠加课程色）；未发布灰是角标，不抢底色。 */
+const COURSE_TONES = ['t1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9', 't10'] as const;
+function courseTone(courseId?: number | null): string {
+  if (!courseId) return 't1';
+  return COURSE_TONES[courseId % COURSE_TONES.length];
+}
+
+/** 卡片 hover 联动：悬停时高亮同课程的其他课次（WebUntis 惯例——一眼看出一门课一周占哪几格） */
+const hoverCourseId = ref<number | null>(null);
+
+/** 卡片完整信息 tooltip：免点详情即可核对全量信息 */
+function cardTitle(s: ScheduleCell): string {
+  const p = PERIODS.find(x => x.seq === s.periodNo);
+  const lines = [
+    s.courseName || '（未命名课程）',
+    `时间：周${CN[(s.weekday ?? 1) - 1]} ${p ? `${p.label}（${timeRange(p)}）` : ''} · ${dateOf(s.weekday ?? 1)}`,
+    `教师：${s.teacherName || '—'} · 班级：${s.clazzName || '未填'}`,
+    `教室：${s.roomName || '未指定教室'}`
+  ];
+  if (s.note) lines.push(`备注：${s.note}`);
+  const why = conflictOf(s);
+  if (why.length) lines.push(`冲突：${why.join('；')}`);
+  lines.push('拖动调课：拖到空格=移动 · 拖到别的教师的课次=并入/互换 · 拖到同一教师的课次=互换');
+  return lines.join('\n');
+}
+
+/** 本周摘要条：当前筛选下课次数 / 教师数 / 教室数 / 冲突课次数 */
+const weekStats = computed(() => {
+  const teachers = new Set<string>();
+  const rooms = new Set<string>();
+  let conflicts = 0;
+  for (const c of filtered.value) {
+    if (c.teacherName) teachers.add(c.teacherName);
+    if (c.roomName) rooms.add(c.roomName);
+    if (conflictOf(c).length) conflicts++;
+  }
+  return { total: filtered.value.length, teachers: teachers.size, rooms: rooms.size, conflicts };
+});
 
 function onDragStart(c: CourseBrief, e: DragEvent) {
   draggingCell.value = null;
@@ -756,7 +938,9 @@ type UndoAction =
   | { kind: 'move' | 'edit'; scheduleId: number; label: string; prev: ScheduleUpdateBo }
   | { kind: 'swap'; fromScheduleId: number; toScheduleId: number; label: string }
   | { kind: 'putback'; label: string; restore: ScheduleCreateBo }
-  | { kind: 'create'; scheduleId: number; label: string };
+  | { kind: 'create'; scheduleId: number; label: string }
+  /** 周次重复排课（2026-10-20）：一次操作 = 多周课次，撤回 = 逐条放回待排 */
+  | { kind: 'batchCreate'; scheduleIds: number[]; label: string };
 const MAX_UNDO = 30;
 const historyStack = ref<UndoAction[]>([]);
 function pushUndo(a: UndoAction) {
@@ -773,6 +957,18 @@ async function undoLast() {
     if (entry.kind === 'move' || entry.kind === 'edit') await moveSchedule(entry.scheduleId, entry.prev);
     else if (entry.kind === 'swap') await swapSchedules({ fromScheduleId: entry.fromScheduleId, toScheduleId: entry.toScheduleId });
     else if (entry.kind === 'putback') await createSchedule(entry.restore);
+    else if (entry.kind === 'batchCreate') {
+      // 批量撤回：逐条放回待排；个别失败不中断（已撤的撤了，失败的提示后可重试或手动处理）
+      let failed = 0;
+      for (const id of entry.scheduleIds) {
+        try {
+          await deleteSchedule(id);
+        } catch {
+          failed++;
+        }
+      }
+      if (failed) ElMessage.warning(`撤回完成 ${entry.scheduleIds.length - failed}/${entry.scheduleIds.length} 条，失败的条目可稍后重试`);
+    }
     else await deleteSchedule(entry.scheduleId);
     historyStack.value.pop();
     ElMessage.success(`已撤回：${entry.label}`);
@@ -886,8 +1082,11 @@ async function returnToPool(cell: ScheduleCell) {
   const slot = `周${CN[(cell.weekday ?? 1) - 1]} ${PERIODS.find(p => p.seq === cell.periodNo)?.label ?? ''}`;
   // 该课程**学期口径内**还剩几节活跃课次（不含本节）：仅用于提示，不影响回池（放回即回池）
   const scope = filters.termId || currentTermId.value;
+  // termId 为 NULL 的课次按「在范围内」处理（同 poolEntries 口径）
   const scopeCells = scope
-    ? allCells.value.filter(c => c.termId !== undefined && c.termId !== null && String(c.termId) === String(scope))
+    ? allCells.value.filter(
+        c => c.termId === undefined || c.termId === null || String(c.termId) === String(scope)
+      )
     : allCells.value;
   const remaining = scopeCells.filter(c => c.courseId === cell.courseId && c.scheduleId !== cell.scheduleId).length;
   const note = remaining > 0
@@ -1033,6 +1232,9 @@ function openDetail(cell: ScheduleCell) {
   // 联动初值：优先班级主表映射，映射不到按班级名前缀推断
   editForm.major = (cell.clazzName && clazzMajorMap.value[cell.clazzName]) || (cell.clazzName ? majorOf(cell.clazzName) : '') || '';
   detailVisible.value = true;
+  // 每周节数核对（只读提示，补齐靠手动拖）：异步拉取，不阻塞弹窗打开
+  if (cell.courseId) void loadWeeklyCheck(cell.courseId);
+  else weeklyCheck.value = null;
   // 教师/班级/专业下拉强制刷新：别处（账号/基础数据）刚新增的立即可选（异步补拉，不阻塞弹窗打开）
   teacherList.value = [];
   clazzNameList.value = [];
@@ -1141,11 +1343,9 @@ async function loadPickers() {
       terms.value = (res?.list ?? [])
         .filter(t => t.termId !== undefined)
         .map(t => ({ termId: t.termId as number, name: t.name || String(t.termId) }));
-      // 默认选中「当前学期」（此前是写死的只读「2026 秋」占位）
-      if (!filters.termId) {
-        const cur = res?.list?.find(t => t.isCurrent === 1) ?? res?.list?.[0];
-        if (cur?.termId !== undefined) filters.termId = String(cur.termId);
-      }
+      // ⛔ 不再默认选中「当前学期」（2026-10-20 实测）：演示数据的课次 term_id 为 NULL，
+      // 后端按 termId 过滤会把它们**全部筛掉**（带任何 termId 查询都返回 0 行）⇒ 课表整页空白。
+      // 默认「全部学期」，让用户显式选学期；selected 后若为空见模板里的空态提示。
       // 记录当前学期：池子「已排」判定在「全部学期」视图下按它收口
       const curTerm = res?.list?.find(t => t.isCurrent === 1) ?? res?.list?.[0];
       currentTermId.value = curTerm?.termId !== undefined ? String(curTerm.termId) : '';
@@ -1215,6 +1415,12 @@ async function openCreate(
   form.clazzName = '';
   form.weekday = weekday ?? 1;
   form.periodNo = periodNo ?? 1;
+  // 每周多节：额外节位给个顺手默认（第 2 节默认排到下一工作日、同时段），并同步总节数满额
+  for (const s of extraSlots) {
+    s.weekday = form.weekday >= 5 ? 1 : form.weekday + 1;
+    s.periodNo = form.periodNo;
+  }
+  syncRepeatTotal();
   presetCourseId.value = preset.courseId ?? '';
   form.courseId = preset.courseId ?? '';
 
@@ -1252,42 +1458,66 @@ async function submitCreate() {
     ElMessage.warning('节次不合法');
     return;
   }
-  const d = new Date(weekStart.value);
-  d.setDate(d.getDate() + (form.weekday - 1));
+  // 每周多节：同周内两节选了相同「星期+节次」= 自己撞自己，直接拦
+  const slots = buildRepeatSlots();
+  const seenSlots = new Set<string>();
+  for (const s of slots) {
+    const k = `${s.weekday}-${s.periodNo}`;
+    if (seenSlots.has(k)) {
+      ElMessage.warning('每周有两节选了同一个「星期 + 节次」，请调整后再保存');
+      return;
+    }
+    seenSlots.add(k);
+  }
+  // 重复口径下的回退定位：老 jar 可能不回传 scheduleId，靠 load 前后差集找出新建的课次
+  const knownIds = new Set(allCells.value.map(c => c.scheduleId));
   saving.value = true;
   try {
-    const res = await createSchedule({
-      courseId: Number(form.courseId),
-      teacherId: Number(form.teacherId),
-      classroomId: form.classroomId ? Number(form.classroomId) : undefined,
-      classTime: `${fmt(d)} ${period.start}:00`,
-      durationMin: period.duration,
-      weekday: form.weekday,
-      periodNo: form.periodNo,
-      targetClass: form.clazzName.trim() || undefined
-    });
-    if (res?.conflict) {
-      ElMessage.warning(`未保存：${res.conflictMsg || '该时段教师或教室已被占用'}`);
-    } else {
-      ElMessage.success('课次已新增');
+    const { createdIds, failed, total } = await createBatch(
+      {
+        courseId: Number(form.courseId),
+        teacherId: Number(form.teacherId),
+        classroomId: form.classroomId ? Number(form.classroomId) : undefined,
+        weekday: form.weekday,
+        periodNo: form.periodNo,
+        targetClass: form.clazzName.trim() || undefined
+      },
+      { slots, capTotal: repeatForm.total }
+    );
+    await load(true);
+    const ids = createdIds.length
+      ? createdIds
+      : allCells.value
+          .filter(
+            x =>
+              x.courseId === Number(form.courseId) &&
+              x.weekday === form.weekday &&
+              x.periodNo === form.periodNo &&
+              !knownIds.has(x.scheduleId)
+          )
+          .map(x => x.scheduleId);
+    const courseLabel = courseList.value.find(o => o.value === form.courseId)?.label ?? '课次';
+    if (ids.length) {
+      for (const s of slots) expandCell(s.weekday, s.periodNo);
       createVisible.value = false;
-      // 若该格原来已有课（并入式新建），自动展开让多节并存立刻可见
-      expandCell(form.weekday, form.periodNo);
-      await load(true);
-      // 撤回：定位刚新建的课次（同课程同格取最大 scheduleId；接口若已回传 id 则直接用）
-      const created =
-        allCells.value
-          .filter(x => x.courseId === Number(form.courseId) && x.weekday === form.weekday && x.periodNo === form.periodNo)
-          .sort((a, b) => b.scheduleId - a.scheduleId)[0] ?? null;
-      const newId = res.scheduleId ?? created?.scheduleId;
-      if (newId) {
-        pushUndo({
-          kind: 'create',
-          scheduleId: newId,
-          label: `新增「${courseList.value.find(o => o.value === form.courseId)?.label ?? '课次'}」课次`
-        });
+      const trimmed = repeatForm.total < repeatForm.weekly * effectiveRepeatTimes.value;
+      pushUndo({
+        kind: 'batchCreate',
+        scheduleIds: ids,
+        label: `新增「${courseLabel}」× ${ids.length} 节（${REPEAT_TEXT[repeatForm.mode]}${repeatForm.weekly > 1 ? ` · 每周 ${repeatForm.weekly} 节` : ''}${trimmed ? ' · 前满后少' : ''}）`
+      });
+      ElMessage.success(
+        `已排入 ${ids.length} 节（${REPEAT_TEXT[repeatForm.mode]}${repeatForm.weekly > 1 ? ` · 每周 ${repeatForm.weekly} 节` : ''}，翻周即可查看）`
+      );
+      if (failed.length) {
+        ElMessageBox.alert(`以下时段因冲突未排入：${failed.join('；')}`, '部分课次未排入', { type: 'warning' }).catch(() => {});
       }
+    } else if (failed.length) {
+      ElMessage.warning(`未保存：${failed[0]}`);
+    } else {
+      ElMessage.warning('未保存，请稍后重试');
     }
+    void total;
   } catch {
     /* 已在请求层提示 */
   } finally {
@@ -1295,9 +1525,220 @@ async function submitCreate() {
   }
 }
 
-/* ---------- 缺口动作：后端既定不实现，前端不发请求 ---------- */
-function onAuto() {
-  ElMessage.info('后端未提供自动排课接口（/schedules/auto 属既定不实现范围），本按钮不发起请求。');
+/* ================= 周次重复（2026-10-20 需求）：排一次 = 整学期各周都有课 =================
+ * 数据模型：schedule 一行 = 一个具体日期的课次（class_time 存日期、无 week_pattern 字段）。
+ * ⇒ 「1-18 周、一周两节」= 第一周排好后，把同 weekday/periodNo 的课次按周逐条 POST
+ *   （每行一个真实日期），第 2~18 周翻周即可见 —— 不依赖后端任何新字段。
+ * 单双周 = 隔周重复：以当前所在周为「第 1 周」——
+ *   单周（odd）锚定当前周（第 1、3、5…周），双周（even）锚定下一周（第 2、4、6…周）。
+ */
+type RepeatMode = 'once' | 'all' | 'odd' | 'even';
+const REPEAT_TEXT: Record<RepeatMode, string> = {
+  once: '仅本周一次',
+  all: '每周重复',
+  odd: '单周（隔周上）',
+  even: '双周（隔周上）'
+};
+/** 会话内记忆上次选择：连续排几门课不必每次重设。
+ *  weekly = 每周节数（1~5，每节可分别定时间）；total = 总节数（可小于满额，前满后少）。 */
+const repeatForm = reactive<{ mode: RepeatMode; times: number; weekly: number; total: number }>({
+  mode: 'all',
+  times: 18,
+  weekly: 1,
+  total: 18
+});
+/** 实际重复次数（once=1，其余 clamp 1~25）——总节数满额 = weekly × 此值 */
+const effectiveRepeatTimes = computed(() =>
+  repeatForm.mode === 'once' ? 1 : Math.max(1, Math.min(25, Math.round(repeatForm.times || 1)))
+);
+/** 每周第 2~5 节的时间（第 1 节 = 表单里的 星期/节次）；weekly 减小时多余项自动不渲染/不提交 */
+const extraSlots = reactive(Array.from({ length: 4 }, () => ({ weekday: 1, periodNo: 1 })));
+const extraSlotList = computed(() => extraSlots.slice(0, Math.max(0, repeatForm.weekly - 1)));
+/** 每周节数 / 重复周数变化时，总节数回到满额（用户随后可手动改小） */
+function syncRepeatTotal() {
+  repeatForm.total = repeatForm.weekly * effectiveRepeatTimes.value;
+}
+/** 本次的全部「节位」：第 1 节 = 表单星期/节次，第 2~weekly 节 = extraSlots 前几项 */
+function buildRepeatSlots(): Array<{ weekday: number; periodNo: number }> {
+  const slots = [{ weekday: form.weekday, periodNo: form.periodNo }];
+  for (let i = 0; i < repeatForm.weekly - 1 && i < extraSlots.length; i++) {
+    slots.push({ weekday: extraSlots[i].weekday, periodNo: extraSlots[i].periodNo });
+  }
+  return slots;
+}
+const repeatHint = computed(() => {
+  if (repeatForm.mode === 'all') return `每周同一时间上课，共 ${repeatForm.times} 周（如第 1~18 周）`;
+  if (repeatForm.mode === 'odd') return `第 1、3、5…周上课，共 ${repeatForm.times} 次`;
+  if (repeatForm.mode === 'even') return `第 2、4、6…周上课，共 ${repeatForm.times} 次`;
+  return '';
+});
+/** 重复计划展开成的上课日期串（YYYY-MM-DD）。once=1 条；odd/even 隔 14 天；all 隔 7 天 */
+function repeatDates(weekday: number): string[] {
+  const base = new Date(weekStart.value);
+  base.setDate(base.getDate() + (weekday - 1) + (repeatForm.mode === 'even' ? 7 : 0));
+  const step = repeatForm.mode === 'odd' || repeatForm.mode === 'even' ? 14 : 7;
+  const count = repeatForm.mode === 'once' ? 1 : Math.max(1, Math.min(25, Math.round(repeatForm.times || 1)));
+  const out: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const d = new Date(base);
+    d.setDate(d.getDate() + step * i);
+    out.push(fmt(d));
+  }
+  return out;
+}
+
+/**
+ * 按当前重复口径批量创建课次（手动排课与自动排课共用）。
+ * 每条一次真实 POST；某条冲突只跳过并记录，不打断其余。
+ * slots = 本次的全部「节位」（手动排课每周节数>1 时传多组；自动排课省略 = 单节位）。
+ * capTotal = 总节数截断（手动排课传 repeatForm.total）：全部节位按日期升序展开后
+ *   只保留最早的 capTotal 条 —— 缺的节从最后一周往前扣（前满后少）。
+ */
+async function createBatch(
+  base: { courseId: number; teacherId: number; classroomId?: number; weekday: number; periodNo: number; targetClass?: string },
+  opts?: { slots?: Array<{ weekday: number; periodNo: number }>; capTotal?: number },
+  onProgress?: (done: number, total: number) => void
+) {
+  const slots = opts?.slots?.length ? opts.slots : [{ weekday: base.weekday, periodNo: base.periodNo }];
+  type Plan = { date: string; weekday: number; periodNo: number };
+  const plans: Plan[] = [];
+  for (const s of slots) {
+    for (const d of repeatDates(s.weekday)) plans.push({ date: d, weekday: s.weekday, periodNo: s.periodNo });
+  }
+  plans.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  const cap = opts?.capTotal;
+  const final = cap !== undefined && plans.length > Math.max(1, cap) ? plans.slice(0, Math.max(1, cap)) : plans;
+  const createdIds: number[] = [];
+  const failed: string[] = [];
+  for (let i = 0; i < final.length; i++) {
+    const pl = final[i];
+    const period = PERIODS.find(p => p.seq === pl.periodNo);
+    if (!period) {
+      failed.push(`${pl.date}：节次不合法`);
+      continue;
+    }
+    onProgress?.(i + 1, final.length);
+    try {
+      const res = await createSchedule({
+        ...base,
+        weekday: pl.weekday,
+        periodNo: pl.periodNo,
+        classTime: `${pl.date} ${period.start}:00`,
+        durationMin: period.duration
+      });
+      if (res?.conflict) {
+        failed.push(
+          `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：${res.conflictMsg || '该时段教师或教室已被占用'}`
+        );
+      } else if (res.scheduleId) {
+        createdIds.push(res.scheduleId);
+      }
+    } catch {
+      failed.push(`${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：保存失败`);
+    }
+  }
+  return { createdIds, failed, total: final.length };
+}
+
+/* ================= 自动排课（2026-10-20 本地实现）：待排池 → 贪心找空位 → 逐条真落库 =================
+ * 规则（后端同款冲突判定 + 行业通行做法）：
+ *   ① 只排「待排课程」池里的课，课表上已落座的一律不碰（= 行业的「手动排课锁定保护」）。
+ *   ② 找位顺序：weekday 1→5、节次 1→5，教师在该时段空闲即可落（同节次不同教师并行合法）。
+ *   ③ 教室自动匹配：容量 ≥ 选课人数的空闲教室中取「余量最小」的；没有合适教室则不填（可手动补）。
+ *   ④ 排不下/无教师的课跳过并进报告，不卡住其他课。
+ * 重复口径与手动排课共用 repeatForm（默认「每周 × 18 周」）。 */
+const autoVisible = ref(false);
+const autoRunning = ref(false);
+const autoProgress = ref('');
+const autoReport = ref<{ ok: string[]; skip: string[] } | null>(null);
+
+function openAuto() {
+  if (!poolEntries.value.length) {
+    ElMessage.info('待排课程为空，没有可自动排课的课程');
+    return;
+  }
+  autoReport.value = null;
+  autoProgress.value = '';
+  autoVisible.value = true;
+}
+
+async function runAuto() {
+  if (autoRunning.value) return;
+  const entries = poolEntries.value.slice();
+  autoRunning.value = true;
+  autoReport.value = { ok: [], skip: [] };
+  // 教师占用表（key=weekday-period-teacherId）：课表现有 + 本次自动排课新增的都记，防自己撞自己
+  const teacherBusy = new Set<string>();
+  const roomBusy = new Set<string>();
+  for (const c of allCells.value) {
+    if (!c.weekday || !c.periodNo) continue;
+    if (c.teacherId !== undefined && c.teacherId !== null) teacherBusy.add(`${c.weekday}-${c.periodNo}-${c.teacherId}`);
+    if (c.classroomId !== undefined && c.classroomId !== null) roomBusy.add(`${c.weekday}-${c.periodNo}-${c.classroomId}`);
+  }
+  const roomCandidates = classroomsAll.value.filter(r => (r.status ?? 'active') !== 'inactive');
+  try {
+    for (const entry of entries) {
+      autoProgress.value = `正在排「${entry.courseName}」（${autoReport.value.ok.length + autoReport.value.skip.length + 1}/${entries.length}）`;
+      if (!entry.teacherId) {
+        autoReport.value.skip.push(`「${entry.courseName}」：课程未指定授课教师，自动排课要求先定教师`);
+        continue;
+      }
+      const need = entry.studentCount ?? 0;
+      let placed: { weekday: number; periodNo: number; classroomId?: number } | null = null;
+      for (const wd of [1, 2, 3, 4, 5]) {
+        let hit: { weekday: number; periodNo: number; classroomId?: number } | null = null;
+        for (const pn of [1, 2, 3, 4, 5]) {
+          if (teacherBusy.has(`${wd}-${pn}-${entry.teacherId}`)) continue;
+          // 教室：该时段空闲且容量最贴（余量最小优先）；没有合适教室就不填教室
+          let best: Classroom | undefined;
+          for (const r of roomCandidates) {
+            if (roomBusy.has(`${wd}-${pn}-${r.classroomId}`)) continue;
+            if ((r.capacity ?? 0) < need) continue;
+            if (!best || (r.capacity ?? 0) < (best.capacity ?? 0)) best = r;
+          }
+          hit = { weekday: wd, periodNo: pn, classroomId: best?.classroomId };
+          break;
+        }
+        if (hit) {
+          placed = hit;
+          break;
+        }
+      }
+      if (!placed) {
+        autoReport.value.skip.push(`「${entry.courseName}」：周一至周五 1~5 节该教师全满，无空位`);
+        continue;
+      }
+      const { createdIds, failed, total } = await createBatch(
+        {
+          courseId: entry.courseId,
+          teacherId: Number(entry.teacherId),
+          classroomId: placed.classroomId,
+          weekday: placed.weekday,
+          periodNo: placed.periodNo
+        },
+        undefined,
+        (i, t) => {
+          autoProgress.value = `正在排「${entry.courseName}」第 ${i}/${t} 周…`;
+        }
+      );
+      // 占用标记按"已占"处理（保守）：即使个别周冲突，也避免下一门课排进同一格
+      teacherBusy.add(`${placed.weekday}-${placed.periodNo}-${entry.teacherId}`);
+      if (placed.classroomId) roomBusy.add(`${placed.weekday}-${placed.periodNo}-${placed.classroomId}`);
+      const roomName = placed.classroomId ? classroomsAll.value.find(r => r.classroomId === placed.classroomId)?.name ?? '' : '';
+      if (createdIds.length) {
+        autoReport.value.ok.push(
+          `「${entry.courseName}」→ 周${CN[placed.weekday - 1]} ${PERIODS.find(p => p.seq === placed.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}（${createdIds.length}/${total} 周${failed.length ? `，跳过 ${failed.length} 周` : ''}）`
+        );
+        pushUndo({ kind: 'batchCreate', scheduleIds: createdIds, label: `自动排课「${entry.courseName}」` });
+      } else {
+        autoReport.value.skip.push(`「${entry.courseName}」：所选时段全部周次冲突（${failed[0] ?? '原因未知'}）`);
+      }
+    }
+  } finally {
+    autoRunning.value = false;
+    autoProgress.value = '';
+  }
+  await load(true);
 }
 
 /* ---------- 发布课表（C-24）：draft→published，整学期口径 ----------
@@ -1318,40 +1759,61 @@ async function onPublish() {
   await load(true);
 }
 
-/* ---------- 导出：前端本地 CSV ---------- */
-function exportCsv() {
+/* ---------- 导出：前端本地 CSV（2026-10-20 加维度：总表 / 按教师 / 按教室） ---------- */
+function exportCsv(mode: 'week' | 'teacher' | 'classroom' = 'week') {
   const rows = (filtered.value.length ? filtered.value : allCells.value).slice();
   if (!rows.length) {
     ElMessage.info('当前没有可导出的课次');
     return;
   }
+  rows.sort((a, b) => (a.weekday ?? 0) - (b.weekday ?? 0) || (a.periodNo ?? 0) - (b.periodNo ?? 0));
+  const line = (cols: (string | number | undefined)[]) =>
+    cols.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',');
   const head = ['节次', '时间', '星期', '课程', '班级', '教师', '教室', '备注'];
-  const body = rows
-    .sort((a, b) => (a.weekday ?? 0) - (b.weekday ?? 0) || (a.periodNo ?? 0) - (b.periodNo ?? 0))
-    .map(r => {
-      const p = PERIODS.find(x => x.seq === r.periodNo);
-      return [
-        p?.label ?? String(r.periodNo ?? ''),
-        p ? timeRange(p) : '',
-        `周${CN[(r.weekday ?? 1) - 1]}`,
-        r.courseName ?? '',
-        r.clazzName ?? '',
-        r.teacherName ?? '',
-        r.roomName ?? '',
-        r.note ?? ''
-      ];
-    });
-  const csv = [head, ...body]
-    .map(cols => cols.map(v => `"${String(v).replace(/"/g, '""')}"`).join(','))
-    .join('\r\n');
+  const rowLine = (r: ScheduleCell) => {
+    const p = PERIODS.find(x => x.seq === r.periodNo);
+    return line([
+      p?.label ?? String(r.periodNo ?? ''),
+      p ? timeRange(p) : '',
+      `周${CN[(r.weekday ?? 1) - 1]}`,
+      r.courseName ?? '',
+      r.clazzName ?? '',
+      r.teacherName ?? '',
+      r.roomName ?? '',
+      r.note ?? ''
+    ]);
+  };
+  let csv = '';
+  let nameSuffix = '';
+  if (mode === 'week') {
+    csv = [line(head), ...rows.map(rowLine)].join('\r\n');
+  } else {
+    // 分组导出：同一份数据换聚合视角（教师课表 / 教室课表），组间空行分隔
+    const keyOfRow = mode === 'teacher' ? (r: ScheduleCell) => r.teacherName || '未指定教师' : (r: ScheduleCell) => r.roomName || '未指定教室';
+    const groups = new Map<string, ScheduleCell[]>();
+    for (const r of rows) {
+      const k = keyOfRow(r);
+      const list = groups.get(k);
+      if (list) list.push(r);
+      else groups.set(k, [r]);
+    }
+    const parts: string[] = [];
+    for (const [k, list] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0], 'zh'))) {
+      parts.push(line([`${mode === 'teacher' ? '教师' : '教室'}：${k}`]), ...list.map(rowLine), '');
+    }
+    csv = parts.join('\r\n');
+    nameSuffix = mode === 'teacher' ? '_按教师' : '_按教室';
+  }
   const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `课表_${weekStartStr.value}_${weekEndStr.value}.csv`;
+  a.download = `课表${nameSuffix}_${weekStartStr.value}_${weekEndStr.value}.csv`;
   a.click();
   URL.revokeObjectURL(url);
-  ElMessage.success('课表已导出（CSV，可用 Excel/WPS 打开）');
+  ElMessage.success(
+    mode === 'week' ? '课表已导出（CSV，可用 Excel/WPS 打开）' : `已按${mode === 'teacher' ? '教师' : '教室'}分组导出`
+  );
 }
 
 onMounted(async () => {
@@ -1377,10 +1839,19 @@ watch(
       >
         <ZkIcon name="undo-2" :size="16" style="margin-right: 4px" />撤回
       </button>
-      <button class="btn btn-outline" @click="exportCsv">
-        <ZkIcon name="download" :size="16" style="margin-right: 4px" />导出课表
-      </button>
-      <button class="btn btn-primary" @click="onAuto">
+      <el-dropdown @command="(m: 'week' | 'teacher' | 'classroom') => exportCsv(m)">
+        <button class="btn btn-outline" type="button">
+          <ZkIcon name="download" :size="16" style="margin-right: 4px" />导出课表<ZkIcon name="chevron-down" :size="13" style="margin-left: 2px" />
+        </button>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item command="week">本周总课表</el-dropdown-item>
+            <el-dropdown-item command="teacher">按教师分组（教师课表）</el-dropdown-item>
+            <el-dropdown-item command="classroom">按教室分组（教室课表）</el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
+      <button class="btn btn-primary" title="把待排课程自动找空闲时段排入课表" @click="openAuto">
         <ZkIcon name="zap" :size="16" style="margin-right: 4px" />自动排课
       </button>
     </div>
@@ -1404,12 +1875,13 @@ watch(
       <el-select v-model="filters.termId" class="f-select" placeholder="全部学期">
         <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="String(t.termId)" />
       </el-select>
-      <!-- 院系：≥2 个院系才显示（单院系筛选无意义），按课程的 school_id 过滤课表与待排池 -->
+      <!-- 学校：≥2 个学校才显示（单校筛选无意义），按课程的 school_id 过滤课表与待排池；
+           school 表是「学校」级（贵州大学），不是院系 ⇒ 文案用学校 -->
       <el-select
         v-if="schools.length > 1"
         v-model="filters.schoolId"
         class="f-select"
-        placeholder="全部院系"
+        placeholder="全部学校"
         clearable
         filterable
       >
@@ -1436,6 +1908,10 @@ watch(
           <ZkIcon name="list-checks" :size="14" style="margin-right: 4px" />打开
         </button>
       </div>
+      <!-- 冲突计数徽标（本地推导，口径与后端一致：同节次同教师 / 同教室） -->
+      <span v-if="conflictCount" class="badge badge-error">
+        <ZkIcon name="alert-triangle" :size="12" style="margin-right: 4px" />{{ conflictCount }} 处冲突待调整
+      </span>
     </div>
   </div>
 
@@ -1502,6 +1978,14 @@ watch(
         放到<b>同一教师的课次</b>上，只能<b>互换上课时间</b>
       </span>
     </div>
+    <!-- 空态提示：选中学期后查不到课次时，大概率是课次没关联学期（term_id 为 NULL）被筛掉 -->
+    <div v-if="!loading && !refreshing && !allCells.length && filters.termId" class="move-hint">
+      <ZkIcon name="alert-triangle" :size="14" />
+      <span>
+        当前学期筛选下没有课次（本周课程可能未关联学期，被学期过滤排除了）——把上方「学期」切回
+        <b>全部学期</b>即可看到。
+      </span>
+    </div>
     <!-- 翻周条：课表上方——上一周贴左 · 日期范围+本周按钮居中 · 下一周贴右 -->
     <div class="week-pager">
       <button class="btn btn-outline" @click="shiftWeek(-7)">
@@ -1515,11 +1999,27 @@ watch(
         下一周<ZkIcon name="chevron-right" :size="15" style="margin-left: 4px" />
       </button>
     </div>
+    <!-- 本周摘要条（UI 对标第 5 项）：当前筛选下的课次总量/教师/教室/冲突一眼可见 -->
+    <div class="week-stats">
+      <template v-if="weekStats.total">
+        <span>本周共 <b>{{ weekStats.total }}</b> 节课</span>
+        <span class="sep">·</span>
+        <span>{{ weekStats.teachers }} 位教师</span>
+        <span class="sep">·</span>
+        <span>{{ weekStats.rooms }} 间教室</span>
+        <span v-if="weekStats.conflicts" class="stat-conflict">
+          · {{ weekStats.conflicts }} 处冲突待调整
+        </span>
+      </template>
+      <span v-else class="muted">本周暂无课次</span>
+    </div>
     <table class="sched">
       <thead>
         <tr>
           <th style="width: 96px">节次</th>
-          <th v-for="d in WEEKDAYS" :key="d.v">{{ d.label }}</th>
+          <th v-for="d in WEEKDAYS" :key="d.v" :class="{ 'is-today': d.v === todayWeekday }">
+            {{ d.label }}<span class="th-date">{{ dateOf(d.v).slice(5) }}</span>
+          </th>
         </tr>
       </thead>
       <tbody>
@@ -1533,6 +2033,7 @@ watch(
             :key="c.weekday"
             class="cell"
             :class="{
+              'is-today-col': c.weekday === todayWeekday,
               'drop-ok': dropMode(c.weekday, row.period.seq) === 'ok',
               'drop-swap': dropMode(c.weekday, row.period.seq) === 'swaponly',
               'drop-no': dropMode(c.weekday, row.period.seq) === 'no'
@@ -1563,9 +2064,10 @@ watch(
                   :key="s.scheduleId"
                   class="cblock"
                   :class="[
-                    s.conflict ? 'c-conf' : 'c-ok',
+                    conflictOf(s).length ? 'c-conf' : ['c-ok', courseTone(s.courseId)],
                     {
                       'c-dragging': draggingCell?.scheduleId === s.scheduleId,
+                      'c-peer': hoverCourseId !== null && s.courseId === hoverCourseId,
                       'c-join-target': isChoiceHover(c.weekday, row.period.seq, s),
                       'c-swap-target': isSwapOnlyHover(c.weekday, row.period.seq, s)
                     }
@@ -1576,11 +2078,13 @@ watch(
                       : undefined
                   "
                   draggable="true"
-                  title="点击查看/调整；拖到空格子或别的教师的课次上，可改上课时间；拖到同一教师的课次上，只能互换上课时间"
+                  :title="cardTitle(s)"
                   @dragstart="onCellBlockDragStart(s, $event)"
                   @dragend="onDragEnd"
                   @dragover.stop="onBlockDragOver(c.weekday, row.period.seq, s, $event)"
                   @drop.stop="onBlockDrop(c.weekday, row.period.seq, s, $event)"
+                  @mouseenter="hoverCourseId = s.courseId ?? null"
+                  @mouseleave="hoverCourseId = null"
                   @click="onCardClick(s, c.weekday, row.period.seq, c.list.length)"
                 >
                   <!-- 未发布标识（C-24）：draft 课次学生/教师端不可见，点「发布课表」后才可见 -->
@@ -1599,6 +2103,10 @@ watch(
                   <span class="who"><ZkIcon name="users" :size="11" />{{ s.clazzName || '未填班级' }}</span>
                   <span class="who"><ZkIcon name="user" :size="11" />{{ s.teacherName || '—' }}</span>
                   <span class="who"><ZkIcon name="map-pin" :size="11" />{{ s.roomName || '未指定教室' }}</span>
+                  <!-- 冲突原因（本地推导）：让红卡"为什么红"一眼可见 -->
+                  <span v-for="w in conflictOf(s)" :key="w" class="who">
+                    <ZkIcon name="alert-triangle" :size="11" />{{ w }}
+                  </span>
                   <!-- ★ 叠牌常驻标志：不用悬停也能一眼看出下面还压着课 -->
                   <span
                     v-if="idx === 0 && c.list.length > 1"
@@ -1699,15 +2207,35 @@ watch(
       </div>
       <div class="detail-row">
         <span class="detail-k">教室</span>
-        <el-select
-          v-model="editForm.classroomId"
-          placeholder="未指定教室"
-          clearable
-          filterable
-          style="flex: 1; min-width: 0"
-        >
-          <el-option v-for="o in roomOptions" :key="o.value" :label="o.label" :value="o.value" />
-        </el-select>
+        <div style="flex: 1; min-width: 0">
+          <el-select
+            v-model="editForm.classroomId"
+            placeholder="未指定教室"
+            clearable
+            filterable
+            style="width: 100%"
+          >
+            <el-option v-for="o in roomOptions" :key="o.value" :label="o.label" :value="o.value" />
+          </el-select>
+          <!-- 容量校验：教室容量 < 课程选课人数时提示（不硬拦） -->
+          <div v-if="detailCapacityWarn" class="small" style="color: var(--error, #d92d20)">
+            {{ detailCapacityWarn }}
+          </div>
+        </div>
+      </div>
+      <!-- 每周节数核对（只读）：按周统计该课程实际排了几节，缺节的周提示手动补齐 -->
+      <div class="detail-row">
+        <span class="detail-k">每周节数</span>
+        <div style="flex: 1; min-width: 0">
+          <span v-if="!weeklyCheck || weeklyCheck.loading" class="small muted">统计中…</span>
+          <template v-else>
+            <div class="small">{{ weeklyCheck.text }}</div>
+            <div v-if="weeklyCheck.uneven" class="small" style="color: var(--warning, #b45309); line-height: 1.7">
+              各周节数不均：翻到缺节的那一周，把「待排课程」签拖到空格（或点空格新增）即可补齐
+            </div>
+            <div class="small muted">以当前显示周为第 1 周向后统计 25 周（已放回待排的课次不计）</div>
+          </template>
+        </div>
       </div>
       <div class="detail-row">
         <span class="detail-k">备注</span>
@@ -1860,6 +2388,10 @@ watch(
         <el-select v-model="form.classroomId" placeholder="可不填" clearable style="width: 100%">
           <el-option v-for="o in roomOptions" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
+        <!-- 容量校验：教室容量 < 课程选课人数时提示（不硬拦） -->
+        <div v-if="createCapacityWarn" class="small" style="color: var(--error, #d92d20); width: 100%">
+          {{ createCapacityWarn }}
+        </div>
       </el-form-item>
       <el-form-item label="节次">
         <el-select v-model="form.periodNo" style="width: 100%">
@@ -1875,6 +2407,66 @@ watch(
         <el-select v-model="form.weekday" style="width: 100%">
           <el-option v-for="d in WEEKDAYS" :key="d.v" :label="d.label" :value="d.v" />
         </el-select>
+      </el-form-item>
+      <!-- 每周节数（2026-10-20）：一周多节的课一次排完，每节可分别定时间 -->
+      <el-form-item label="每周节数">
+        <div style="display: flex; gap: 8px; width: 100%; align-items: center">
+          <el-input-number v-model="repeatForm.weekly" :min="1" :max="5" @change="syncRepeatTotal" style="width: 110px" />
+          <span class="small muted">大于 1 时可为每节分别选时间</span>
+        </div>
+      </el-form-item>
+      <el-form-item
+        v-for="(s, i) in extraSlotList"
+        :key="'extra-slot-' + i"
+        :label="`第${i + 2}节`"
+      >
+        <div style="display: flex; gap: 8px; width: 100%">
+          <el-select v-model="s.weekday" style="width: 100%">
+            <el-option v-for="d in WEEKDAYS" :key="d.v" :label="d.label" :value="d.v" />
+          </el-select>
+          <el-select v-model="s.periodNo" style="width: 100%">
+            <el-option
+              v-for="p in PERIODS"
+              :key="p.seq"
+              :label="`${p.label}（${timeRange(p)}）`"
+              :value="p.seq"
+            />
+          </el-select>
+        </div>
+      </el-form-item>
+      <!-- 周次重复（2026-10-20）：排一次 = 按周展开成整学期的课次，翻周即可见 -->
+      <el-form-item label="重复">
+        <div style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
+          <el-select v-model="repeatForm.mode" style="flex: 1; min-width: 140px">
+            <el-option v-for="(t, m) in REPEAT_TEXT" :key="m" :label="t" :value="m" />
+          </el-select>
+          <el-input-number
+            v-if="repeatForm.mode !== 'once'"
+            v-model="repeatForm.times"
+            :min="1"
+            :max="25"
+            style="width: 110px"
+          />
+          <span v-if="repeatForm.mode !== 'once'" class="small muted">周</span>
+        </div>
+        <div v-if="repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
+          以当前所在周为第 1 周 · {{ repeatHint }}
+        </div>
+      </el-form-item>
+      <!-- 总节数（2026-10-20）：满额可改小 —— 不够分时从最后一周往前少排（前满后少） -->
+      <el-form-item v-if="repeatForm.mode !== 'once'" label="总节数">
+        <div style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
+          <el-input-number
+            v-model="repeatForm.total"
+            :min="1"
+            :max="repeatForm.weekly * effectiveRepeatTimes"
+            style="width: 130px"
+          />
+          <span v-if="repeatForm.total < repeatForm.weekly * effectiveRepeatTimes" class="small" style="color: var(--warning, #b45309)">
+            不足满额 {{ repeatForm.weekly * effectiveRepeatTimes }} 节：从最后一周往前少排（前满后少）
+          </span>
+          <span v-else class="small muted">满额 = 每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 周</span>
+        </div>
       </el-form-item>
     </el-form>
     <template #footer>
@@ -1894,6 +2486,55 @@ watch(
           <el-button type="primary" :loading="saving" @click="submitCreate">保存课次</el-button>
         </span>
       </div>
+    </template>
+  </el-dialog>
+
+  <!-- 自动排课（本地实现）：待排池贪心找空位，逐条真落库；结束出报告 -->
+  <el-dialog v-model="autoVisible" title="自动排课" width="560px" :close-on-click-modal="!autoRunning">
+    <template v-if="!autoReport">
+      <p class="small" style="margin-top: 0">把「待排课程」池里的课程自动找空闲时段排入课表：</p>
+      <div class="detail-row">
+        <span class="detail-k">重复</span>
+        <div style="flex: 1; min-width: 0">
+          <el-select v-model="repeatForm.mode" style="width: 100%">
+            <el-option v-for="(t, m) in REPEAT_TEXT" :key="m" :label="t" :value="m" />
+          </el-select>
+          <div v-if="repeatForm.mode !== 'once'" class="small muted">
+            以当前所在周为第 1 周 · {{ repeatHint }}
+          </div>
+        </div>
+      </div>
+      <ul class="small muted" style="padding-left: 18px; line-height: 2; margin: 10px 0 0">
+        <li>只排「待排课程」池里的课，<b>课表上已有的课一律不动</b>（锁定保护）</li>
+        <li>找位规则：教师空闲优先；教室按「容量 ≥ 选课人数、余量最小」自动匹配，无合适教室则不填</li>
+        <li>排不下的课跳过并在结束后报告，不会卡住其他课</li>
+      </ul>
+      <p v-if="autoProgress" class="small" style="margin: 12px 0 0">
+        <ZkIcon name="refresh-cw" :size="13" style="margin-right: 4px" />{{ autoProgress }}
+      </p>
+    </template>
+    <template v-else>
+      <p style="margin-top: 0">
+        <b>排课结果：成功 {{ autoReport.ok.length }} 门，跳过 {{ autoReport.skip.length }} 门</b>
+      </p>
+      <ul v-if="autoReport.ok.length" class="small" style="padding-left: 18px; line-height: 2">
+        <li v-for="(t, i) in autoReport.ok" :key="'ok' + i">{{ t }}</li>
+      </ul>
+      <div v-if="autoReport.skip.length">
+        <b class="small">未排入：</b>
+        <ul class="small" style="color: var(--error, #d92d20); padding-left: 18px; line-height: 2">
+          <li v-for="(t, i) in autoReport.skip" :key="'skip' + i">{{ t }}</li>
+        </ul>
+      </div>
+    </template>
+    <template #footer>
+      <span v-if="!autoReport">
+        <el-button :disabled="autoRunning" @click="autoVisible = false">取消</el-button>
+        <el-button type="primary" :loading="autoRunning" @click="runAuto">开始自动排课</el-button>
+      </span>
+      <span v-else>
+        <el-button type="primary" @click="autoVisible = false">知道了</el-button>
+      </span>
     </template>
   </el-dialog>
 
@@ -2719,5 +3360,72 @@ watch(
 .gap-hint > span {
   flex: 1;
   min-width: 0;
+}
+
+/* ========== 2026-10-20 UI 惯例对标：今天列高亮 + 课程配色 + hover 联动 + 摘要条 ========== */
+
+/* 列头日期小字（WebUntis 惯例：周一 10/20） */
+.th-date {
+  display: block;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--ink-400);
+  line-height: 1.3;
+}
+
+/* 今天列头：Google Calendar 同款强调（填充色 + 反白） */
+.sched th.is-today {
+  background: var(--brand-600);
+  color: #fff;
+  font-weight: 600;
+}
+.sched th.is-today .th-date {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+/* 今天整列铺淡底。拖拽放置态（drop-ok/swap/no）优先——它们在拖动中临时覆盖本底色 */
+.sched td.cell.is-today-col:not(.drop-ok):not(.drop-swap):not(.drop-no) {
+  background: #f2faf6;
+}
+
+/* 课程卡一门课一色：低饱和 tint 底 + 同系深字（密集网格不花、扫读快）。
+   仅覆盖 c-ok 的三件套（背景/文字/描边），布局样式不动；冲突红走 c-conf，天然优先。 */
+.cblock.t1 { background: #eef2ff; color: #3730a3; border-color: #c7d2fe; }
+.cblock.t2 { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+.cblock.t3 { background: #ecfdf5; color: #047857; border-color: #a7f3d0; }
+.cblock.t4 { background: #fff7ed; color: #c2410c; border-color: #fed7aa; }
+.cblock.t5 { background: #fdf2f8; color: #be185d; border-color: #fbcfe8; }
+.cblock.t6 { background: #f0fdfa; color: #0f766e; border-color: #99f6e4; }
+.cblock.t7 { background: #faf5ff; color: #7e22ce; border-color: #e9d5ff; }
+.cblock.t8 { background: #fefce8; color: #a16207; border-color: #fde68a; }
+.cblock.t9 { background: #f8fafc; color: #334155; border-color: #cbd5e1; }
+.cblock.t10 { background: #ecfeff; color: #0e7490; border-color: #a5f3fc; }
+
+/* hover 联动：悬停某节课时，同课程的所有课次描边高亮（WebUntis 惯例）。
+   用 outline 不占布局、不挤叠牌几何；色彩取品牌绿，与冲突红/可放置虚线可区分。 */
+.cblock.c-peer {
+  outline: 2px solid var(--brand-600);
+  outline-offset: -1px;
+}
+
+/* 本周摘要条：翻周条与课表之间的一行小字 */
+.week-stats {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -4px 0 10px;
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--ink-500);
+}
+.week-stats b {
+  color: var(--ink-900);
+}
+.week-stats .sep {
+  color: var(--ink-300);
+}
+.week-stats .stat-conflict {
+  color: var(--error);
+  font-weight: 600;
 }
 </style>
