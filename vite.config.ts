@@ -18,6 +18,8 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const proxyTarget = env.VITE_PROXY_TARGET || 'http://127.0.0.1:8080';
   return {
+    // 子路径部署：生产按 /admin/ 挂载（运维 10-21 实测口径）；BASE_URL 供 router 与登录跳转跟随
+    base: '/admin/',
     plugins: [vue()],
     resolve: {
       alias: {

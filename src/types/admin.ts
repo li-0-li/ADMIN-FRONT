@@ -445,6 +445,8 @@ export interface AnalyticsAlert {
   status?: string;
   /** 已处理时间，yyyy-MM-dd HH:mm */
   handledAt?: string | null;
+  /** 处理备注（标记已处理时填写，可空；旧包无此字段） */
+  handleNote?: string | null;
 }
 
 /** 全校学情聚合 VO */

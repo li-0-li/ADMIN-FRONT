@@ -379,6 +379,58 @@ async function doDelete(row: AdminUserVo) {
   fetchList();
 }
 
+/* ---------------- 批量启停 / 批量删除（循环调既有单条接口，后端护栏兜底） ---------------- */
+const selectedRows = ref<AdminUserVo[]>([]);
+const batchLoading = ref(false);
+
+function onSelectionChange(rows: AdminUserVo[]) {
+  selectedRows.value = rows;
+}
+
+type BatchKind = 'enable' | 'disable' | 'delete';
+const BATCH_LABEL: Record<BatchKind, string> = { enable: '批量启用', disable: '批量停用', delete: '批量删除' };
+
+async function runBatch(kind: BatchKind) {
+  const rows = selectedRows.value;
+  if (!rows.length) return;
+  const admins = rows.filter(isAdminRow);
+  const targets = rows.filter((r) => !isAdminRow(r));
+  if (!targets.length) {
+    ElMessage.warning('选中项均为管理员账号，仅超级管理员可操作，已取消');
+    return;
+  }
+  const nameList = targets.map((r) => r.username).join('、');
+  const verb = kind === 'delete' ? '删除' : kind === 'enable' ? '启用' : '停用';
+  await ElMessageBox.confirm(
+    `确定要${verb}以下 ${targets.length} 个账号吗？${kind === 'delete' ? '删除后不可恢复，' : '停用后立即踢下线，'}该操作逐个生效。\n${nameList}` +
+      (admins.length ? `\n（另有 ${admins.length} 个管理员账号已自动跳过）` : ''),
+    BATCH_LABEL[kind],
+    { type: 'warning', confirmButtonText: `确定${verb}` }
+  );
+  batchLoading.value = true;
+  let ok = 0;
+  const fails: string[] = [];
+  try {
+    for (const r of targets) {
+      try {
+        if (kind === 'delete') await deleteUser(r.userId);
+        else await updateUserStatus(r.userId, kind === 'enable' ? '0' : '1');
+        ok += 1;
+      } catch (e) {
+        fails.push(`${r.username}（${e instanceof Error ? e.message : '失败'}）`);
+      }
+    }
+  } finally {
+    batchLoading.value = false;
+  }
+  if (fails.length) {
+    await ElMessageBox.alert(`成功 ${ok} 个，失败 ${fails.length} 个：\n${fails.join('\n')}`, '批量结果', { type: 'warning' });
+  } else {
+    ElMessage.success(`${BATCH_LABEL[kind]}完成：共 ${ok} 个`);
+  }
+  fetchList();
+}
+
 /* ---------------- 查看详情 ---------------- */
 const detailVisible = ref(false);
 const detailRow = ref<AdminUserVo | null>(null);
@@ -441,6 +493,22 @@ async function openFootprint(row: AdminUserVo) {
       <el-button :loading="exporting" @click="onExport">
         <ZkIcon name="download" :size="15" style="margin-right: 4px" />导出
       </el-button>
+      <el-divider direction="vertical" />
+      <el-tooltip content="勾选列表行后可用" :disabled="!!selectedRows.length" placement="top">
+        <el-button :disabled="!selectedRows.length" :loading="batchLoading" @click="runBatch('enable')">
+          <ZkIcon name="power" :size="15" style="margin-right: 4px" />启用{{ selectedRows.length ? `（${selectedRows.length}）` : '' }}
+        </el-button>
+      </el-tooltip>
+      <el-tooltip content="勾选列表行后可用" :disabled="!!selectedRows.length" placement="top">
+        <el-button :disabled="!selectedRows.length" :loading="batchLoading" @click="runBatch('disable')">
+          <ZkIcon name="ban" :size="15" style="margin-right: 4px" />停用
+        </el-button>
+      </el-tooltip>
+      <el-tooltip content="勾选列表行后可用" :disabled="!!selectedRows.length" placement="top">
+        <el-button :disabled="!selectedRows.length" :loading="batchLoading" type="danger" plain @click="runBatch('delete')">
+          <ZkIcon name="trash-2" :size="15" style="margin-right: 4px" />删除
+        </el-button>
+      </el-tooltip>
     </div>
     <div class="right">
       <!-- 搜索整体单元（与课程审核页同款）：占位文案用覆盖层，物理杜绝选中复制 -->
@@ -469,7 +537,8 @@ async function openFootprint(row: AdminUserVo) {
   </div>
 
   <div class="card">
-    <el-table v-loading="loading" :data="rows" style="width: 100%">
+    <el-table v-loading="loading" :data="rows" style="width: 100%" @selection-change="onSelectionChange">
+      <el-table-column type="selection" width="42" />
       <el-table-column label="用户名" min-width="240">
         <template #default="{ row }">
           <div class="row" style="gap: 8px">

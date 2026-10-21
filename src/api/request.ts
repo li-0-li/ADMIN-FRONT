@@ -29,8 +29,10 @@ http.interceptors.request.use(config => {
 
 function gotoLogin() {
   localStorage.removeItem(TOKEN_KEY);
-  if (!location.pathname.startsWith('/login')) {
-    location.href = '/login';
+  // 登录页跟随部署 base（子路径 /admin/ 下为 /admin/login），不能写死根路径 /login（那是后端 POST 接口）
+  const loginPath = import.meta.env.BASE_URL + 'login';
+  if (!location.pathname.startsWith(loginPath)) {
+    location.href = loginPath;
   }
 }
 

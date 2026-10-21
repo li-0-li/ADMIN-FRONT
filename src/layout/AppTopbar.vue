@@ -27,7 +27,19 @@ const pwdRules: FormRules = {
   oldPassword: [{ required: true, message: '请输入原密码', trigger: 'blur' }],
   newPassword: [
     { required: true, message: '请输入新密码', trigger: 'blur' },
-    { min: 6, max: 20, message: '新密码长度 6 ~ 20 位', trigger: 'blur' }
+    { min: 8, max: 20, message: '新密码长度 8 ~ 20 位', trigger: 'blur' },
+    {
+      validator: (_rule, value: string, callback) => {
+        if (value && (!/[A-Za-z]/.test(value) || !/[0-9]/.test(value))) {
+          callback(new Error('新密码须同时包含字母和数字'));
+        } else if (value && value.includes(' ')) {
+          callback(new Error('新密码不能包含空格'));
+        } else {
+          callback();
+        }
+      },
+      trigger: 'blur'
+    }
   ],
   confirm: [
     { required: true, message: '请再次输入新密码', trigger: 'blur' },
@@ -64,9 +76,9 @@ async function submitPwd() {
     type: 'success',
     confirmButtonText: '重新登录'
   });
-  // 改密后强制重新登录（清 token 走登录页）
+  // 改密后强制重新登录（清 token 走登录页）；跟随部署 base，防子路径下跳到根 /login
   userStore.logout();
-  location.href = '/login';
+  location.href = import.meta.env.BASE_URL + 'login';
 }
 </script>
 

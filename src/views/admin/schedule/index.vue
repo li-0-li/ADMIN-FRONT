@@ -73,8 +73,9 @@ const loading = ref(false);
  */
 const refreshing = ref(false);
 const filters = reactive({ courseId: '', teacherId: '', clazzName: '', classroomId: '', major: '', termId: '', schoolId: '' });
-/** 学期下拉（后端 ScheduleQueryBo 支持 termId 过滤 ⇒ 服务端筛，变化即重查） */
-const terms = ref<{ termId: number; name: string }[]>([]);
+/** 学期下拉（后端 ScheduleQueryBo 支持 termId 过滤 ⇒ 服务端筛，变化即重查）；
+ *  startDate/endDate 用于「学期第 N 周」标注（2026-10-21） */
+const terms = ref<{ termId: number; name: string; startDate?: string; endDate?: string }[]>([]);
 /** 学校列表（基础数据 school 表，学校级）：≥2 个才显示学校筛选，单校无筛选意义 */
 const schools = ref<{ schoolId: number; name: string }[]>([]);
 /** 班级名 → 专业名 映射（schedule.target_class 是冗余字符串、无 clazzId 外键，
@@ -458,6 +459,33 @@ const returnedCells = ref<ScheduleCell[]>([]);
 
 /** 当前学期 id（loadPickers 拉学期列表时记录）：未选学期（=全部学期）时池子按它判定「已排」 */
 const currentTermId = ref('');
+
+/* ---------- 学期周次标注（2026-10-21）：解决"看不出当前是学期第几周、重复锚点排错"的问题 ---------- */
+const currentTermInfo = computed(() => terms.value.find(t => String(t.termId) === String(currentTermId.value)) ?? null);
+/** 当前显示周相对学期的周次（1 起）；学期没配起止日期或日期非法时 = null（不标注）。
+ *  ★ 日期解析容错：后端可能返回 "2026-09-07" 也可能 "2026-09-07 00:00:00" —— 统一取前 10 位再拼 T，
+ *    否则带时分秒的原串拼 T 后 NaN，周次标签会静默消失。 */
+function parseDateOnly(v?: string | null): Date | null {
+  if (!v) return null;
+  const d = new Date(`${String(v).slice(0, 10).replace(/\//g, '-')}T00:00:00`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+const weekNo = computed<number | null>(() => {
+  const anchor = parseDateOnly(currentTermInfo.value?.startDate);
+  if (!anchor) return null;
+  // 对齐到学期起始日所在周的周一：学期周中开课也算整第 1 周
+  anchor.setDate(anchor.getDate() - ((anchor.getDay() + 6) % 7));
+  const diff = Math.round((weekStart.value.getTime() - anchor.getTime()) / (7 * 86400000));
+  return diff + 1;
+});
+const weekNoLabel = computed(() => {
+  const n = weekNo.value;
+  if (n === null) return '';
+  if (n < 1) return '开学前';
+  const end = parseDateOnly(currentTermInfo.value?.endDate);
+  if (end && weekStart.value > new Date(end.getTime() + 86399000)) return '假期中';
+  return `第 ${n} 周`;
+});
 
 /** 待排池条目：1 条 = 1 节课（放回课次逐条成签）或 1 门本周未排的课程 */
 interface PoolEntry extends CourseBrief {
@@ -1342,7 +1370,12 @@ async function loadPickers() {
       const res = await listTerms({ page: 1, pageSize: 50 });
       terms.value = (res?.list ?? [])
         .filter(t => t.termId !== undefined)
-        .map(t => ({ termId: t.termId as number, name: t.name || String(t.termId) }));
+        .map(t => ({
+          termId: t.termId as number,
+          name: t.name || String(t.termId),
+          startDate: t.startDate,
+          endDate: t.endDate
+        }));
       // ⛔ 不再默认选中「当前学期」（2026-10-20 实测）：演示数据的课次 term_id 为 NULL，
       // 后端按 termId 过滤会把它们**全部筛掉**（带任何 termId 查询都返回 0 行）⇒ 课表整页空白。
       // 默认「全部学期」，让用户显式选学期；selected 后若为空见模板里的空态提示。
@@ -1992,8 +2025,9 @@ watch(
         <ZkIcon name="chevron-left" :size="15" style="margin-right: 4px" />上一周
       </button>
       <div class="week-center">
-        <div class="sched-week">{{ weekRangeLabel }}</div>
         <button class="btn btn-outline" @click="gotoThisWeek">本周</button>
+        <div class="sched-week">{{ weekRangeLabel }}</div>
+        <span v-if="weekNoLabel" class="week-no">{{ weekNoLabel }}</span>
       </div>
       <button class="btn btn-outline" @click="shiftWeek(7)">
         下一周<ZkIcon name="chevron-right" :size="15" style="margin-left: 4px" />
@@ -2001,6 +2035,7 @@ watch(
     </div>
     <!-- 本周摘要条（UI 对标第 5 项）：当前筛选下的课次总量/教师/教室/冲突一眼可见 -->
     <div class="week-stats">
+      <span v-if="weekNoLabel" class="week-no-inline">{{ weekNoLabel }}</span>
       <template v-if="weekStats.total">
         <span>本周共 <b>{{ weekStats.total }}</b> 节课</span>
         <span class="sep">·</span>
@@ -2452,6 +2487,13 @@ watch(
         <div v-if="repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
           以当前所在周为第 1 周 · {{ repeatHint }}
         </div>
+        <div
+          v-if="repeatForm.mode !== 'once' && weekNo !== null && weekNo > 1"
+          class="small"
+          style="color: var(--warning, #b45309); width: 100%"
+        >
+          注意：当前显示的是<b>学期第 {{ weekNo }} 周</b>，重复展开以「显示周」为重复第 1 周——课程要从学期第 1 周上起的话，请先翻回第 1 周再保存
+        </div>
       </el-form-item>
       <!-- 总节数（2026-10-20）：满额可改小 —— 不够分时从最后一周往前少排（前满后少） -->
       <el-form-item v-if="repeatForm.mode !== 'once'" label="总节数">
@@ -2501,6 +2543,9 @@ watch(
           </el-select>
           <div v-if="repeatForm.mode !== 'once'" class="small muted">
             以当前所在周为第 1 周 · {{ repeatHint }}
+          </div>
+          <div v-if="repeatForm.mode !== 'once' && weekNo !== null && weekNo > 1" class="small" style="color: var(--warning, #b45309)">
+            注意：当前显示的是学期第 {{ weekNo }} 周，自动排课从「显示周」开始展开——要从学期第 1 周起排，请先翻回第 1 周
           </div>
         </div>
       </div>
@@ -3426,6 +3471,24 @@ watch(
 }
 .week-stats .stat-conflict {
   color: var(--error);
+  font-weight: 600;
+}
+
+/* 学期周次标注：翻周条日期旁的胶囊 + 摘要条内联 */
+.week-no {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 12px;
+  background: var(--brand-100);
+  color: var(--brand-800);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.week-no-inline {
+  color: var(--brand-800);
   font-weight: 600;
 }
 </style>

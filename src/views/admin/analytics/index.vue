@@ -351,17 +351,18 @@ onMounted(async () => {
           <div class="card-pad" style="padding-bottom: 0"><div class="card-title">课程分类统计（按课程类别）</div></div>
           <table class="tbl">
             <thead>
-              <tr><th>类别</th><th>课程数</th><th>学生数</th><th>及格率</th></tr>
+              <tr><th>类别</th><th>课程数</th><th>学生数</th><th>平均分</th><th>及格率</th></tr>
             </thead>
             <tbody>
               <tr v-for="(c, i) in data.categories ?? []" :key="c.category">
                 <td><span class="badge" :class="catCls(i)">{{ catText(c.category) }}</span></td>
                 <td>{{ c.courseCount }}</td>
                 <td>{{ c.studentCount }}</td>
+                <td>{{ num(c.avgScore) }}</td>
                 <td>{{ num(c.passRate, '%' ) }}</td>
               </tr>
               <tr v-if="!data.categories?.length">
-                <td colspan="4" class="center muted" style="padding: 24px">暂无分类数据</td>
+                <td colspan="5" class="center muted" style="padding: 24px">暂无分类数据</td>
               </tr>
             </tbody>
           </table>
@@ -642,6 +643,7 @@ onMounted(async () => {
             <tr>
               <th>学生</th><th>课程</th><th>院系</th><th>类型</th><th>当前分</th><th>等级</th>
               <th>{{ alertStatus === 'open' ? '操作' : '处理时间' }}</th>
+              <th v-if="alertStatus === 'closed'">处理备注</th>
             </tr>
           </thead>
           <tbody>
@@ -659,6 +661,7 @@ onMounted(async () => {
                 >标记已处理</button>
                 <span v-else class="small muted">{{ a.handledAt || '—' }}</span>
               </td>
+              <td v-if="alertStatus === 'closed'" class="small muted">{{ a.handleNote || '—' }}</td>
             </tr>
           </tbody>
         </table>
