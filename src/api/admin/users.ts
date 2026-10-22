@@ -37,8 +37,10 @@ export function resetUserPassword(userId: number) {
   return request<UserCreateVo>({ url: `${BASE}/${userId}/password/reset`, method: 'post' });
 }
 
-/** B-7 导出账号 Excel（按当前筛选；返回文件流） */
-export function exportUsers(query: { keyword?: string; roleKey?: string; status?: string }) {
+/** B-7 导出账号 Excel（按当前筛选；返回文件流）
+ *  后端 AdminAccountServiceImpl.buildExportRows 收的是与列表同一个 UserQueryBo，
+ *  并在内部强制 page=1 / pageSize=1000 ⇒ 这里只传筛选项，分页参数发过去也会被覆盖。 */
+export function exportUsers(query: UserQuery) {
   return requestBlob({ url: `${BASE}/export`, method: 'post', data: query });
 }
 

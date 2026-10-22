@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import type { FormInstance, FormRules } from 'element-plus';
+import type { FormInstance, FormRules, TableInstance } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import {
   createUser,
@@ -16,7 +16,7 @@ import {
   updateUser,
   updateUserStatus
 } from '@/api/admin/users';
-import type { AdminUserVo, FootprintVo, ImportResultVo } from '@/types/admin';
+import type { AdminUserVo, FootprintVo, ImportResultVo, UserSaveBo } from '@/types/admin';
 import { useUserStore } from '@/store/user';
 
 /* ---------------- 词典 ---------------- */
@@ -43,13 +43,56 @@ const ROLE_OPTIONS = [
   { value: 'common', label: '普通用户' }
 ];
 
+/** 状态下拉选项（若依字典 sys_normal_disable：'0'=启用、'1'=停用；与列表徽标同一口径） */
+const STATUS_OPTIONS = [
+  { value: '', label: '全部状态' },
+  { value: '0', label: '启用' },
+  { value: '1', label: '停用' }
+];
+
 /* ---------------- 列表 ---------------- */
 const loading = ref(false);
 const rows = ref<AdminUserVo[]>([]);
 const total = ref(0);
-const query = reactive({ page: 1, pageSize: 20, keyword: '', roleKey: '' });
+const query = reactive({ page: 1, pageSize: 20, keyword: '', roleKey: '', status: '', deptId: undefined as number | undefined });
 
-async function fetchList() {
+/* ---------------- 院系候选（A6）----------------
+ * 后端 UserQueryBo 支持 deptId（实跑 ?deptId=201 生效），但管理端**没有院系 CRUD 端点**
+ * （admin 模块 dept 端点实测 0 命中，属后端未决账）⇒ 候选只能从现有账号已登记的院系里去重拿。
+ * 开页时一次性拉快照做去重，避免候选跟着当前筛选页缩来缩去；代价是「还没有人归属」的新院系不会出现在下拉里。
+ *
+ * ★ 已知边界（1022-P2-1，必须写出来）：快照只装得下前 DEPT_SNAPSHOT_SIZE 条账号。
+ *   账号总数一旦超过它，没进快照的院系会**静默缺项** —— 使用方会以为「院系就只有下拉里这几个」。
+ *   所以触顶时在下拉底部明说统计范围，而不是等人数涨到 200 才发现这是隐形缺陷。
+ */
+const DEPT_SNAPSHOT_SIZE = 200;
+const deptOptions = ref<{ id: number; name: string }[]>([]);
+const deptSnapshotTotal = ref(0);
+const deptSnapshotTruncated = computed(() => deptSnapshotTotal.value > DEPT_SNAPSHOT_SIZE);
+async function loadDeptOptions() {
+  try {
+    const res = await listUsers({ page: 1, pageSize: DEPT_SNAPSHOT_SIZE });
+    const map = new Map<number, string>();
+    (res?.list ?? []).forEach((r) => {
+      if (typeof r.deptId === 'number' && r.deptName) map.set(r.deptId, r.deptName);
+    });
+    deptOptions.value = [...map.entries()]
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+    // 用「快照那一次请求返回的 total」判触顶，不用列表页的 total：后者会随筛选变小，判据不可靠
+    deptSnapshotTotal.value = res?.total ?? 0;
+  } catch {
+    /* 候选拉不到不影响列表本身，下拉留空即可（request.ts 已提示） */
+  }
+}
+
+const tableRef = ref<TableInstance>();
+
+/** 勾选只在翻页时保留（跨页批量）。EP 的 reserve-selection 在 setData 时一律不裁选
+    （store/index.mjs:35 只调 assertRowKey），换筛选或写操作后若不由调用方清空，
+    批量启用/停用/删除就会打到不在屏幕上的账号 ⇒ 除 goPage 外全部按默认值清空勾选。 */
+async function fetchList(keepSelection = false) {
+  if (!keepSelection) tableRef.value?.clearSelection();
   loading.value = true;
   try {
     const res = await listUsers(query);
@@ -73,7 +116,12 @@ function goPage(n: number) {
   const target = Math.min(Math.max(1, Math.trunc(n) || 1), pageCount.value);
   if (target === query.page) { pageInput.value = target; return; }
   query.page = target;
-  fetchList();
+  fetchList(true);
+}
+
+/** 表格「序号」列的序号：跨页连续（第 2 页从 21 起）。EP 默认每页从 1 重计，看不出这是全局第几行。 */
+function rowIndex(i: number) {
+  return (query.page - 1) * query.pageSize + i + 1;
 }
 
 function onSearch() {
@@ -84,6 +132,8 @@ function onSearch() {
 function resetQuery() {
   query.keyword = '';
   query.roleKey = '';
+  query.status = '';
+  query.deptId = undefined;
   query.page = 1;
   fetchList();
 }
@@ -100,6 +150,7 @@ onMounted(() => {
   const v = route.query.roleKey;
   if (typeof v === 'string') query.roleKey = v;
   fetchList();
+  loadDeptOptions();
 });
 
 /** 已挂载期间入口参数变化（如角色页再点另一角色）→ 同步筛选 */
@@ -170,8 +221,10 @@ const roleOptionsForForm = computed(() => {
 const formVisible = ref(false);
 const formMode = ref<'create' | 'edit'>('create');
 const saving = ref(false);
+/** 新增账号落在的默认院系（演示库 200=示例大学；编辑态一律沿用行原值） */
+const DEFAULT_DEPT_ID = 200;
 /** 表单模型（含单选角色，提交时包成后端要求的 roleKeys 数组） */
-const form = reactive<{ username: string; nickName: string; email: string; phone: string; userNo: string; remark: string; role: string; userId?: number }>({ username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: '', userId: undefined });
+const form = reactive<{ username: string; nickName: string; email: string; phone: string; userNo: string; remark: string; role: string; userId?: number; deptId?: number | null }>({ username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: '', userId: undefined, deptId: undefined });
 const formRef = ref<FormInstance>();
 /** 编辑超管时锁死角色下拉（双保险：行按钮已禁用，弹窗内再兜一层） */
 const editingAdmin = computed(() => formMode.value === 'edit' && form.userId === 1);
@@ -191,7 +244,7 @@ const rules: FormRules = {
 
 function openCreate() {
   formMode.value = 'create';
-  Object.assign(form, { username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: '', userId: undefined });
+  Object.assign(form, { username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: '', userId: undefined, deptId: undefined });
   formRoleOriginal.value = '';
   formRef.value?.clearValidate();
   formVisible.value = true;
@@ -207,6 +260,8 @@ function openEdit(row: AdminUserVo) {
     phone: row.phone ?? '',
     userNo: row.userNo ?? '',
     remark: '',
+    // ★ 沿用该行原院系；null（未入院系）也要如实带着，提交时省略该键即可保持原值
+    deptId: row.deptId ?? null,
     role: (row.roleKeys ?? [])[0] ?? 'common'
   });
   formRoleOriginal.value = form.role;
@@ -230,9 +285,21 @@ async function submitForm() {
   form.phone = form.phone.trim();
   saving.value = true;
   try {
-    // 后端 BO 收 roleKeys 数组（若依 sys_user_role 关联表），单选包一层
-    const payload = { ...form, roleKeys: [form.role], deptId: 200 };
+    // 后端 BO 收 roleKeys 数组（若依 sys_user_role 关联表），单选包一层。
+    // ★ 逐键显式列写（不用 {...form} 摊开）：form 里带 deptId: null 与前端专用的 role，
+    //   摊开会污染契约类型；且「省略某个键」正是下面两条保原值的手法，必须能精确控制发什么。
+    const payload: UserSaveBo = {
+      userId: form.userId,
+      username: form.username,
+      nickName: form.nickName,
+      email: form.email,
+      phone: form.phone,
+      userNo: form.userNo,
+      remark: form.remark,
+      roleKeys: [form.role]
+    };
     if (formMode.value === 'create') {
+      payload.deptId = DEFAULT_DEPT_ID;
       const res = await createUser(payload);
       ElMessage.success('新增成功');
       if (res?.tempPassword) {
@@ -241,8 +308,18 @@ async function submitForm() {
         pwdVisible.value = true;
       }
     } else {
+      // A1 保院系：行原值有院系就带上，原本未入院系则省略该键
+      //（省略键 ⇒ 后端 AdminAccountServiceImpl:169 setDeptId(null) → SysUserMapper.xml:183 `<if test="deptId != 0">`
+      //  在 OGNL 下 null != 0 为真 ⇒ 仍然执行 dept_id = NULL。本分支里该行 dept_id 本来就是 NULL，所以结果「等于不变」；
+      //  ★ 这只是「写回同一个 NULL」，不是「后端跳过了该列」，不能推广到有院系的行（那里发 null 会真的摘掉院系）。
+      //  而旧代码一律发 200，会把「计算机学院(201)」等账号静默挪进「示例大学(200)」）
+      if (form.deptId != null) payload.deptId = form.deptId;
+      else delete payload.deptId;
+      // A2 保备注：AdminUserVo 不含 remark（列表接口实测 17 个字段无它），前端无从回填，
+      // 留空即「不改」⇒ 省略该键（后端 SysUserMapper.xml:194 `<if test="remark != null">` 不发键才跳过；发空串会真清掉）
+      if (!payload.remark) delete payload.remark;
       // 编辑时带原 userId（★ PUT /users 没有 path 段，userId 在 body 里）
-      await updateUser({ ...payload });
+      await updateUser(payload);
       ElMessage.success('保存成功');
     }
     formVisible.value = false;
@@ -254,6 +331,9 @@ async function submitForm() {
 
 /* ---------------- Excel 导入 / 导出（B-7 / B-8 / B-8a） ---------------- */
 const exporting = ref(false);
+/** 后端把导出行数写死成 page=1 / pageSize=1000（AdminAccountServiceImpl.java:312-317 buildExportRows），
+    超出部分静默少导、不报错 ⇒ 条数必须由前端在点导出时说清楚。 */
+const EXPORT_MAX_ROWS = 1000;
 
 function saveBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -269,11 +349,31 @@ function saveBlob(blob: Blob, filename: string) {
 async function onExport() {
   exporting.value = true;
   try {
-    const blob = await exportUsers({ keyword: query.keyword || undefined, roleKey: query.roleKey || undefined });
+    // 关键词输入框实时绑定 query，用户可能只敲了字没点「搜索」。
+    // 先按当前筛选查一次：既保证「屏幕所见 = 实际所导」，又拿到准确的命中条数用于截断提示（传 true 保留勾选）。
+    await fetchList(true);
+    const hit = total.value;
+    if (!hit) {
+      ElMessage.info('当前筛选条件下没有可导出的账号');
+      return;
+    }
+    // 导出与列表同一套筛选（后端复用 UserQueryBo），否则页面筛完导出的行数对不上眼前所见
+    const blob = await exportUsers({
+      keyword: query.keyword || undefined,
+      roleKey: query.roleKey || undefined,
+      status: query.status || undefined,
+      deptId: query.deptId
+    });
     saveBlob(blob, `账号数据_${new Date().toISOString().slice(0, 10)}.xlsx`);
-    ElMessage.success('导出完成（含当前筛选条件）');
+    if (hit > EXPORT_MAX_ROWS) {
+      ElMessage.warning(
+        `本次筛选命中 ${hit} 条，单次最多导出 ${EXPORT_MAX_ROWS} 条，未导出 ${hit - EXPORT_MAX_ROWS} 条。请缩小筛选范围后分次导出。`
+      );
+    } else {
+      ElMessage.success(`导出完成：本次筛选共 ${hit} 条已全部导出`);
+    }
   } catch {
-    /* requestBlob 已提示 */
+    /* fetchList / exportUsers 任一失败，接口层已提示 */
   } finally {
     exporting.value = false;
   }
@@ -320,12 +420,23 @@ async function onSubmitImport() {
   }
 }
 
-/* ---------------- 启停 / 重置密码 / 删除 ---------------- */
+/* ---------------- 启停 / 重置密码 / 删除 ----------------
+ * ★ 这几处的确认框必须就地接住「取消」：ElMessageBox.confirm 在点取消/按 ESC 时是
+ *   **reject** 的 Promise，事件处理函数里不 catch 会冒成 Vue 的
+ *   「Unhandled error during execution of component event handler」（实测：停用一个账号
+ *   再点取消 = 控制台 1 条 warn），把「0 控制台报错」的验收口径打掉。
+ *   接口失败同理（request.ts 已弹过 ElMessage，这里吞掉即可，不重复提示）。
+ */
 async function toggleStatus(row: AdminUserVo) {
   const next = row.status === '0' ? '1' : '0';
-  await ElMessageBox.confirm(`确定要${next === '0' ? '启用' : '停用'}账号「${row.username}」吗？`, '提示', { type: 'warning' });
-  // ★ status 走 query
-  await updateUserStatus(row.userId, next);
+  const ok = await ElMessageBox.confirm(`确定要${next === '0' ? '启用' : '停用'}账号「${row.username}」吗？`, '提示', { type: 'warning' }).catch(() => false);
+  if (!ok) return;
+  try {
+    // ★ status 走 query
+    await updateUserStatus(row.userId, next);
+  } catch {
+    return;
+  }
   ElMessage.success('操作成功');
   fetchList();
 }
@@ -334,8 +445,14 @@ const pwdVisible = ref(false);
 const pwdResult = ref('');
 const pwdTitle = ref('重置密码');
 async function doResetPwd(row: AdminUserVo) {
-  await ElMessageBox.confirm(`确定要重置账号「${row.username}」的登录密码吗？原密码将立即失效。`, '重置密码', { type: 'warning' });
-  const res = await resetUserPassword(row.userId);
+  const ok = await ElMessageBox.confirm(`确定要重置账号「${row.username}」的登录密码吗？原密码将立即失效。`, '重置密码', { type: 'warning' }).catch(() => false);
+  if (!ok) return;
+  let res;
+  try {
+    res = await resetUserPassword(row.userId);
+  } catch {
+    return;
+  }
   pwdResult.value = res?.tempPassword ?? '';
   pwdVisible.value = true;
 }
@@ -373,8 +490,13 @@ async function copyPwd() {
 }
 
 async function doDelete(row: AdminUserVo) {
-  await ElMessageBox.confirm(`确定要删除账号「${row.username}」吗？`, '删除账号', { type: 'warning', confirmButtonText: '删除' });
-  await deleteUser(row.userId);
+  const ok = await ElMessageBox.confirm(`确定要删除账号「${row.username}」吗？`, '删除账号', { type: 'warning', confirmButtonText: '删除' }).catch(() => false);
+  if (!ok) return;
+  try {
+    await deleteUser(row.userId);
+  } catch {
+    return;
+  }
   ElMessage.success('已删除');
   fetchList();
 }
@@ -401,12 +523,13 @@ async function runBatch(kind: BatchKind) {
   }
   const nameList = targets.map((r) => r.username).join('、');
   const verb = kind === 'delete' ? '删除' : kind === 'enable' ? '启用' : '停用';
-  await ElMessageBox.confirm(
+  const confirmed = await ElMessageBox.confirm(
     `确定要${verb}以下 ${targets.length} 个账号吗？${kind === 'delete' ? '删除后不可恢复，' : '停用后立即踢下线，'}该操作逐个生效。\n${nameList}` +
       (admins.length ? `\n（另有 ${admins.length} 个管理员账号已自动跳过）` : ''),
     BATCH_LABEL[kind],
     { type: 'warning', confirmButtonText: `确定${verb}` }
-  );
+  ).catch(() => false);
+  if (!confirmed) return;
   batchLoading.value = true;
   let ok = 0;
   const fails: string[] = [];
@@ -487,24 +610,20 @@ async function openFootprint(row: AdminUserVo) {
       <el-button type="primary" @click="openCreate">
         <ZkIcon name="plus" :size="15" style="margin-right: 4px" />新增账号
       </el-button>
-      <el-button @click="openImport">
-        <ZkIcon name="upload" :size="15" style="margin-right: 4px" />导入
-      </el-button>
-      <el-button :loading="exporting" @click="onExport">
-        <ZkIcon name="download" :size="15" style="margin-right: 4px" />导出
-      </el-button>
+      <!-- 导入 / 导出已移到列表最下方：这一行原本是「3 个操作 + 分隔线 + 3 个批量 + 搜索单元 + 3 个下拉 + 重置」，
+           单行固有宽超过窄视口可用宽（实测见 style 里 .toolbar 那条），低频的导入导出先挪到底部（见 .table-foot-bar） -->
       <el-divider direction="vertical" />
-      <el-tooltip content="勾选列表行后可用" :disabled="!!selectedRows.length" placement="top">
+      <el-tooltip content="勾选后可用（翻页保留，改筛选即清空）" :disabled="!!selectedRows.length" placement="top">
         <el-button :disabled="!selectedRows.length" :loading="batchLoading" @click="runBatch('enable')">
           <ZkIcon name="power" :size="15" style="margin-right: 4px" />启用{{ selectedRows.length ? `（${selectedRows.length}）` : '' }}
         </el-button>
       </el-tooltip>
-      <el-tooltip content="勾选列表行后可用" :disabled="!!selectedRows.length" placement="top">
+      <el-tooltip content="勾选后可用（翻页保留，改筛选即清空）" :disabled="!!selectedRows.length" placement="top">
         <el-button :disabled="!selectedRows.length" :loading="batchLoading" @click="runBatch('disable')">
           <ZkIcon name="ban" :size="15" style="margin-right: 4px" />停用
         </el-button>
       </el-tooltip>
-      <el-tooltip content="勾选列表行后可用" :disabled="!!selectedRows.length" placement="top">
+      <el-tooltip content="勾选后可用（翻页保留，改筛选即清空）" :disabled="!!selectedRows.length" placement="top">
         <el-button :disabled="!selectedRows.length" :loading="batchLoading" type="danger" plain @click="runBatch('delete')">
           <ZkIcon name="trash-2" :size="15" style="margin-right: 4px" />删除
         </el-button>
@@ -518,27 +637,47 @@ async function openFootprint(row: AdminUserVo) {
           <input
             v-model="query.keyword"
             class="su-input"
-            aria-label="搜索账号 / 姓名 / 邮箱"
+            aria-label="搜索账号 / 姓名 / 手机号 / 工号学号"
             @keyup.enter="onSearch"
           />
-          <span v-if="!query.keyword" class="su-ph">搜索账号 / 姓名 / 邮箱</span>
+          <span v-if="!query.keyword" class="su-ph">搜索账号 / 姓名 / 手机号 / 工号学号</span>
         </div>
         <button v-if="query.keyword" class="su-clear" title="清空" aria-label="清空搜索" @click="clearKeyword">
           <ZkIcon name="x" :size="13" />
         </button>
         <button class="su-btn" @click="onSearch">搜索</button>
       </div>
-      <span class="muted small">角色筛选</span>
-      <el-select v-model="query.roleKey" style="width: 130px" @change="onSearch">
+      <!-- placeholder 必须显式写：三个下拉的「全部」项值都是空串，EP 对空值显示 placeholder
+           而不是 option 的 label ⇒ 不写就会一起显示默认的「请选择」，看不出这是筛选器。
+           （原此处有「角色筛选」小字标签，2026-10-22 用户要求删除；placeholder 已自带语义，不补别的标签。） -->
+      <el-select v-model="query.roleKey" filterable style="width: 130px" placeholder="全部角色" @change="onSearch">
         <el-option v-for="o in ROLE_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+      </el-select>
+      <el-select v-model="query.status" filterable style="width: 110px" placeholder="全部状态" @change="onSearch">
+        <el-option v-for="o in STATUS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+      </el-select>
+      <!-- 院系候选来自「现有账号已登记的院系」去重快照：后端无院系 CRUD 端点，拿不到全量院系树 -->
+      <el-select v-model="query.deptId" filterable style="width: 160px" clearable placeholder="全部院系" @change="onSearch">
+        <el-option v-for="o in deptOptions" :key="o.id" :label="o.name" :value="o.id" />
+        <!-- ★ 1022-P2-1：快照只取前 200 条账号，账号总数超过它时未进快照的院系会缺项。
+             不写这行，缺项表现为「下拉里就是所有院系」——用户无从分辨。只在触顶时出现，日常不打扰。 -->
+        <template v-if="deptSnapshotTruncated" #footer>
+          <div class="small muted dept-foot-tip">
+            候选只统计了前 {{ DEPT_SNAPSHOT_SIZE }} 条账号（快照时共 {{ deptSnapshotTotal }} 条），院系可能有缺；
+            要找的院系不在列表里时，直接键入名称过滤，或改用关键词搜索定位。
+          </div>
+        </template>
       </el-select>
       <el-button text @click="resetQuery">重置</el-button>
     </div>
   </div>
 
   <div class="card">
-    <el-table v-loading="loading" :data="rows" style="width: 100%" @selection-change="onSelectionChange">
-      <el-table-column type="selection" width="42" />
+    <el-table ref="tableRef" v-loading="loading" row-key="userId" :data="rows" style="width: 100%" @selection-change="onSelectionChange">
+      <el-table-column type="selection" width="42" reserve-selection />
+      <!-- 列宽是实测值（离线复刻页在 Chrome 150 里量，见 §.workbuddy/tmp/fe-jia/measure-opcol.html）：
+           序号表头「序号」实测需 55px、状态徽标「启用」实测需 79px ⇒ 这两列原本 64/90 已接近下限，收窄反而只剩 1px 余量，故保持原值。 -->
+      <el-table-column type="index" label="序号" width="64" align="center" :index="rowIndex" />
       <el-table-column label="用户名" min-width="240">
         <template #default="{ row }">
           <div class="row" style="gap: 8px">
@@ -560,11 +699,13 @@ async function openFootprint(row: AdminUserVo) {
           <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="创建时间" width="170" prop="createTime" />
+      <el-table-column label="创建时间" width="170" prop="createTime">
+        <template #default="{ row }">{{ row.createTime || '—' }}</template>
+      </el-table-column>
       <el-table-column label="最近登录" width="170" prop="loginDate">
         <template #default="{ row }">{{ row.loginDate || '—' }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="400" align="right" class-name="op-col">
+      <el-table-column label="操作" width="390" align="right" class-name="op-col">
         <template #default="{ row }">
           <el-button text size="small" @click="openDetail(row)">
             <ZkIcon name="eye" :size="14" style="margin-right: 3px" />查看
@@ -604,7 +745,12 @@ async function openFootprint(row: AdminUserVo) {
     </el-table>
 
     <div class="between page-foot" style="padding: 12px 16px">
-      <span class="small muted">共 {{ total }} 条记录</span>
+      <span class="small muted">
+        共 {{ total }} 条记录
+        <!-- ★ 排序只在当前页内生效：后端 listUsers 固定 order by u.user_id，翻页后各页之间仍是按 userId 排。
+             真正的「全站按创建时间倒序」要后端加排序参数（已作为 B2 报后端线），前端不假装它是全局排序。 -->
+        <span class="muted small">（「创建时间」为当前页内倒序，跨页仍按后端默认序）</span>
+      </span>
       <div class="mini-pager">
         <button
           class="mp-btn"
@@ -634,6 +780,17 @@ async function openFootprint(row: AdminUserVo) {
           <ZkIcon name="chevron-right" :size="14" />
         </button>
       </div>
+    </div>
+
+    <!-- 导入 / 导出（从工具栏移下来，见上方注释）：紧贴「共 N 条记录」，导出范围就在按钮旁边说清 -->
+    <div class="row table-foot-bar">
+      <el-button @click="openImport">
+        <ZkIcon name="upload" :size="15" style="margin-right: 4px" />导入
+      </el-button>
+      <el-button :loading="exporting" @click="onExport">
+        <ZkIcon name="download" :size="15" style="margin-right: 4px" />导出
+      </el-button>
+      <span class="small muted">导出按上方筛选（关键词 / 角色 / 状态 / 院系）取，单次最多 1000 条；命中更多时只导前 1000 条，导出后会写明少导了多少。</span>
     </div>
   </div>
 
@@ -670,7 +827,9 @@ async function openFootprint(row: AdminUserVo) {
       </el-form-item>
       <el-form-item label="备注" prop="remark">
         <el-input v-model="form.remark" type="textarea" :rows="2" />
-        <span v-if="!form.remark" class="fc-ph ta">选填</span>
+        <!-- 列表接口返回的 AdminUserVo 不含 remark（B1 已报后端），编辑态回填不了原备注，
+             所以必须把「留空 = 不改」这件事写在明面上，否则使用者以为留空就是清空。 -->
+        <span v-if="!form.remark" class="fc-ph ta">{{ formMode === 'create' ? '选填' : '留空表示不修改原备注' }}</span>
       </el-form-item>
     </el-form>
     <template #footer>
@@ -685,7 +844,7 @@ async function openFootprint(row: AdminUserVo) {
     <div class="rowline" style="margin-top: 10px">
       <span class="mono" style="font-size: 16px; font-weight: 700">{{ pwdResult }}</span>
       <el-button text @click="copyPwd">
-        <ZkIcon name="check" :size="14" style="margin-right: 3px" />复制
+        <ZkIcon name="copy" :size="14" style="margin-right: 3px" />复制
       </el-button>
     </div>
     <template #footer>
@@ -705,7 +864,7 @@ async function openFootprint(row: AdminUserVo) {
       <div class="pf-row"><span class="k">工号/学号</span><span>{{ detailRow.userNo || '—' }}</span></div>
       <div class="pf-row"><span class="k">所属学校</span><span>{{ detailRow.schoolName || '—' }}</span></div>
       <div class="pf-row"><span class="k">所属院系</span><span>{{ detailRow.deptName || '—' }}</span></div>
-      <div class="pf-row"><span class="k">创建时间</span><span>{{ detailRow.createTime }}</span></div>
+      <div class="pf-row"><span class="k">创建时间</span><span>{{ detailRow.createTime || '—' }}</span></div>
       <div class="pf-row"><span class="k">首次登录需改密</span><span>{{ detailRow.mustChangePwd ? '是' : '否' }}</span></div>
     </div>
     <template #footer>
@@ -804,6 +963,32 @@ async function openFootprint(row: AdminUserVo) {
 </template>
 
 <style scoped>
+/* 工具栏允许换行：共享样式 .toolbar 是 flex + nowrap（theme.css:216-217），窄视口下不会折行、只会溢出。
+   离线复刻实测（.workbuddy/tmp/fe-jia/measure-toolbar2.html，Chrome 150）：左组固有宽 422 + 右组 878 + 间距 12
+   + 内边距 32 = 单行需 1344px，加上侧栏 224 与主区内边距 56 ⇒ 需视口 1626px 才不换行；
+   1366 视口下溢出 243px、1440 下溢出 169px（最右的「重置」被顶出卡片外，页面出横向滚动条）；1920 下可用 1607 > 需 1312，不溢。
+   .right 也要能换行：只给 .toolbar 换行时，1024 视口下右组 878 > 可用 711，仍溢出 151px；
+   两条都加后 1024 下右组自己折成两行、溢出 0，搜索单元仍是 380 未被压窄。
+   只改本页作用域（scoped 选择器带 data-v，不影响其它页面的 .toolbar），共享 theme.css 不动。 */
+.toolbar {
+  flex-wrap: wrap;
+}
+.toolbar .right {
+  flex-wrap: wrap;
+}
+
+/* 列表底部：导入 / 导出（从工具栏移下来） */
+.table-foot-bar {
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}
+/* 院系下拉「候选可能不全」提示：只在账号总数超过快照大小时出现 */
+.dept-foot-tip {
+  line-height: 1.6;
+  white-space: normal;
+}
+
 /* F-1 足迹抽屉 */
 .fp-metrics {
   display: grid;
@@ -883,9 +1068,20 @@ async function openFootprint(row: AdminUserVo) {
   color: var(--error, #e5484d);
   margin-left: 6px;
 }
-/* 操作列有 5 个动作，窄列会把按钮挤成两行、撑高行高 —— 强制单行 */
+/* 操作列有 6 个动作，窄列会把按钮挤成两行、撑高行高 —— 强制单行。
+   EP 2.14.3 的 text 按钮只换颜色与边框，内边距仍由 size 给（theme-chalk/el-button.css：
+   .el-button--small{padding:5px 11px;font-size:12px} 与 .el-button+.el-button{margin-left:12px}）。
+   列宽取实测值，不取口算：离线复刻页（.workbuddy/tmp/fe-jia/measure-opcol.html）在 Chrome 150 里量
+   .cell 的 scrollWidth ⇒ 默认 padding 时需 451px（我先前口算 435，偏小 16），
+   压到 padding 7px / 间距 8px 后需 383px（我先前口算 367，偏小 16）⇒ 列宽 380 仍被切 3px，故给 390（余 7px）。 */
 :deep(.op-col) .cell {
   white-space: nowrap;
+}
+:deep(.op-col) .el-button {
+  padding: 5px 7px;
+}
+:deep(.op-col) .el-button + .el-button {
+  margin-left: 8px;
 }
 
 /* 表单标签对齐：星号绝对定位脱离文字流，所有标签统一 padding-left:12px
@@ -996,10 +1192,16 @@ async function openFootprint(row: AdminUserVo) {
 }
 
 /* 搜索整体单元：图标 + 输入 + 清空 + 搜索按钮合为一个带边框圆角的控件 */
+/* 380px（原 300px）：占位文案「搜索账号 / 姓名 / 手机号 / 工号学号」实测宽 217px
+   （离线复刻页在 Chrome 150 里量 .su-ph 的 offsetWidth；我先前口算 ~245px，偏大 28）。
+   输入区（.su-field）可用宽 = 单元总宽 − 图标区 28px（14 图标 + 左 10 右 4 边距）− 「搜索」按钮 54px（实测）− 上下边框 1px×2。
+   ⇒ 300px 时实测只剩 217px（占位文案要 217px）＝ 零余量，文案 nowrap 正好压在「搜索」按钮左缘上
+     （2026-10-22 用户反馈，复刻页 phHitsBtn=true）；
+     380px 时实测输入区 297px，余 80px，键入后出现的清空按钮（18px + 2px 右边距 = 20px）也吃得下。 */
 .search-unit {
   display: flex;
   align-items: stretch;
-  width: 300px;
+  width: 380px;
   height: 30px;
   border: 1px solid var(--border-strong);
   border-radius: 8px;
