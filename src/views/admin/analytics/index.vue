@@ -2,24 +2,22 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
-import { exportReport, getSchoolAnalytics, handleAlert } from '@/api/admin/analytics';
+import { getSchoolAnalytics, handleAlert } from '@/api/admin/analytics';
 import { listMajors, listTerms } from '@/api/admin/basicdata';
 import { listCourses } from '@/api/admin/dashboard';
-import type {
-  AnalyticsPrepDetail,
-  ReportFileVo,
-  SchoolAnalyticsVo
-} from '@/types/admin';
+import type { AnalyticsAlert, AnalyticsPrepDetail, SchoolAnalyticsVo } from '@/types/admin';
 
 /**
  * 全校学情统计看板（原型 ui-prototype/pc/admin-analytics.html）。
  * 数据 = 后端一次聚合 GET /api/v1/admin/analytics/school（termId / major / courseId / deptId / alertStatus 过滤）。
  * 筛选 = 学期/院系/专业/课程四维（termId 后端翻译成学期编码真正参与过滤）；
  * 迭代 2026-10-20：教师教学排行 / 课程及格率倒数 TOP / 分数段分布 / 学期环比 / 预警闭环。
+ * 导出生成前端 CSV：后端 /export/report 只认 semester 参数，用它导出会与屏上院系/专业/课程筛选口径不一致。
  */
 const loading = ref(true);
-const exporting = ref(false);
 const data = ref<SchoolAnalyticsVo | null>(null);
+/** 本页聚合数据的拉取时刻；后端没有推送，界面不能再写「实时」 */
+const loadedAt = ref('');
 
 /* ---------- 筛选：学期 / 院系 / 专业 / 课程（院系 = 任课教师所属部门，后端 deptId 过滤） ---------- */
 const terms = ref<{ termId: number; name: string }[]>([]);
@@ -65,32 +63,52 @@ async function loadPickers() {
   }
 }
 
+/** 聚合接口一次拉全页数据 ⇒ 并发响应必须只认最后一次，否则慢的那次会覆盖新筛选结果 */
+let reqSeq = 0;
+let mergeTimer: number | undefined;
+
 async function load() {
+  const seq = ++reqSeq;
   loading.value = true;
   try {
-    data.value = await getSchoolAnalytics({
+    const res = await getSchoolAnalytics({
       termId: filters.termId ? Number(filters.termId) : undefined,
       deptId: filters.deptId ? Number(filters.deptId) : undefined,
       major: filters.major || undefined,
       courseId: filters.courseId ? Number(filters.courseId) : undefined,
       alertStatus: alertStatus.value
     });
-    // 院系选项随每次聚合返回（不被 deptId 自身过滤）；旧包无该字段时保留上次结果
-    if (data.value?.deptOptions?.length) {
-      depts.value = data.value.deptOptions.map(d => ({ deptId: d.deptId, name: d.deptName }));
+    if (seq !== reqSeq) return;
+    data.value = res;
+    loadedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    // 院系选项随每次聚合返回 ⇒ 只增不减地合并进本地列表。
+    // 后端 deptOptions 会跟着课程筛选一起缩小，直接整表替换会让已选中的院系从下拉里消失：
+    // 下拉回显成裸 id「201」，dimBadge 找不到名字回落成「全部院系」，连导出文件名与 CSV 首行的口径都是错的。
+    if (res?.deptOptions?.length) {
+      const byId = new Map(depts.value.map(d => [d.deptId, d]));
+      for (const d of res.deptOptions) {
+        if (d?.deptId !== undefined && d?.deptName) byId.set(d.deptId, { deptId: d.deptId, name: d.deptName });
+      }
+      depts.value = [...byId.values()];
     }
   } catch {
+    if (seq !== reqSeq) return;
     data.value = null;
   } finally {
-    loading.value = false;
+    if (seq === reqSeq) loading.value = false;
   }
 }
 
+/** 五个筛选都打同一个聚合接口 ⇒ 连改合并成一次请求 */
+function reloadSoon() {
+  if (mergeTimer) window.clearTimeout(mergeTimer);
+  mergeTimer = window.setTimeout(load, 150);
+}
+
 watch(
-  () => [filters.termId, filters.deptId, filters.major, filters.courseId],
-  () => load()
+  [() => filters.termId, () => filters.deptId, () => filters.major, () => filters.courseId, alertStatus],
+  () => reloadSoon()
 );
-watch(alertStatus, () => load());
 
 /* ---------- 统计卡 ---------- */
 interface StatCard {
@@ -99,19 +117,30 @@ interface StatCard {
   icon: string;
 }
 const STAT_CARDS: StatCard[] = [
+  { key: 'avg', label: '全校平均分', icon: 'activity' },
   { key: 'pass', label: '及格率', icon: 'badge-check' },
   { key: 'live', label: '当前上课课堂', icon: 'graduation-cap' },
   { key: 'alert', label: '预警学生', icon: 'alert-triangle' }
 ];
 const num = (v: number | undefined | null, suffix = '') =>
   v === undefined || v === null ? '—' : `${Math.round(v * 10) / 10}${suffix}`;
-/** 变化量：+2.1 / -0.8；0 显示 ±0 */
-const deltaText = (d: number | undefined, suffix = '') =>
-  d === undefined || d === null ? '' : `${d > 0 ? '+' : d < 0 ? '' : '±'}${Math.round(d * 10) / 10}${suffix}`;
+/** 变化量带方向符号：▲+2.1 / ▼0.8 / ±0 —— 颜色之外还要能读出涨跌 */
+const deltaText = (d: number | undefined | null, suffix = '') =>
+  d === undefined || d === null
+    ? ''
+    : `${d > 0 ? '▲+' : d < 0 ? '▼' : '±'}${Math.round(Math.abs(d) * 10) / 10}${suffix}`;
 /** 预警数减少是好事 ⇒ 颜色反向（down 绿 / up 红） */
 function trendOf(card: StatCard): { text: string; cls: string } | null {
   const s = data.value?.summary;
   if (!s) return null;
+  if (card.key === 'avg') {
+    const tc = data.value?.termCompare;
+    if (tc && tc.curAvg !== undefined && tc.curAvg !== null && tc.prevAvg !== undefined && tc.prevAvg !== null) {
+      const d = Math.round((tc.curAvg - tc.prevAvg) * 10) / 10;
+      return { text: `较上学期 ${deltaText(d, '分')}`, cls: d >= 0 ? 'up' : 'down' };
+    }
+    return { text: `较上期 ${deltaText(s.avgScoreDelta, '分')}`, cls: (s.avgScoreDelta ?? 0) >= 0 ? 'up' : 'down' };
+  }
   if (card.key === 'pass') {
     // 选中学期且有上一学期数据 ⇒ 显示学期环比（④）；否则回落到自然月环比
     const tc = data.value?.termCompare;
@@ -121,9 +150,16 @@ function trendOf(card: StatCard): { text: string; cls: string } | null {
     }
     return { text: `较上期 ${deltaText(s.passRateDelta, '%')}`, cls: s.passRateDelta >= 0 ? 'up' : 'down' };
   }
-  if (card.key === 'live') return { text: '实时', cls: 'up' };
+  if (card.key === 'live') return { text: loadedAt.value ? `${loadedAt.value} 拉取` : '当次拉取', cls: 'up' };
   return { text: `较上期 ${deltaText(s.alertDelta)}`, cls: s.alertDelta <= 0 ? 'up' : 'down' };
 }
+/** 卡区脚注：百分比要有分母，否则 82.4% 说不出是「多少门课、多少学生」里的 82.4% */
+const coverage = computed(() => {
+  const s = data.value?.summary;
+  if (!s) return '';
+  const cnt = (v: number | undefined) => (v === undefined || v === null ? '—' : v);
+  return `当前筛选维度覆盖 ${cnt(s.courseCount)} 门课程 · ${cnt(s.teacherCount)} 名教师 · ${cnt(s.studentCount)} 名学生 · 已批改成绩 ${distTotal.value} 份`;
+});
 
 /* ---------- 课程分类统计：badge 色按行轮换（原型同款） ---------- */
 const CAT_CLS = ['badge-info', 'badge-success', 'badge-warning', 'badge-neutral'];
@@ -140,34 +176,72 @@ const catText = (v: string) => CAT_TEXT[String(v)] ?? v;
 /* ---------- 院系及格率对比：汇总行取已批改总数，横条按 100% 定标 ---------- */
 const distTotal = computed(() => (data.value?.distribution ?? []).reduce((s, b) => s + b.count, 0));
 const dpW = (rate: number) => Math.min(100, Math.max(rate > 0 ? 3 : 0, rate));
+/** 份数不足 10 的及格率不稳（5 份里挂 1 份就是 80%），条眼降透明并在口径行里说明 */
+const SMALL_N = 10;
+const thinSample = (n: number | undefined) => n !== undefined && n !== null && n < SMALL_N;
 
-/* ---------- 分数段分布（③）：柱高按最大档定标，档位颜色随区间加深 ---------- */
+/* ---------- 分数段分布（③）：柱高按最大档定标 ---------- */
 const bandMax = computed(() => Math.max(1, ...(data.value?.distribution ?? []).map(b => b.count)));
 const bandH = (c: number) => Math.round((c / bandMax.value) * 100);
-const BAND_CLS = ['band-low', 'band-mid', 'band-mid2', 'band-good', 'band-best'];
-const bandCls = (i: number) => BAND_CLS[i % BAND_CLS.length];
+/**
+ * 档色按分数语义而非数组下标（后端档位是 <60 / 60-70 / 70-80 / 80-90 / 90-100，
+ * 按下标取色一旦后端改档序或并档，及格线以下就会穿成绿）。
+ */
+function bandLower(range: string): number | null {
+  const s = String(range ?? '');
+  const m = s.match(/\d+/);
+  if (!m) return null;
+  return /[<≤]/.test(s) ? 0 : Number(m[0]);
+}
+/** 及格线以下的档（红色） */
+const failBand = (range: string) => {
+  const lo = bandLower(range);
+  return lo !== null && lo < 60;
+};
+function bandCls(range: string): string {
+  const lo = bandLower(range);
+  if (lo === null) return 'band-na';
+  if (lo < 60) return 'band-low';
+  if (lo < 70) return 'band-mid';
+  if (lo < 80) return 'band-mid2';
+  if (lo < 90) return 'band-good';
+  return 'band-best';
+}
+/** 口径行：把「哪个档算不及格」写在图下面，而不是让人猜颜色 */
+const failBandText = computed(() => {
+  const failing = (data.value?.distribution ?? []).filter(b => failBand(b.range));
+  return failing.length ? `${failing.map(b => b.range).join(' / ')} 为 60 分及格线以下` : '分数段按及格线上下分色';
+});
 
 /* ---------- 教师教学排行（①）与课程及格率倒数 TOP（②）---------- */
 const teacherRanks = computed(() => data.value?.teacherRankings ?? []);
 const courseRanks = computed(() => data.value?.courseRankings ?? []);
 
-/* ---------- 预警闭环（⑤）：标记已处理 ---------- */
+/* ---------- 预警闭环（⑤）：标记已处理 + 填写处理备注 ---------- */
 const handling = ref(false);
 async function onHandleAlert(a: { alertId?: number; student?: string; course?: string }) {
   if (handling.value || !a.alertId) return;
+  let note = '';
   try {
-    await ElMessageBox.confirm(
-      `确认把「${a.student || '该学生'} · ${a.course || ''}」的预警标记为已处理？`,
+    const r = await ElMessageBox.prompt(
+      `把「${a.student || '该学生'} · ${a.course || ''}」的预警标记为已处理，并写下处理方式（可留空）。`,
       '预警闭环',
-      { confirmButtonText: '标记已处理', cancelButtonText: '取消', type: 'warning' }
+      {
+        confirmButtonText: '标记已处理',
+        cancelButtonText: '取消',
+        inputPlaceholder: '如：已联系学生本人，约定本周内补交',
+        // 后端 handle_note 列宽 500，留一倍余量；超长的备注会让表格撑破行
+        inputValidator: (v: string) => (v ?? '').trim().length <= 200 || '处理备注请控制在 200 字以内'
+      }
     );
+    note = String(r.value ?? '').trim();
   } catch {
     return; // 用户取消
   }
   handling.value = true;
   try {
-    await handleAlert(a.alertId);
-    ElMessage.success('已标记为处理完成');
+    await handleAlert(a.alertId, note || undefined);
+    ElMessage.success(note ? '已标记为处理完成，处理备注已记录' : '已标记为处理完成');
     await load();
   } catch {
     /* 已在请求层提示 */
@@ -204,7 +278,10 @@ const prepAggs = computed<PrepAgg[]>(() => {
     g.expDone += d.expDone ?? 0;
     g.expTotal += d.expTotal ?? 0;
   }
-  return [...map.values()];
+  // 滞后在前：教务开这块是为了找异常行，不是先看正常的
+  return [...map.values()].sort(
+    (a, b) => pct(a.prepDone, a.prepTotal) - pct(b.prepDone, b.prepTotal) || a.key.localeCompare(b.key, 'zh-CN')
+  );
 });
 const pct = (a: number, b: number) => (b > 0 ? Math.round((a / b) * 100) : 0);
 function prepStatus(p: number): { label: string; cls: string } {
@@ -212,16 +289,20 @@ function prepStatus(p: number): { label: string; cls: string } {
   if (p >= 50) return { label: '偏慢', cls: 'badge-warning' };
   return { label: '滞后', cls: 'badge-error' };
 }
-/** 该院系（或课程）下备课进度 <50% 的课程数 —— 「滞后课程」列 */
+/** 该院系下备课进度 <50% 的课程数 —— 「滞后课程」列。
+ *  同一课程可能有多位教师的行，必须先按课程合计再判，只取「首次出现的那一行」会让后端行序决定屏上数字 */
 function lagCoursesOf(g: PrepAgg): number {
   if (prepDim.value !== 'dept') return 0;
-  const seen = new Set<string>();
-  let lag = 0;
+  const byCourse = new Map<string, { done: number; total: number }>();
   for (const d of data.value?.prepDetails ?? []) {
-    if (d.dept !== g.key || seen.has(d.course)) continue;
-    seen.add(d.course);
-    if (pct(d.prepDone, d.prepTotal) < 50) lag++;
+    if (d.dept !== g.key) continue;
+    const c = byCourse.get(d.course) || { done: 0, total: 0 };
+    c.done += d.prepDone ?? 0;
+    c.total += d.prepTotal ?? 0;
+    byCourse.set(d.course, c);
   }
+  let lag = 0;
+  for (const c of byCourse.values()) if (pct(c.done, c.total) < 50) lag++;
   return lag;
 }
 function drillRows(g: PrepAgg): AnalyticsPrepDetail[] {
@@ -230,6 +311,10 @@ function drillRows(g: PrepAgg): AnalyticsPrepDetail[] {
 function switchPrep(dim: 'dept' | 'course') {
   prepDim.value = dim;
   Object.keys(prepOpen).forEach(k => delete prepOpen[k]);
+}
+/** 下钻开关：行点击与键盘（展开按钮）共用一个入口 */
+function togglePrep(key: string) {
+  prepOpen[key] = !prepOpen[key];
 }
 
 /* ---------- 成绩趋势折线（近 8 周，SVG 手绘） ---------- */
@@ -242,10 +327,13 @@ const trendPts = computed(() => {
   const span = Math.max(1, max - min);
   const x = (i: number) => 40 + Math.round((i * 340) / (pts.length - 1));
   const y = (v: number) => 160 - Math.round(((v - min) / span) * 120);
+  // y = 160 - (v-min)/span*120 ⇒ v = min + (160-y)/120*span
+  const tickV = (gy: number) => Math.round((min + ((160 - gy) / 120) * span) * 10) / 10;
   return {
     line: pts.map((p, i) => `${x(i)},${y(p.avgScore)}`).join(' '),
     dots: pts.map((p, i) => ({ cx: x(i), cy: y(p.avgScore), week: p.week })),
-    grid: [122, 84, 46]
+    // 原来三条网格线没有读数，折线高低看不出是 78 与 82 还是 60 与 95 的差
+    grid: [122, 84, 46].map(gy => ({ y: gy, v: tickV(gy) }))
   };
 });
 
@@ -254,35 +342,123 @@ const RING_C = 314;
 const ringOffset = computed(() => RING_C * (1 - Math.min(100, Math.max(0, data.value?.experimentRate ?? 0)) / 100));
 
 /* ---------- 预警等级 → badge ---------- */
+/**
+ * 库里等级码不统一：实测同一列同时出现 high / mid / low（不是 medium），
+ * 只认 medium 的话 4 条中危会原样显示英文码、排序还掉到「低」后面。
+ */
+function levelCode(level: string): '高' | '中' | '低' | '' {
+  const v = String(level ?? '').trim().toLowerCase();
+  if (v === '高' || v === 'high') return '高';
+  if (v === '中' || v === 'mid' || v === 'middle' || v === 'medium') return '中';
+  if (v === '低' || v === 'low') return '低';
+  return '';
+}
+const LEVEL_BADGE: Record<'高' | '中' | '低', string> = { 高: 'badge-error', 中: 'badge-warning', 低: 'badge-info' };
 function levelOf(level: string): { label: string; cls: string } {
-  const v = String(level ?? '');
-  if (v === '高' || v === 'high') return { label: '高', cls: 'badge-error' };
-  if (v === '中' || v === 'medium') return { label: '中', cls: 'badge-warning' };
-  if (v === '低' || v === 'low') return { label: '低', cls: 'badge-info' };
-  return { label: v || '—', cls: 'badge-neutral' };
+  const c = levelCode(level);
+  return c ? { label: c, cls: LEVEL_BADGE[c] } : { label: String(level ?? '') || '—', cls: 'badge-neutral' };
 }
-
-/* ---------- 导出报表：后端生成文件并返回下载地址 ---------- */
-async function onExport() {
-  if (exporting.value) return;
-  exporting.value = true;
-  try {
-    const semester = terms.value.find(o => String(o.termId) === filters.termId)?.name;
-    const file = await exportReport({ reportType: 'school-analytics', format: 'csv', semester });
-    downloadReport(file);
-    ElMessage.success(`报表已生成：${file?.fileName || '全校学情报表'}`);
-  } catch {
-    ElMessage.warning('报表生成失败，请稍后重试');
-  } finally {
-    exporting.value = false;
+const LEVEL_RANK: Record<'高' | '中' | '低', number> = { 高: 3, 中: 2, 低: 1 };
+function levelRank(level: string): number {
+  const c = levelCode(level);
+  return c ? LEVEL_RANK[c] : 0;
+}
+/**
+ * 名单默认按后端数组序 = 高年级低分和低年级高分混排，得自己扫。
+ * 待处理按等级降序、同级按当前分升序（最该找的先找到）；已处理按处理时间倒序。
+ */
+const sortedAlerts = computed<AnalyticsAlert[]>(() => {
+  const rows = data.value?.alerts ?? [];
+  if (alertStatus.value === 'closed') {
+    return [...rows].sort((a, b) => String(b.handledAt ?? '').localeCompare(String(a.handledAt ?? '')));
   }
+  return [...rows].sort((a, b) => levelRank(b.level) - levelRank(a.level) || (a.score ?? 999) - (b.score ?? 999));
+});
+const alertSortHint = computed(() =>
+  alertStatus.value === 'closed' ? '按处理时间最新在前' : '按等级高→低、同级按当前分低→高'
+);
+
+/* ---------- 导出报表：按当前筛选维度在前端生成 CSV ---------- */
+/**
+ * 后端 GET /api/v1/admin/export/report 只接 reportType/format/semester，不吃 deptId/major/courseId
+ * ⇒ 用它导出的是整个学期口径，和屏上筛选后的数字对不上。
+ * 改为导出页内已聚合的接口出参（同一份数据，不做二次加工）。
+ */
+const csvCell = (v: unknown): string => {
+  let s = v === undefined || v === null ? '' : String(v);
+  // 课程名/学生名/备注是库里的文本，写成 =1+1 之类会被 Excel 当公式执行 ⇒ 前置单引号阻断
+  if (typeof v === 'string' && /^[=+@]/.test(s)) s = `'${s}`;
+  return `"${s.replace(/"/g, '""')}"`;
+};
+const csvRow = (cells: unknown[]): string => `${cells.map(csvCell).join(',')}\r\n`;
+
+function buildCsv(): string {
+  const d = data.value;
+  const s = d?.summary;
+  const closed = alertStatus.value === 'closed';
+  const out: string[] = [];
+  out.push(csvRow(['全校学情统计报表']));
+  out.push(csvRow(['统计维度', dimBadge.value]));
+  out.push(csvRow(['数据拉取时刻', loadedAt.value || '—']));
+  out.push(csvRow([]));
+  out.push(csvRow(['总览']));
+  out.push(csvRow(['平均分', num(s?.avgScore), '及格率', num(s?.passRate, '%'), '当前上课课堂', s?.liveClassCount, '预警学生', s?.alertCount]));
+  out.push(csvRow(['课程数', s?.courseCount, '教师数', s?.teacherCount, '学生数', s?.studentCount, '已批改成绩', distTotal.value]));
+  out.push(csvRow([]));
+  out.push(csvRow(['课程分类统计']));
+  out.push(csvRow(['类别', '课程数', '学生数', '平均分', '及格率']));
+  for (const c of d?.categories ?? []) out.push(csvRow([catText(c.category), c.courseCount, c.studentCount, num(c.avgScore), num(c.passRate, '%')]));
+  out.push(csvRow([]));
+  out.push(csvRow(['分数段分布']));
+  out.push(csvRow(['分数段', '份数']));
+  for (const b of d?.distribution ?? []) out.push(csvRow([b.range, b.count]));
+  out.push(csvRow([]));
+  out.push(csvRow(['院系及格率对比']));
+  out.push(csvRow(['院系', '及格率', '成绩份数', '样本偏少']));
+  for (const x of d?.deptPassRates ?? []) out.push(csvRow([x.deptName, num(x.passRate, '%'), x.scoreCount, thinSample(x.scoreCount) ? '是' : '']));
+  out.push(csvRow([]));
+  out.push(csvRow(['课程及格率倒数 TOP']));
+  out.push(csvRow(['课程', '院系', '平均分', '及格率', '成绩份数', '样本偏少']));
+  for (const x of d?.courseRankings ?? []) out.push(csvRow([x.course, x.dept ?? '—', num(x.avgScore), num(x.passRate, '%'), x.scoreCount, thinSample(x.scoreCount) ? '是' : '']));
+  out.push(csvRow([]));
+  out.push(csvRow(['教师教学排行']));
+  out.push(csvRow(['教师', '院系', '课程数', '批改份数', '平均分', '及格率']));
+  for (const x of d?.teacherRankings ?? []) out.push(csvRow([x.teacher, x.dept ?? '—', x.courseCount, x.scoreCount, num(x.avgScore), num(x.passRate, '%')]));
+  out.push(csvRow([]));
+  out.push(csvRow(['备课与实验进度（教师明细）']));
+  out.push(csvRow(['院系', '课程', '教师', '备课完成周', '备课总周', '实验完成次', '实验总次', '备课进度']));
+  for (const x of d?.prepDetails ?? []) out.push(csvRow([x.dept, x.course, x.teacher, x.prepDone, x.prepTotal, x.expDone, x.expTotal, `${pct(x.prepDone, x.prepTotal)}%`]));
+  out.push(csvRow([]));
+  out.push(csvRow(['当前上课课堂']));
+  out.push(csvRow(['课程', '教师', '教室', '节次', '在线学生']));
+  for (const x of d?.liveClasses ?? []) out.push(csvRow([x.course, x.teacher, x.room, x.slot, x.online]));
+  out.push(csvRow([]));
+  out.push(csvRow([`预警名单（${closed ? '已处理' : '待处理'}）`]));
+  out.push(csvRow(['学生', '课程', '院系', '类型', '当前分', '等级', closed ? '处理时间' : '状态', closed ? '处理备注' : '']));
+  for (const x of sortedAlerts.value) out.push(csvRow([x.student, x.course, x.dept, x.type, x.score, levelOf(x.level).label, closed ? x.handledAt ?? '—' : x.status ?? 'open', closed ? x.handleNote ?? '' : '']));
+  return out.join('');
 }
-function downloadReport(file: ReportFileVo | undefined) {
-  if (!file?.fileUrl) return;
+/** 文件名带筛选维度，避免导出后分不清是哪一份口径 */
+function csvFileName(): string {
+  const t = new Date();
+  const p = (n: number) => String(n).padStart(2, '0');
+  const dim = dimBadge.value.replace(/[\s·]+/g, '_').replace(/[\\/:*?"<>|]/g, '');
+  return `全校学情_${dim}_${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}-${p(t.getHours())}${p(t.getMinutes())}.csv`;
+}
+function onExport() {
+  if (!data.value) {
+    ElMessage.warning('当前没有可导出的数据，请先重新加载');
+    return;
+  }
+  // BOM 不能省：没有它 Excel 直接双击打开中文 CSV 会乱码
+  const blob = new Blob(['\ufeff', buildCsv()], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = file.fileUrl;
-  a.download = file.fileName || '';
+  a.href = url;
+  a.download = csvFileName();
   a.click();
+  URL.revokeObjectURL(url);
+  ElMessage.success('报表已按当前筛选维度生成');
 }
 
 onMounted(async () => {
@@ -294,8 +470,8 @@ onMounted(async () => {
   <div class="page-head">
     <h1>全校学情统计看板</h1>
     <div class="actions">
-      <button class="btn btn-outline" :disabled="exporting" @click="onExport">
-        <ZkIcon name="download" :size="16" style="margin-right: 4px" />{{ exporting ? '生成中…' : '导出报表' }}
+      <button class="btn btn-outline" title="按上方筛选维度导出本页全部表格数据（CSV）" @click="onExport">
+        <ZkIcon name="download" :size="16" style="margin-right: 4px" />导出当前筛选报表
       </button>
     </div>
   </div>
@@ -305,50 +481,51 @@ onMounted(async () => {
          院系 = 任课教师所属部门（sys_dept），后端 deptId 过滤；school 表只有一所大学，学校维度无筛选价值已隐藏 -->
     <div class="card card-pad filter-bar">
       <span class="small muted">统计维度</span>
-      <el-select v-model="filters.termId" class="f-sel" placeholder="学期" filterable style="width: 200px">
+      <el-select v-model="filters.termId" class="f-sel" placeholder="学期" filterable>
         <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="String(t.termId)" />
       </el-select>
-      <el-select v-model="filters.deptId" class="f-sel" placeholder="全部院系" clearable filterable style="width: 190px">
+      <el-select v-model="filters.deptId" class="f-sel" placeholder="全部院系" clearable filterable>
         <el-option v-for="d in depts" :key="d.deptId" :label="d.name" :value="String(d.deptId)" />
       </el-select>
       <!-- 专业：与智能排课页同维度；course.major 是文本列，按专业名过滤 -->
-      <el-select v-model="filters.major" class="f-sel" placeholder="全部专业" clearable filterable style="width: 190px">
+      <el-select v-model="filters.major" class="f-sel" placeholder="全部专业" clearable filterable>
         <el-option v-for="m in majors" :key="m" :label="m" :value="m" />
       </el-select>
       <!-- 课程：需求文档（三级功能清单+原型）的第三维；按 course.course_id 过滤 -->
-      <el-select v-model="filters.courseId" class="f-sel" placeholder="全部课程" clearable filterable style="width: 190px">
+      <el-select v-model="filters.courseId" class="f-sel" placeholder="全部课程" clearable filterable>
         <el-option v-for="c in courses" :key="c.courseId" :label="c.name" :value="String(c.courseId)" />
       </el-select>
       <span class="badge badge-info dim-badge">{{ dimBadge }}</span>
     </div>
 
     <template v-if="data">
-      <!-- 四张统计卡 -->
-      <div class="grid g4 mt16">
+      <!-- 统计卡：平均分 / 及格率 / 当前上课课堂 / 预警学生 -->
+      <div class="grid g4 mt16 cards">
         <div v-for="c in STAT_CARDS" :key="c.key" class="card stat">
           <div class="label">
             <ZkIcon :name="c.icon" :size="13" style="vertical-align: -2px; margin-right: 4px" />{{ c.label }}
           </div>
           <div class="num" :style="c.key === 'live' ? 'color:var(--brand-600)' : ''">
             {{
-              c.key === 'pass'
-                ? num(data.summary?.passRate, '%')
-                : c.key === 'live'
-                  ? (data.summary?.liveClassCount ?? '—')
-                  : (data.summary?.alertCount ?? '—')
+              c.key === 'avg'
+                ? num(data.summary?.avgScore)
+                : c.key === 'pass'
+                  ? num(data.summary?.passRate, '%')
+                  : c.key === 'live'
+                    ? (data.summary?.liveClassCount ?? '—')
+                    : (data.summary?.alertCount ?? '—')
             }}
           </div>
-          <div v-if="trendOf(c)" class="trend" :class="trendOf(c)!.cls">
-            <template v-if="c.key === 'live'"><span class="badge badge-success">实时</span> 进行中</template>
-            <template v-else>{{ trendOf(c)!.text }}</template>
-          </div>
+          <div v-if="trendOf(c)" class="trend" :class="trendOf(c)!.cls">{{ trendOf(c)!.text }}</div>
         </div>
       </div>
+      <div v-if="coverage" class="cov-line small muted">{{ coverage }}</div>
 
       <!-- 课程分类统计 + 成绩分布 -->
-      <div class="grid g2 mt16">
+      <div class="grid g2 mt16 pair">
         <div class="card">
-          <div class="card-pad" style="padding-bottom: 0"><div class="card-title">课程分类统计（按课程类别）</div></div>
+          <div class="card-pad"><div class="card-title">课程分类统计（按课程类别）</div></div>
+          <div class="tbl-wrap">
           <table class="tbl">
             <thead>
               <tr><th>类别</th><th>课程数</th><th>学生数</th><th>平均分</th><th>及格率</th></tr>
@@ -366,6 +543,7 @@ onMounted(async () => {
               </tr>
             </tbody>
           </table>
+          </div>
         </div>
         <div class="card card-pad">
           <div class="card-title">院系及格率对比（当前筛选维度）</div>
@@ -388,33 +566,35 @@ onMounted(async () => {
               <p class="empty-sub">有已批改的作业成绩后，这里会展示各院系及格率对比</p>
             </div>
             <template v-else>
-              <div v-for="d in data.deptPassRates ?? []" :key="d.deptId" class="dp-row">
+              <div v-for="d in data.deptPassRates ?? []" :key="d.deptId" class="dp-row" :class="{ thin: thinSample(d.scoreCount) }">
                 <span class="dp-name" :title="d.deptName">{{ d.deptName }}</span>
                 <div class="dp-track"><i :style="{ width: dpW(d.passRate) + '%' }" :class="{ low: d.passRate < 60 }"></i></div>
                 <span class="dp-num" :class="{ low: d.passRate < 60 }">{{ num(d.passRate, '%') }}</span>
-                <span class="dp-cnt">{{ d.scoreCount }} 份</span>
+                <span class="dp-cnt" :class="{ warn: thinSample(d.scoreCount) }" :title="thinSample(d.scoreCount) ? `仅 ${d.scoreCount} 份成绩，及格率不稳` : ''">{{ d.scoreCount }} 份</span>
               </div>
             </template>
           </div>
+          <div v-if="data.deptPassRates?.length" class="caliber small muted">条长 = 及格率；份数 &lt;{{ SMALL_N }} 的行标<span class="cnt-warn">橙色的份数</span>并降条不透明度。</div>
         </div>
       </div>
 
       <!-- 分数段分布 + 课程及格率倒数 TOP（对标主流教务大屏的薄弱课定位） -->
-      <div class="grid g2 mt16">
+      <div class="grid g2 mt16 pair">
         <div class="card card-pad">
           <div class="between" style="margin-bottom: 6px">
             <div class="card-title">分数段分布（当前筛选维度）</div>
             <span class="small muted">共 {{ distTotal }} 份已批改成绩</span>
           </div>
           <div v-if="distTotal > 0" class="score-bands">
-            <div v-for="(b, i) in data.distribution ?? []" :key="b.range" class="band-col">
+            <div v-for="b in data.distribution ?? []" :key="b.range" class="band-col">
               <span class="band-num">{{ b.count }}</span>
               <div class="band-track">
-                <i :class="bandCls(i)" :style="{ height: bandH(b.count) + '%' }"></i>
+                <i :class="bandCls(b.range)" :style="{ height: bandH(b.count) + '%' }"></i>
               </div>
-              <span class="band-label">{{ b.range }}</span>
+              <span class="band-label" :class="{ fail: failBand(b.range) }">{{ b.range }}</span>
             </div>
           </div>
+          <div v-if="distTotal > 0" class="caliber small muted">{{ failBandText }}。</div>
           <div v-else class="empty" style="padding: 22px 10px">
             <span class="empty-icon"><ZkIcon name="bar-chart-3" :size="22" /></span>
             <p class="empty-main">暂无已批改成绩</p>
@@ -424,13 +604,14 @@ onMounted(async () => {
         <div class="card card-pad">
           <div class="card-title">课程及格率倒数 TOP5（薄弱课程）</div>
           <div v-if="courseRanks.length" class="dept-pass" style="padding-top: 10px">
-            <div v-for="c in courseRanks" :key="c.courseId" class="dp-row">
+            <div v-for="c in courseRanks" :key="c.courseId" class="dp-row" :class="{ thin: thinSample(c.scoreCount) }">
               <span class="dp-name" :title="c.course">{{ c.course }}</span>
               <div class="dp-track"><i class="low" :style="{ width: dpW(c.passRate) + '%' }"></i></div>
               <span class="dp-num low">{{ num(c.passRate, '%') }}</span>
-              <span class="dp-cnt">{{ c.scoreCount }} 份</span>
+              <span class="dp-cnt" :class="{ warn: thinSample(c.scoreCount) }" :title="thinSample(c.scoreCount) ? `仅 ${c.scoreCount} 份成绩，及格率不稳` : ''">{{ c.scoreCount }} 份</span>
             </div>
           </div>
+          <div v-if="courseRanks.length" class="caliber small muted">倒数 TOP 按及格率升序；份数 &lt;{{ SMALL_N }} 的课程橙色标记，先确认是不是刚开课。</div>
           <div v-else class="empty" style="padding: 22px 10px">
             <span class="empty-icon ok"><ZkIcon name="shield-check" :size="22" /></span>
             <p class="empty-main">暂无薄弱课程数据</p>
@@ -441,11 +622,12 @@ onMounted(async () => {
 
       <!-- 教师教学排行（批改份数降序）：教务处看工作量与教学效果 -->
       <div class="card mt16">
-        <div class="card-pad between" style="padding-bottom: 0">
+        <div class="card-pad between">
           <div class="card-title">教师教学排行（按批改份数）</div>
           <span class="small muted">口径：已批改作业成绩；及格率 = 及格份数 ÷ 批改份数</span>
         </div>
-        <table v-if="teacherRanks.length" class="tbl">
+        <div v-if="teacherRanks.length" class="tbl-wrap">
+        <table class="tbl">
           <thead>
             <tr><th>#</th><th>教师</th><th>院系</th><th>课程数</th><th>批改份数</th><th>平均分</th><th>及格率</th></tr>
           </thead>
@@ -461,6 +643,7 @@ onMounted(async () => {
             </tr>
           </tbody>
         </table>
+        </div>
         <div v-else class="empty" style="padding: 22px 10px">
           <span class="empty-icon"><ZkIcon name="users" :size="22" /></span>
           <p class="empty-main">暂无教师批改数据</p>
@@ -470,16 +653,17 @@ onMounted(async () => {
 
       <!-- 备课与实验进度监控（按院系 / 按课程，点击行下钻教师明细） -->
       <div class="card mt16">
-        <div class="card-pad between" style="padding-bottom: 0">
+        <div class="card-pad between">
           <div class="card-title">备课与实验进度监控（{{ prepDim === 'dept' ? '按院系' : '按课程' }}）</div>
           <span class="row" style="gap: 10px">
             <span class="pilltabs">
-              <span class="pill" :class="{ active: prepDim === 'dept' }" @click="switchPrep('dept')">按院系</span>
-              <span class="pill" :class="{ active: prepDim === 'course' }" @click="switchPrep('course')">按课程</span>
+              <span class="pill" role="button" tabindex="0" :class="{ active: prepDim === 'dept' }" :aria-pressed="prepDim === 'dept'" @click="switchPrep('dept')" @keydown.enter.prevent="switchPrep('dept')" @keydown.space.prevent="switchPrep('dept')">按院系</span>
+              <span class="pill" role="button" tabindex="0" :class="{ active: prepDim === 'course' }" :aria-pressed="prepDim === 'course'" @click="switchPrep('course')" @keydown.enter.prevent="switchPrep('course')" @keydown.space.prevent="switchPrep('course')">按课程</span>
             </span>
             <span class="small muted">点击行可下钻查看教师明细</span>
           </span>
         </div>
+        <div class="tbl-wrap">
         <table class="tbl">
           <thead>
             <tr v-if="prepDim === 'dept'">
@@ -491,10 +675,13 @@ onMounted(async () => {
           </thead>
           <tbody>
             <template v-for="g in prepAggs" :key="g.key">
-              <tr class="prep-main" @click="prepOpen[g.key] = !prepOpen[g.key]">
+              <tr class="prep-main" @click="togglePrep(g.key)">
                 <td>
                   <div class="row" style="gap: 6px">
-                    <ZkIcon :name="prepOpen[g.key] ? 'chevron-down' : 'chevron-right'" :size="14" style="color: var(--ink-400)" />
+                    <!-- ZkIcon 没有登记 chevron-down（画出来是空框），改用一个图标 + 旋转变体。
+                         行本身不可聚焦（tr 没有键盘语义），展开做成真按钮：Tab 能走到、Enter/Space 能开合 -->
+                    <button class="chev" type="button" :class="{ open: prepOpen[g.key] }" :aria-expanded="!!prepOpen[g.key]"
+                      :aria-label="(prepOpen[g.key] ? '收起' : '展开') + g.key + '的教师明细'" @click.stop="togglePrep(g.key)"><ZkIcon name="chevron-right" :size="14" /></button>
                     <b style="color: var(--ink-900)">{{ g.key }}</b>
                   </div>
                 </td>
@@ -559,22 +746,27 @@ onMounted(async () => {
             </tr>
           </tbody>
         </table>
+        </div>
         <div class="between" style="padding: 12px 16px">
           <span class="small muted">共 {{ prepAggs.length }} 个{{ prepDim === 'dept' ? '院系' : '课程' }}（点击行下钻教师明细）</span>
-          <span class="small muted">进度数据实时汇总自各教师备课记录与实验任务</span>
+          <span class="small muted">按备课完成率升序排列（滞后在前）· 数据随本页聚合拉取{{ loadedAt ? `，${loadedAt}` : '' }}</span>
         </div>
       </div>
 
       <!-- 当前上课课堂 + 成绩趋势 / 实验完成率 -->
       <div class="grid mt16 live-grid">
         <div class="card">
-          <div class="card-pad between" style="padding-bottom: 0">
-            <div class="card-title">当前上课课堂（实时 · {{ data.liveClasses?.length ?? 0 }} 个）</div>
-            <span v-if="data.liveClasses?.length" class="badge badge-success">
-              <ZkIcon name="refresh-cw" :size="12" style="vertical-align: -2px; margin-right: 2px" /> 直播中
+          <div class="card-pad between">
+            <div class="card-title">当前上课课堂（{{ loadedAt ? `${loadedAt} 拉取` : '当次拉取' }} · {{ data.liveClasses?.length ?? 0 }} 个）</div>
+            <span class="row" style="gap: 8px">
+              <span class="badge badge-neutral" title="数据来自一次聚合请求，没有推送、不会自己变；要更新请点右侧刷新">非实时</span>
+              <button class="btn btn-outline btn-sm" :disabled="loading" @click="load">
+                <ZkIcon name="refresh-cw" :size="12" style="vertical-align: -2px; margin-right: 2px" />刷新
+              </button>
             </span>
           </div>
-          <table v-if="data.liveClasses?.length" class="tbl">
+          <div v-if="data.liveClasses?.length" class="tbl-wrap">
+          <table class="tbl">
             <thead>
               <tr><th>课程</th><th>教师</th><th>教室</th><th>节次</th><th>在线学生</th></tr>
             </thead>
@@ -588,6 +780,7 @@ onMounted(async () => {
               </tr>
             </tbody>
           </table>
+          </div>
           <!-- 空态：说明"功能在、只是此刻没课"，避免空表格显得破 -->
           <div v-else class="empty">
             <span class="empty-icon"><ZkIcon name="calendar-days" :size="22" /></span>
@@ -596,12 +789,18 @@ onMounted(async () => {
           </div>
         </div>
         <div class="card card-pad">
-          <div class="card-title">成绩趋势（近 {{ data.trend?.length ?? 0 }} 周）</div>
+          <div class="between" style="align-items: baseline; margin-bottom: 4px">
+            <div class="card-title">成绩趋势（近 {{ data.trend?.length ?? 0 }} 周）</div>
+            <span class="small muted">纵轴：周平均分</span>
+          </div>
           <svg v-if="trendPts" viewBox="0 0 400 200" style="width: 100%; height: auto">
             <line x1="30" y1="10" x2="30" y2="160" stroke="#e3eaec" />
             <line x1="30" y1="160" x2="390" y2="160" stroke="#e3eaec" />
             <g stroke="#f1f5f6">
-              <line v-for="gy in trendPts.grid" :key="gy" x1="30" :y1="gy" x2="390" :y2="gy" />
+              <line v-for="g in trendPts.grid" :key="g.y" x1="30" :y1="g.y" x2="390" :y2="g.y" />
+            </g>
+            <g font-size="9" fill="#94a3b8" text-anchor="end">
+              <text v-for="g in trendPts.grid" :key="'v' + g.y" x="27" :y="g.y + 3">{{ g.v }}</text>
             </g>
             <polyline :points="trendPts.line" fill="none" stroke="#0d9488" stroke-width="2.5" stroke-linecap="round" />
             <g fill="#0d9488">
@@ -631,14 +830,18 @@ onMounted(async () => {
 
       <!-- 预警名单（闭环：待处理可标记已处理，已处理留痕） -->
       <div class="card mt16">
-        <div class="card-pad between" style="padding-bottom: 0">
+        <div class="card-pad between">
           <div class="card-title">预警名单（低分 / 退步 / 未提交）</div>
-          <span class="pilltabs">
-            <span class="pill" :class="{ active: alertStatus === 'open' }" @click="alertStatus = 'open'">待处理</span>
-            <span class="pill" :class="{ active: alertStatus === 'closed' }" @click="alertStatus = 'closed'">已处理</span>
+          <span class="row" style="gap: 10px">
+            <span class="small muted">{{ alertSortHint }}</span>
+            <span class="pilltabs">
+              <span class="pill" role="button" tabindex="0" :class="{ active: alertStatus === 'open' }" :aria-pressed="alertStatus === 'open'" @click="alertStatus = 'open'" @keydown.enter.prevent="alertStatus = 'open'" @keydown.space.prevent="alertStatus = 'open'">待处理</span>
+              <span class="pill" role="button" tabindex="0" :class="{ active: alertStatus === 'closed' }" :aria-pressed="alertStatus === 'closed'" @click="alertStatus = 'closed'" @keydown.enter.prevent="alertStatus = 'closed'" @keydown.space.prevent="alertStatus = 'closed'">已处理</span>
+            </span>
           </span>
         </div>
-        <table v-if="data.alerts?.length" class="tbl">
+        <div v-if="sortedAlerts.length" class="tbl-wrap">
+        <table class="tbl">
           <thead>
             <tr>
               <th>学生</th><th>课程</th><th>院系</th><th>类型</th><th>当前分</th><th>等级</th>
@@ -647,7 +850,7 @@ onMounted(async () => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="a in data.alerts ?? []" :key="a.alertId ?? (a.student + a.course)">
+            <tr v-for="a in sortedAlerts" :key="a.alertId ?? (a.student + a.course)">
               <td>{{ a.student || '—' }}</td>
               <td>{{ a.course || '—' }}</td>
               <td>{{ a.dept || '—' }}</td>
@@ -661,10 +864,11 @@ onMounted(async () => {
                 >标记已处理</button>
                 <span v-else class="small muted">{{ a.handledAt || '—' }}</span>
               </td>
-              <td v-if="alertStatus === 'closed'" class="small muted">{{ a.handleNote || '—' }}</td>
+              <td v-if="alertStatus === 'closed'" class="small muted note-cell" :title="a.handleNote || ''">{{ a.handleNote || '—' }}</td>
             </tr>
           </tbody>
         </table>
+        </div>
         <!-- 空态：待处理无预警是好事（正向文案）；已处理为空是普通无数据 -->
         <div v-else class="empty">
           <span class="empty-icon" :class="{ ok: alertStatus === 'open' }"><ZkIcon :name="alertStatus === 'open' ? 'shield-check' : 'badge-check'" :size="22" /></span>
@@ -741,7 +945,7 @@ onMounted(async () => {
   gap: 10px;
 }
 .dp-name {
-  flex: 0 0 96px;
+  flex: 0 0 clamp(72px, 11vw, 118px);
   font-size: 13px;
   font-weight: 600;
   color: var(--ink-700, #475569);
@@ -900,5 +1104,113 @@ onMounted(async () => {
 .divider {
   height: 1px;
   background: var(--border);
+}
+/* 筛选下拉：定宽改弹性，窄屏不溢出（原先是四个内联 px 宽） */
+.f-sel {
+  width: clamp(150px, 17vw, 200px);
+}
+/* 「全部院系/全部专业/全部课程」是未筛选时的口径文案，不是输入提示 ⇒ EP 默认 2.56:1 读不清，提到与 .muted 同一档 */
+.filter-bar :deep(.el-select__placeholder.is-transparent) {
+  color: var(--ink-500, #64748b);
+}
+/* 卡区口径脚注：给百分比一个分母 */
+.cov-line {
+  margin-top: 8px;
+  padding-left: 2px;
+}
+/* 口径行：条长/颜色/排序的读法写在图下面，不靠读者猜 */
+.caliber {
+  margin-top: 8px;
+  line-height: 1.6;
+}
+.cnt-warn {
+  display: inline-block;
+  padding: 0 4px;
+  margin: 0 3px;
+  border-radius: 4px;
+  color: #d97706;
+  background: rgba(217, 119, 6, 0.1);
+}
+/* ZkIcon 未登记 chevron-down（会渲染成空框），下钻箭头用一个图标 + 旋转 */
+.chev {
+  display: inline-flex;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-400);
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+.chev.open {
+  transform: rotate(90deg);
+}
+/* 全局样式没有任何 :focus-visible 规则 ⇒ 自定义控件的焦点环得本页自己给，否则键盘用户看不见自己在哪 */
+.chev:focus-visible,
+.pill:focus-visible {
+  outline: 2px solid var(--brand-600, #2563eb);
+  outline-offset: 2px;
+}
+.pill:focus-visible {
+  border-radius: var(--r-full, 999px);
+}
+.dp-row.thin .dp-track i {
+  opacity: 0.45;
+}
+.dp-cnt.warn {
+  color: #d97706;
+  font-weight: 600;
+}
+.band-label.fail {
+  color: #dc2626;
+  font-weight: 600;
+}
+/* 分数段档位解析不出数字时的兜底灰（后端换档名也不至于是白柱） */
+.band-na {
+  background: var(--ink-400, #94a3b8);
+}
+/* 处理备注列：折行显示，长备注不再顶开整行 */
+.note-cell {
+  max-width: 240px;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.5;
+}
+/* 表格宽度由列内容决定，窄屏不会自己缩 ⇒ 每张表套一层横滚容器，溢出留在卡内、不顶穿页面 */
+.tbl-wrap {
+  overflow-x: auto;
+}
+/* 窄屏回落：全局只把 .g4 兜到 1100px 两列，.g2 没有兜底 ⇒ 本页自己收 */
+@media (max-width: 1000px) {
+  .pair {
+    grid-template-columns: 1fr;
+  }
+}
+/* 表卡页眉 = .card > .card-pad（图表卡是 .card.card-pad 整体内缩，不匹配这条）。
+   全局 .card-title 自带 margin-bottom:12px，与页眉 padding-bottom:18px 叠加后 5 张表卡的「标题→表格」实测 30/26/18/20/18 不一 ⇒ 归零，留白只由 padding 决定 */
+.card > .card-pad > .card-title {
+  margin-bottom: 0;
+}
+/* 网格子项默认 min-width:auto ⇒ 轨道被卡片内容的 min-content 顶宽（400px 视口下实测 .pair 轨道 290px、.card-title 画到 x=523 出视口）。
+   放开最小宽度后轨道能缩回容器，宽表退回 .tbl-wrap 里横滚 */
+.cards > *,
+.pair > *,
+.live-grid > * {
+  min-width: 0;
+}
+@media (max-width: 620px) {
+  .cards {
+    grid-template-columns: 1fr;
+  }
+  .filter-bar .dim-badge {
+    margin-left: 0;
+  }
+}
+@media (max-width: 560px) {
+  .score-bands {
+    gap: 6px;
+  }
+  .band-track {
+    max-width: 34px;
+  }
 }
 </style>

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import { createSchedule, deleteSchedule, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules } from '@/api/admin/schedules';
@@ -72,6 +73,9 @@ const loading = ref(false);
  * 而首次加载 / 切周是**整体替换**，保留阻挡：否则会被人把旧周的课拖到新周日期的格子上。
  */
 const refreshing = ref(false);
+/** 读取失败标记：区分「接口挂了导致的空表」与「真的没课」。
+ *  旧写法 catch 里只清数据，两种空在界面上长得一样，用户只能猜（2026-10-22 复盘缺陷 2）。 */
+const loadError = ref(false);
 const filters = reactive({ courseId: '', teacherId: '', clazzName: '', classroomId: '', major: '', termId: '', schoolId: '' });
 /** 学期下拉（后端 ScheduleQueryBo 支持 termId 过滤 ⇒ 服务端筛，变化即重查）；
  *  startDate/endDate 用于「学期第 N 周」标注（2026-10-21） */
@@ -89,6 +93,7 @@ const clazzMajorMap = ref<Record<string, string>>({});
 async function load(soft = false) {
   if (soft) refreshing.value = true;
   else loading.value = true;
+  loadError.value = false;
   try {
     const res = await listSchedules({
       startDate: weekStartStr.value,
@@ -106,7 +111,10 @@ async function load(soft = false) {
   } catch {
     allCells.value = [];
     returnedCells.value = [];
+    loadError.value = true;
   } finally {
+    // 卡片整批重渲染后原触发元素已离开 DOM，悬浮层不收会浮在原地成为孤儿
+    hideCardTip();
     if (soft) refreshing.value = false;
     else loading.value = false;
   }
@@ -385,6 +393,164 @@ function conflictOf(s: ScheduleCell): string[] {
 /** 冲突课次总数（工具栏徽标） */
 const conflictCount = computed(() => conflictInfo.value.size);
 
+/* ================= 2026-10-21 丙：只看冲突 / 逐个跳转 / 视角概览 / 视图状态进 URL ================= */
+
+/* ---------- 「只看冲突」 ----------
+ * ★ 冲突判定仍基于**筛选后的全量课次**（conflictInfo ← filtered），只在渲染时收窄。
+ *   若把过滤塞进 filtered，会出现"只剩冲突 pair 中的一节 ⇒ 冲突自己消失"的漏判。 */
+const onlyConflicts = ref(false);
+/** 视角概览点中的那一行（key = 前缀 + 显示名：t1001 / n未指定教师 / r9002 / x未指定教室 / c计算机2301）
+ *  ★ 不写进 filters，只在渲染层收窄：① 点一行看它时概览其余行仍在，能直接点下一行；
+ *    ② 未登记 ID 的行按名字也能聚焦（2026-10-22 实测本周 3 节里 2 节 classroomId=null，
+ *       旧版按 ID 筛选对这些行只能禁用，等于"点不动"）。 */
+const rosterFocus = ref('');
+function focusMatch(c: ScheduleCell) {
+  const k = rosterFocus.value;
+  if (!k) return true;
+  const head = k[0];
+  const name = k.slice(1);
+  if (viewMode.value === 'teacher')
+    return head === 't' ? String(c.teacherId ?? '') === name : ((c.teacherName ?? '').trim() || '未指定教师') === name;
+  if (viewMode.value === 'room')
+    return head === 'r' ? String(c.classroomId ?? '') === name : ((c.roomName ?? '').trim() || '未指定教室') === name;
+  if (viewMode.value === 'class') return ((c.clazzName ?? '').trim() || '未填班级') === name;
+  return true;
+}
+const shownCells = computed(() =>
+  filtered.value.filter(c => (!onlyConflicts.value || conflictInfo.value.has(c.scheduleId)) && focusMatch(c))
+);
+/** 冲突课次按「节次 → 星期」的阅读顺序排队，上一处/下一处按此序走 */
+const conflictQueue = computed(() =>
+  filtered.value
+    .filter(c => conflictInfo.value.has(c.scheduleId) && c.weekday && c.periodNo)
+    .sort((a, b) => (a.periodNo ?? 0) - (b.periodNo ?? 0) || (a.weekday ?? 0) - (b.weekday ?? 0))
+);
+const jumpIdx = ref(-1);
+/** 描边只在当前这一跳亮 1.6 秒；★ 与 jumpIdx 分开——跳完亮完，计数仍停在「2 / 5」，
+ *  否则徽标回落到「— / 5」，用户不知道自己在第几处（首版踩过，探针实测到）。 */
+const jumpFlashId = ref(0);
+const jumpTargetId = computed(() => jumpFlashId.value);
+let jumpResetTimer: ReturnType<typeof setTimeout> | undefined;
+/** 跳上一处/下一处冲突：自动开启「只看冲突」，展开叠牌格，滚动到可视区并描边 1.6 秒 */
+async function jumpConflict(step: 1 | -1) {
+  const n = conflictQueue.value.length;
+  if (!n) {
+    jumpIdx.value = -1;
+    ElMessage.info('本周当前筛选下没有冲突课次');
+    return;
+  }
+  onlyConflicts.value = true;
+  jumpIdx.value = jumpIdx.value < 0 ? (step > 0 ? 0 : n - 1) : (jumpIdx.value + step + n) % n;
+  const t = conflictQueue.value[jumpIdx.value];
+  // 目标课次不在"只看它"的范围里 ⇒ 先放开聚焦，否则跳过去了屏幕上什么也没有
+  if (rosterFocus.value && !focusMatch(t)) rosterFocus.value = '';
+  await nextTick();
+  if (t.weekday && t.periodNo) expandCell(t.weekday, t.periodNo);
+  await nextTick();
+  document.querySelector(`[data-sid="${t.scheduleId}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  jumpFlashId.value = t.scheduleId;
+  if (jumpResetTimer) clearTimeout(jumpResetTimer);
+  jumpResetTimer = setTimeout(() => (jumpFlashId.value = 0), 1600);
+}
+/** 队列变了（换周 / 改筛选 / 关掉过滤）⇒ 位置失效，回到「未开始」而不是指着越界的一项 */
+watch(conflictQueue, (q) => {
+  if (jumpIdx.value >= q.length) jumpIdx.value = -1;
+  if (!q.length) jumpFlashId.value = 0;
+});
+
+/* ---------- 视角概览（班级 / 教师 / 教室） ----------
+ * 与筛选的差别：筛选是单值收敛，一次只能看一位教师，**无法横向比较**"谁本周占了几节、
+ * 谁的课撞了"。概览条把当前周按维度聚合出来，点一行 = 课表只看它（rosterFocus，只收渲染层），
+ * 再点同一行取消 ⇒ 网格与拖拽逻辑一行不动（避免动叠牌与落点判定）。 */
+type ViewMode = '' | 'class' | 'teacher' | 'room';
+const viewMode = ref<ViewMode>('');
+const VIEW_OPTIONS: { m: ViewMode; t: string }[] = [
+  { m: 'class', t: '班级' },
+  { m: 'teacher', t: '教师' },
+  { m: 'room', t: '教室' }
+];
+const roster = computed(() => {
+  if (!viewMode.value) return [];
+  const rows = new Map<string, { key: string; label: string; lessons: number; conflicts: number }>();
+  for (const c of filtered.value) {
+    let label: string;
+    if (viewMode.value === 'teacher') label = (c.teacherName ?? '').trim() || '未指定教师';
+    else if (viewMode.value === 'room') label = (c.roomName ?? '').trim() || '未指定教室';
+    else label = (c.clazzName ?? '').trim() || '未填班级';
+    /* key 前缀必须区分"按 ID 聚合"与"按名字聚合"：focusMatch 靠首字符决定比 ID 还是比名字，
+       两类共用前缀会让名字行（如 t未指定教师）去和 teacherId 比 ⇒ 点它反而变空表（首版踩过） */
+    const id = viewMode.value === 'teacher' ? c.teacherId : viewMode.value === 'room' ? c.classroomId : undefined;
+    const groupKey =
+      id !== undefined && id !== null
+        ? (viewMode.value === 'teacher' ? 't' : 'r') + String(id)
+        : (viewMode.value === 'teacher' ? 'n' : viewMode.value === 'room' ? 'x' : 'c') + label;
+    const r = rows.get(groupKey) ?? { key: groupKey, label, lessons: 0, conflicts: 0 };
+    r.lessons += 1;
+    if (conflictInfo.value.has(c.scheduleId)) r.conflicts += 1;
+    rows.set(groupKey, r);
+  }
+  return [...rows.values()]
+    .map(r => ({ key: r.key, label: r.label, lessons: r.lessons, conflicts: r.conflicts }))
+    .sort((a, b) => b.lessons - a.lessons || a.label.localeCompare(b.label, 'zh-CN'));
+});
+/** 点概览行 = 课表只看它；再点同一个 = 取消 */
+function pickRoster(row: { key: string }) {
+  rosterFocus.value = rosterFocus.value === row.key ? '' : row.key;
+}
+function setViewMode(m: ViewMode) {
+  viewMode.value = viewMode.value === m ? '' : m;
+  // 聚焦 key 的维度前缀跟着视角走，换视角必须作废，否则「教师 t1001」会被当成教室行
+  rosterFocus.value = '';
+}
+/** 概览条标题：正在"只看它"时把对象名回显出来，避免用户忘了网格被收窄 */
+const rosterHead = computed(() => {
+  const dim = viewMode.value === 'teacher' ? '教师' : viewMode.value === 'room' ? '教室' : '班级';
+  const picked = roster.value.find(r => r.key === rosterFocus.value);
+  return picked
+    ? `${dim}视角 · 课表当前只看「${picked.label}」（共 ${roster.value.length} 个${dim}，点别的行直接切；再点它或退出视角恢复整周）`
+    : `${dim}视角 · 本周 ${roster.value.length} 个${dim} · 点一行只看它`;
+});
+
+/* ---------- 视图状态写进 URL query ----------
+ * 现状：刷新后一律回到「本周 + 无筛选」，也没法把"第 9 周只看计算机学院"链接发给同事。
+ * 做法：setup 内**同步**读一次 query（早于 :1857 那个学期/学校 watcher 注册 ⇒ 不会触发重复请求），
+ * 变更时 router.replace 换 query。**只读现成路由**，不动禁改的 src/router/index.ts。 */
+const route = useRoute();
+const router = useRouter();
+const qv = (v: unknown) => (typeof v === 'string' ? v : Array.isArray(v) ? String(v[0] ?? '') : '');
+function applyQueryState() {
+  const w = qv(route.query.week);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(w) && !Number.isNaN(Date.parse(w))) weekStart.value = mondayOf(new Date(`${w}T00:00:00`));
+  filters.termId = qv(route.query.term);
+  filters.schoolId = qv(route.query.school);
+  filters.major = qv(route.query.major);
+  filters.courseId = qv(route.query.course);
+  filters.clazzName = qv(route.query.clazz);
+  filters.teacherId = qv(route.query.teacher);
+  filters.classroomId = qv(route.query.room);
+  onlyConflicts.value = qv(route.query.conflict) === '1';
+  const vm = qv(route.query.view);
+  viewMode.value = vm === 'teacher' || vm === 'room' || vm === 'class' ? vm : '';
+  rosterFocus.value = qv(route.query.focus);
+}
+function syncQueryState() {
+  const next: Record<string, string> = {};
+  if (weekStartStr.value !== fmt(mondayOf(new Date()))) next.week = weekStartStr.value;
+  if (filters.termId) next.term = filters.termId;
+  if (filters.schoolId) next.school = filters.schoolId;
+  if (filters.major) next.major = filters.major;
+  if (filters.courseId) next.course = filters.courseId;
+  if (filters.clazzName) next.clazz = filters.clazzName;
+  if (filters.teacherId) next.teacher = filters.teacherId;
+  if (filters.classroomId) next.room = filters.classroomId;
+  if (onlyConflicts.value) next.conflict = '1';
+  if (viewMode.value) next.view = viewMode.value;
+  if (rosterFocus.value) next.focus = rosterFocus.value;
+  void router.replace({ query: next });
+}
+applyQueryState();
+watch([weekStart, filters, onlyConflicts, viewMode, rosterFocus], syncQueryState, { deep: true });
+
 /* ---------- 教室容量校验（2026-10-20）：行业标配「人数→容量匹配」，数据都有、此前没用 ---------- */
 /** 新增课次：所选教室容量 < 所选课程选课人数 ⇒ 提示（不硬拦，教室紧张时管理员自行取舍） */
 const createCapacityWarn = computed(() => {
@@ -417,7 +583,7 @@ const keyOf = (weekday: number, periodNo: number) => `${weekday}-${periodNo}`;
  */
 const cellMap = computed(() => {
   const m: Record<string, ScheduleCell[]> = {};
-  for (const c of filtered.value) {
+  for (const c of shownCells.value) {
     if (!c.weekday || !c.periodNo) continue;
     const k = keyOf(c.weekday, c.periodNo);
     (m[k] ??= []).push(c);
@@ -449,8 +615,8 @@ const grid = computed(() =>
  *   ⇒ 规则据此分成「可选并入/互换」与「只能互换」两种，见 ③④。
  * ★ 互换会把对方也挪走（破坏性大于"并入"），所以两种都可行时必须由用户显式选择，
  *   不做默认自动决定 —— 避免"我只是想把他俩放一起，怎么把另一节挪走了"。
- * ⛔ 仍不实现：/schedules/auto 自动排课、/schedules/publish 发布课表、删除课次
- *   （后端未提供，按钮点击只做缺口提示、不发请求）。
+ * ⛔ 仍不接后端端点：`/schedules/auto`（自动排课走页内本地实现，见下方 runAuto）
+ *   ✔ 已实现并真发请求：`publishSchedules()`（发布课表，`:2215`）、`deleteSchedule()`（删除课次，`:1294` / `:1300` / `:1475`）
  */
 const poolCourses = ref<CourseBrief[]>([]);
 
@@ -600,6 +766,7 @@ function deckGeom(n: number) {
 }
 /** 压缩态点击卡片＝展开该格；展开态点击卡片＝打开详情 */
 function onCardClick(s: ScheduleCell, weekday: number, periodNo: number, count: number) {
+  hideCardTip();
   if (isCollapsedCell(weekday, periodNo, count)) toggleCellExpand(weekday, periodNo);
   else openDetail(s);
 }
@@ -608,6 +775,86 @@ function expandCell(weekday: number, periodNo: number) {
   if (!expandedCells.value.has(cellKey(weekday, periodNo))) {
     expandedCells.value = new Set(expandedCells.value).add(cellKey(weekday, periodNo));
   }
+}
+
+/* ---------- 课表网格键盘可达（2026-10-22 落地第一档）----------
+ * roving tabindex：整张网格在 Tab 序列里只占一个停靠点（当前锚点格里的那张卡，
+ * 空格子则是空格本身），进网之后用方向键在格子间走，Enter/Space 激活。
+ * 这样 Tab 键不会被几百张卡片淹没，键盘路径和鼠标路径指向同一批动作。
+ * 第二档（键盘完成"移动/互换"这类拖拽语义）改动量约 150 行，另批做。 */
+const gridFocus = reactive<{ wd: number; pn: number; sid: number | null }>({
+  wd: WEEKDAYS[0].v,
+  pn: PERIODS[0].seq,
+  sid: null
+});
+function cellListAt(weekday: number, periodSeq: number): ScheduleCell[] {
+  return cellMap.value[keyOf(weekday, periodSeq)] ?? [];
+}
+/** 锚点格里的停靠课次：该课次已被撤回/删除时退化成本格第一节，空格子退化为 null */
+const tabStopSid = computed<number | null>(() => {
+  const list = cellListAt(gridFocus.wd, gridFocus.pn);
+  if (!list.length) return null;
+  return list.some(s => s.scheduleId === gridFocus.sid) ? gridFocus.sid : list[0].scheduleId;
+});
+/** 卡片是否为本轮 Tab 停靠点（true → tabindex=0，其余 -1） */
+function isTabStop(weekday: number, periodSeq: number, sid: number | null): boolean {
+  if (weekday !== gridFocus.wd || periodSeq !== gridFocus.pn) return false;
+  return sid === tabStopSid.value;
+}
+function cardTabindex(weekday: number, periodSeq: number, sid: number): string {
+  return isTabStop(weekday, periodSeq, sid) ? '0' : '-1';
+}
+function emptyTabindex(weekday: number, periodSeq: number): string {
+  return isTabStop(weekday, periodSeq, null) ? '0' : '-1';
+}
+/** 卡片拿到焦点时把锚点挪过来（鼠标点选后再按 Tab 会回到刚操作的那格） */
+function onCardFocus(s: ScheduleCell, weekday: number, periodSeq: number, e: FocusEvent) {
+  gridFocus.wd = weekday;
+  gridFocus.pn = periodSeq;
+  gridFocus.sid = s.scheduleId;
+  showCardTip(e.target as HTMLElement | undefined, s, weekday, periodSeq);
+}
+async function focusGridCell(weekday: number, periodSeq: number) {
+  const list = cellListAt(weekday, periodSeq);
+  gridFocus.wd = weekday;
+  gridFocus.pn = periodSeq;
+  gridFocus.sid = list.length ? list[0].scheduleId : null;
+  await nextTick();
+  const td = document.querySelector(`.sched td.cell[data-wd="${weekday}"][data-pn="${periodSeq}"]`);
+  const target = (list.length
+    ? td?.querySelector(`.cblock[data-sid="${gridFocus.sid}"]`)
+    : td?.querySelector('.c-empty')) as HTMLElement | null;
+  target?.focus();
+}
+const GRID_ARROW_STEPS: Record<string, [number, number]> = {
+  ArrowLeft: [-1, 0],
+  ArrowRight: [1, 0],
+  ArrowUp: [0, -1],
+  ArrowDown: [0, 1]
+};
+function onGridKey(e: KeyboardEvent, weekday: number, periodSeq: number, s: ScheduleCell | null) {
+  const count = cellListAt(weekday, periodSeq).length;
+  if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+    e.preventDefault();
+    if (s) onCardClick(s, weekday, periodSeq, count);
+    else openCreate(weekday, periodSeq);
+    return;
+  }
+  if (e.key === 'Home' || e.key === 'End') {
+    e.preventDefault();
+    const d = e.key === 'Home' ? WEEKDAYS[0] : WEEKDAYS[WEEKDAYS.length - 1];
+    void focusGridCell(d.v, periodSeq);
+    return;
+  }
+  const step = GRID_ARROW_STEPS[e.key];
+  if (!step) return;
+  e.preventDefault();
+  const wi = WEEKDAYS.findIndex(x => x.v === weekday);
+  const pi = PERIODS.findIndex(x => x.seq === periodSeq);
+  if (wi < 0 || pi < 0) return;
+  const nw = WEEKDAYS[Math.min(Math.max(wi + step[0], 0), WEEKDAYS.length - 1)].v;
+  const np = PERIODS[Math.min(Math.max(pi + step[1], 0), PERIODS.length - 1)].seq;
+  void focusGridCell(nw, np);
 }
 
 /** 本周 weekday 对应的日期（1=周一） */
@@ -696,11 +943,19 @@ function courseTone(courseId?: number | null): string {
 /** 卡片 hover 联动：悬停时高亮同课程的其他课次（WebUntis 惯例——一眼看出一门课一周占哪几格） */
 const hoverCourseId = ref<number | null>(null);
 
-/** 卡片完整信息 tooltip：免点详情即可核对全量信息 */
-function cardTitle(s: ScheduleCell): string {
+/** 配色第二通道：形状与 10 色互质 ⇒ 30 种「色 + 形」组合不重复，
+ *  色弱用户与黑白打印下仍能区分课程（原配色只有色相一个通道，是无障碍缺口）。 */
+const COURSE_MARKS = ['●', '▲', '■'] as const;
+function courseMark(courseId?: number | null): string {
+  return COURSE_MARKS[(courseId ?? 0) % COURSE_MARKS.length];
+}
+
+/** 卡片明细行：tooltip 逐行渲染（原生 title 只能靠 \n，行距与断行不可控） */
+function cardLines(s: ScheduleCell): string[] {
   const p = PERIODS.find(x => x.seq === s.periodNo);
+  const name = s.courseName || '（未命名课程）';
   const lines = [
-    s.courseName || '（未命名课程）',
+    s.courseCode ? `${name} · ${s.courseCode}` : name,
     `时间：周${CN[(s.weekday ?? 1) - 1]} ${p ? `${p.label}（${timeRange(p)}）` : ''} · ${dateOf(s.weekday ?? 1)}`,
     `教师：${s.teacherName || '—'} · 班级：${s.clazzName || '未填'}`,
     `教室：${s.roomName || '未指定教室'}`
@@ -708,8 +963,47 @@ function cardTitle(s: ScheduleCell): string {
   if (s.note) lines.push(`备注：${s.note}`);
   const why = conflictOf(s);
   if (why.length) lines.push(`冲突：${why.join('；')}`);
-  lines.push('拖动调课：拖到空格=移动 · 拖到别的教师的课次=并入/互换 · 拖到同一教师的课次=互换');
-  return lines.join('\n');
+  return lines;
+}
+
+/** 读屏朗读文本：tooltip 是悬浮层，读屏用户拿不到，键盘可达必须靠 aria-label */
+function cardAria(s: ScheduleCell, sameCellCount: number): string {
+  const more = sameCellCount > 1 ? `，同节次共 ${sameCellCount} 节` : '';
+  return `${cardLines(s).join('；')}${more}。按回车查看或调整这一节`;
+}
+function emptyCellAria(weekday: number, periodSeq: number): string {
+  const p = PERIODS.find(x => x.seq === periodSeq);
+  return `周${CN[weekday - 1]} ${p ? `${p.label}（${timeRange(p)}）` : ''}空闲。按回车在这里新增课次`;
+}
+
+/* ---------- 卡片明细悬浮层（2026-10-22 替换原生 title）----------
+ * 整张网格共用一个 tooltip（虚拟触发 + manual），不是每张卡各挂一个实例：
+ * 一张卡一个实例会往 body 里塞上百个 popper 节点，且 EP 的 OnlyChild 克隆触发元素
+ * 会干扰叠牌的绝对定位与 `.cblock + .cblock` 相邻选择器。
+ * 原生 title 的问题：换行靠 \n 不可控、无法样式化、悬停 1 秒才出、触屏与键盘拿不到。 */
+const cardTipVisible = ref(false);
+const cardTipEl = ref<HTMLElement | undefined>(undefined);
+const cardTipLines = ref<string[]>([]);
+const cardTipHint = ref('');
+function showCardTip(el: HTMLElement | undefined, s: ScheduleCell, weekday: number, periodSeq: number) {
+  if (!el) return;
+  cardTipEl.value = el;
+  cardTipLines.value = cardLines(s);
+  const n = cellListAt(weekday, periodSeq).length;
+  cardTipHint.value =
+    `同节次共 ${n} 节 · 拖到空格=移动 · 拖到别的教师的课次=并入/互换 · 拖到同一教师的课次=互换`;
+  cardTipVisible.value = true;
+}
+function hideCardTip() {
+  cardTipVisible.value = false;
+}
+function onCardEnter(e: MouseEvent, s: ScheduleCell, weekday: number, periodSeq: number) {
+  hoverCourseId.value = s.courseId ?? null;
+  showCardTip(e.currentTarget as HTMLElement | undefined, s, weekday, periodSeq);
+}
+function onCardLeave() {
+  hoverCourseId.value = null;
+  hideCardTip();
 }
 
 /** 本周摘要条：当前筛选下课次数 / 教师数 / 教室数 / 冲突课次数 */
@@ -744,6 +1038,7 @@ function onCellBlockDragStart(cell: ScheduleCell, e: DragEvent) {
   draggingCourse.value = null;
   draggingCell.value = cell;
   dragOverKey.value = '';
+  hideCardTip();
   if (e.dataTransfer) {
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', `cell:${cell.scheduleId}`);
@@ -977,10 +1272,16 @@ function pushUndo(a: UndoAction) {
 }
 /** 撤回按钮 tooltip：显示将被撤回的那步是什么 */
 const undoLabel = computed(() => historyStack.value[historyStack.value.length - 1]?.label ?? '');
-async function undoLast() {
-  const entry = historyStack.value[historyStack.value.length - 1];
-  if (!entry || busy.value) return;
-  busy.value = true;
+/** 本次调整记录（最新在前）。depth = 撤回「这一步及其之后」所需的步数 */
+const undoHistory = computed(() =>
+  historyStack.value
+    .map((h, i) => ({ no: i + 1, label: h.label, depth: historyStack.value.length - i }))
+    .reverse()
+);
+
+/** 单条逆向动作的结果：ok=整步撤成；partial=批量里有条目失败（已撤的算数）；failed=整步没撤成 */
+type UndoStep = { state: 'ok' | 'partial' | 'failed'; failed: number; total: number };
+async function applyUndoEntry(entry: UndoAction): Promise<UndoStep> {
   try {
     if (entry.kind === 'move' || entry.kind === 'edit') await moveSchedule(entry.scheduleId, entry.prev);
     else if (entry.kind === 'swap') await swapSchedules({ fromScheduleId: entry.fromScheduleId, toScheduleId: entry.toScheduleId });
@@ -995,16 +1296,55 @@ async function undoLast() {
           failed++;
         }
       }
-      if (failed) ElMessage.warning(`撤回完成 ${entry.scheduleIds.length - failed}/${entry.scheduleIds.length} 条，失败的条目可稍后重试`);
-    }
-    else await deleteSchedule(entry.scheduleId);
-    historyStack.value.pop();
-    ElMessage.success(`已撤回：${entry.label}`);
+      if (failed) return { state: 'partial', failed, total: entry.scheduleIds.length };
+    } else await deleteSchedule(entry.scheduleId);
+    return { state: 'ok', failed: 0, total: 0 };
   } catch {
     /* 请求层已弹提示；撤回失败保留记录，可再点重试 */
-  } finally {
-    busy.value = false;
+    return { state: 'failed', failed: 1, total: 1 };
   }
+}
+
+async function undoLast() {
+  const entry = historyStack.value[historyStack.value.length - 1];
+  if (!entry || busy.value) return;
+  busy.value = true;
+  const r = await applyUndoEntry(entry);
+  if (r.state === 'failed') {
+    busy.value = false;
+    return; // 视图未变，不用回读；记录留在栈里可重试
+  }
+  historyStack.value.pop();
+  if (r.state === 'partial') ElMessage.warning(`撤回完成 ${r.total - r.failed}/${r.total} 条，失败的条目可稍后重试`);
+  else ElMessage.success(`已撤回：${entry.label}`);
+  busy.value = false;
+  await load(true);
+}
+
+/** 回退到某一步之前（「本次调整记录」下拉点选）：从最新一条起连续撤 depth 步，撤不动就停在已完成处 */
+async function undoToStep(depth: number) {
+  if (busy.value) return;
+  const target = Math.min(depth, historyStack.value.length);
+  if (target <= 0) return;
+  busy.value = true;
+  let done = 0;
+  let stopped = '';
+  let partialNote = '';
+  for (let i = 0; i < target; i++) {
+    const entry = historyStack.value[historyStack.value.length - 1];
+    if (!entry) break;
+    const r = await applyUndoEntry(entry);
+    if (r.state === 'failed') {
+      stopped = `第 ${done + 1}/${target} 步「${entry.label}」没撤成`;
+      break;
+    }
+    if (r.state === 'partial') partialNote = `批量步里有 ${r.failed}/${r.total} 条没删掉`;
+    historyStack.value.pop();
+    done++;
+  }
+  busy.value = false;
+  if (stopped) ElMessage.warning(`已回退 ${done} 步后中断：${stopped}，已撤的不再重复`);
+  else ElMessage.success(`已回退 ${done} 步${partialNote ? `（${partialNote}）` : ''}`);
   await load(true);
 }
 
@@ -1673,17 +2013,31 @@ async function createBatch(
   return { createdIds, failed, total: final.length };
 }
 
-/* ================= 自动排课（2026-10-20 本地实现）：待排池 → 贪心找空位 → 逐条真落库 =================
+/* ================= 自动排课（2026-10-20 本地实现；2026-10-22 丙修三处） =================
  * 规则（后端同款冲突判定 + 行业通行做法）：
  *   ① 只排「待排课程」池里的课，课表上已落座的一律不碰（= 行业的「手动排课锁定保护」）。
- *   ② 找位顺序：weekday 1→5、节次 1→5，教师在该时段空闲即可落（同节次不同教师并行合法）。
+ *   ② 找位：在该教师空闲的格子里，对 5×5=25 个候选全部打分（见下方 AUTO_W）取最低分，不是取第一个空位。
  *   ③ 教室自动匹配：容量 ≥ 选课人数的空闲教室中取「余量最小」的；没有合适教室则不填（可手动补）。
  *   ④ 排不下/无教师的课跳过并进报告，不卡住其他课。
- * 重复口径与手动排课共用 repeatForm（默认「每周 × 18 周」）。 */
+ * 重复口径与手动排课共用 repeatForm（默认「每周 × 18 周」）。
+ * ★ 10-22 修①「点了像没反应」：原代码在开跑那一行就把 autoReport 置成空对象 ⇒ 弹窗立刻切到
+ *   「报告视图」，进度文案住在 v-if="!autoReport" 分支里全程不显示，用户从头看到的就是
+ *   「排课结果：成功 0 门，跳过 0 门」+「知道了」（零写入探针实测：跑动中显示"成功 8 门"，
+ *   而真实待排 12 门 × 18 周 = 187 次串行 POST、单次往返实测均值 327 ms ≈ 一分多钟）。
+ *   ⇒ 跑动中只更新 autoProgress，结束后才写 autoReport。
+ * ★ 10-22 修②「排出来的课没有班级」：同一探针捕获的 187 条 payload **全部不带 targetClass**，
+ *   因为 /courses 出参实测只有 courseCode/courseId/courseName/semester/status/studentCount/teacherId/teacherName，
+ *   没有班级字段 ⇒ 自动排的课次按班级筛选看不到、班级视角恒显示「未填班级」。
+ *   ⇒ 放回签沿用原课次的班级（内存里就有）；整门新课由弹窗里选一次统一班级；都没选则如实留空并在报告里标明。
+ * ★ 10-22 修③「排上了但没排开」：原②是「取第一个空位就 break」，而待排池按课程 id 升序进出、
+ *   周一 1 节又常被现有课表占掉 ⇒ 实测 8 门课全落在周一 2~5 节 + 周二 1~5 节，周三门以后空的。
+ *   ⇒ 改成对 25 个格子全打分择优，主目标「同班级不同天」，次目标「各天节数拉平」，再次「同教师连排」。 */
 const autoVisible = ref(false);
 const autoRunning = ref(false);
 const autoProgress = ref('');
 const autoReport = ref<{ ok: string[]; skip: string[] } | null>(null);
+/** 本次自动排课统一写入的班级（放回签优先用各自原课次的班级） */
+const autoClass = ref('');
 
 function openAuto() {
   if (!poolEntries.value.length) {
@@ -1692,34 +2046,94 @@ function openAuto() {
   }
   autoReport.value = null;
   autoProgress.value = '';
+  autoClass.value = '';
   autoVisible.value = true;
+}
+
+/** 这张签能沿用到的班级：放回签（lesson-{id}）= 原课次 clazzName；整门新课（course-{id}）= 弹窗所选 */
+function entryClass(entry: PoolEntry) {
+  if (entry.key.startsWith('lesson-')) {
+    const src = returnedCells.value.find(r => r.scheduleId === Number(entry.key.slice(7)));
+    const own = (src?.clazzName ?? '').trim();
+    if (own) return own;
+  }
+  return autoClass.value.trim();
+}
+
+/* ---------- 自动排课落位规则（2026-10-22：贪心取首个空位 → 全候选打分择优） ----------
+ * 原规则：外层按「周一→周五」、内层按「1→5 节」取第一个空位就 break ⇒
+ * 8 门课会全堆进周一 2~5 节 + 周二 1~5 节，看着"排上了但没排开"。
+ * 现规则：把 5×5=25 个格子全部过一遍硬约束，再按下面的权重打分取最低分。
+ * 权重集中在这里，日后按业务口径调参只动这张表，不动结构。 */
+type AutoSlot = { weekday: number; periodNo: number; classroomId?: number; capacity?: number };
+const AUTO_W = {
+  /** 主目标：同一班级同一天已有几节课（每多一节 +100，等于把班级摊到不同天） */
+  sameClassDay: 100,
+  /** 次目标：该天（全校+本次已排）总节数，让周一~周五负载接近 */
+  dayLoad: 6,
+  /** 平摊之后让同一教师的课尽量连排，少留空等：与当天最近一节的节次距离 */
+  teacherGap: 1,
+  /** 该时段没有满足容量的教室 ⇒ 可以排但不推荐（轻罚，避免整门课直接放弃） */
+  noRoom: 2,
+  /** 教室容量余量：够用就好，别占大教室 */
+  roomSlack: 0.2,
+  /** 同分时靠早节次（0.05 ⇒ 只在以上全部打平时才起作用） */
+  period: 0.05
+};
+function scoreAutoSlot(
+  slot: AutoSlot,
+  s: { sameClassDay: number; dayLoad: number; teacherGap: number; need: number }
+): number {
+  const slack = slot.classroomId ? Math.max((slot.capacity ?? 0) - s.need, 0) : 0;
+  return (
+    s.sameClassDay * AUTO_W.sameClassDay +
+    s.dayLoad * AUTO_W.dayLoad +
+    s.teacherGap * AUTO_W.teacherGap +
+    (slot.classroomId ? 0 : AUTO_W.noRoom) +
+    slack * AUTO_W.roomSlack +
+    slot.periodNo * AUTO_W.period
+  );
 }
 
 async function runAuto() {
   if (autoRunning.value) return;
   const entries = poolEntries.value.slice();
   autoRunning.value = true;
-  autoReport.value = { ok: [], skip: [] };
+  autoReport.value = null;
+  const ok: string[] = [];
+  const skip: string[] = [];
   // 教师占用表（key=weekday-period-teacherId）：课表现有 + 本次自动排课新增的都记，防自己撞自己
   const teacherBusy = new Set<string>();
   const roomBusy = new Set<string>();
+  // 负载表（打分用）：同班级·同天节数 / 各天总节数 / 教师某天已用的节次，同样以现有课表打底
+  const sameClassDay: Record<string, number> = {};
+  const dayLoad: Record<number, number> = {};
+  const teacherPeriods: Record<string, number[]> = {};
   for (const c of allCells.value) {
     if (!c.weekday || !c.periodNo) continue;
-    if (c.teacherId !== undefined && c.teacherId !== null) teacherBusy.add(`${c.weekday}-${c.periodNo}-${c.teacherId}`);
+    if (c.teacherId !== undefined && c.teacherId !== null) {
+      teacherBusy.add(`${c.weekday}-${c.periodNo}-${c.teacherId}`);
+      (teacherPeriods[`${c.teacherId}|${c.weekday}`] ??= []).push(c.periodNo);
+    }
     if (c.classroomId !== undefined && c.classroomId !== null) roomBusy.add(`${c.weekday}-${c.periodNo}-${c.classroomId}`);
+    dayLoad[c.weekday] = (dayLoad[c.weekday] ?? 0) + 1;
+    const own = (c.clazzName ?? '').trim();
+    if (own) sameClassDay[`${own}|${c.weekday}`] = (sameClassDay[`${own}|${c.weekday}`] ?? 0) + 1;
   }
   const roomCandidates = classroomsAll.value.filter(r => (r.status ?? 'active') !== 'inactive');
   try {
-    for (const entry of entries) {
-      autoProgress.value = `正在排「${entry.courseName}」（${autoReport.value.ok.length + autoReport.value.skip.length + 1}/${entries.length}）`;
+    for (const [i, entry] of entries.entries()) {
+      autoProgress.value = `正在排「${entry.courseName}」：第 ${i + 1}/${entries.length} 门（已排入 ${ok.length} · 已跳过 ${skip.length}）`;
       if (!entry.teacherId) {
-        autoReport.value.skip.push(`「${entry.courseName}」：课程未指定授课教师，自动排课要求先定教师`);
+        skip.push(`「${entry.courseName}」：课程未指定授课教师，自动排课要求先定教师`);
         continue;
       }
       const need = entry.studentCount ?? 0;
-      let placed: { weekday: number; periodNo: number; classroomId?: number } | null = null;
+      const clazz = entryClass(entry).trim();
+      /** 25 个格子全过一遍硬约束后打分取最低（原实现是取第一个空位就 break） */
+      let placed: AutoSlot | null = null;
+      let bestScore = Number.POSITIVE_INFINITY;
       for (const wd of [1, 2, 3, 4, 5]) {
-        let hit: { weekday: number; periodNo: number; classroomId?: number } | null = null;
         for (const pn of [1, 2, 3, 4, 5]) {
           if (teacherBusy.has(`${wd}-${pn}-${entry.teacherId}`)) continue;
           // 教室：该时段空闲且容量最贴（余量最小优先）；没有合适教室就不填教室
@@ -1729,16 +2143,22 @@ async function runAuto() {
             if ((r.capacity ?? 0) < need) continue;
             if (!best || (r.capacity ?? 0) < (best.capacity ?? 0)) best = r;
           }
-          hit = { weekday: wd, periodNo: pn, classroomId: best?.classroomId };
-          break;
-        }
-        if (hit) {
-          placed = hit;
-          break;
+          const slot: AutoSlot = { weekday: wd, periodNo: pn, classroomId: best?.classroomId, capacity: best?.capacity };
+          const used = teacherPeriods[`${entry.teacherId}|${wd}`] ?? [];
+          const sc = scoreAutoSlot(slot, {
+            sameClassDay: clazz ? sameClassDay[`${clazz}|${wd}`] ?? 0 : 0,
+            dayLoad: dayLoad[wd] ?? 0,
+            teacherGap: used.length ? Math.min(...used.map(p => Math.abs(p - pn))) : 0,
+            need
+          });
+          if (sc < bestScore) {
+            bestScore = sc;
+            placed = slot;
+          }
         }
       }
       if (!placed) {
-        autoReport.value.skip.push(`「${entry.courseName}」：周一至周五 1~5 节该教师全满，无空位`);
+        skip.push(`「${entry.courseName}」：周一至周五 1~5 节该教师全满，无空位`);
         continue;
       }
       const { createdIds, failed, total } = await createBatch(
@@ -1747,27 +2167,32 @@ async function runAuto() {
           teacherId: Number(entry.teacherId),
           classroomId: placed.classroomId,
           weekday: placed.weekday,
-          periodNo: placed.periodNo
+          periodNo: placed.periodNo,
+          targetClass: clazz || undefined
         },
         undefined,
-        (i, t) => {
-          autoProgress.value = `正在排「${entry.courseName}」第 ${i}/${t} 周…`;
+        (done, t) => {
+          autoProgress.value = `正在排「${entry.courseName}」第 ${done}/${t} 周（共 ${entries.length} 门，已排入 ${ok.length}）`;
         }
       );
       // 占用标记按"已占"处理（保守）：即使个别周冲突，也避免下一门课排进同一格
       teacherBusy.add(`${placed.weekday}-${placed.periodNo}-${entry.teacherId}`);
       if (placed.classroomId) roomBusy.add(`${placed.weekday}-${placed.periodNo}-${placed.classroomId}`);
+      // 负载表同步累加：下一门课打分时要看得见这一门，否则又堆回同一格
+      dayLoad[placed.weekday] = (dayLoad[placed.weekday] ?? 0) + 1;
+      (teacherPeriods[`${entry.teacherId}|${placed.weekday}`] ??= []).push(placed.periodNo);
+      if (clazz) sameClassDay[`${clazz}|${placed.weekday}`] = (sameClassDay[`${clazz}|${placed.weekday}`] ?? 0) + 1;
       const roomName = placed.classroomId ? classroomsAll.value.find(r => r.classroomId === placed.classroomId)?.name ?? '' : '';
+      const where = `周${CN[placed.weekday - 1]} ${PERIODS.find(p => p.seq === placed.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}${clazz ? ' · ' + clazz : ''}`;
       if (createdIds.length) {
-        autoReport.value.ok.push(
-          `「${entry.courseName}」→ 周${CN[placed.weekday - 1]} ${PERIODS.find(p => p.seq === placed.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}（${createdIds.length}/${total} 周${failed.length ? `，跳过 ${failed.length} 周` : ''}）`
-        );
+        ok.push(`「${entry.courseName}」→ ${where}（${createdIds.length}/${total} 周${failed.length ? `，跳过 ${failed.length} 周` : ''}${clazz ? '' : '，未填班级'}）`);
         pushUndo({ kind: 'batchCreate', scheduleIds: createdIds, label: `自动排课「${entry.courseName}」` });
       } else {
-        autoReport.value.skip.push(`「${entry.courseName}」：所选时段全部周次冲突（${failed[0] ?? '原因未知'}）`);
+        skip.push(`「${entry.courseName}」：所选时段全部周次冲突（${failed[0] ?? '原因未知'}）`);
       }
     }
   } finally {
+    autoReport.value = { ok, skip };
     autoRunning.value = false;
     autoProgress.value = '';
   }
@@ -1864,14 +2289,6 @@ watch(
   <div class="page-head">
     <h1>智能排课</h1>
     <div class="actions">
-      <button
-        class="btn btn-outline"
-        :disabled="!historyStack.length || busy"
-        :title="undoLabel ? `撤回上一步：${undoLabel}` : '暂无可撤回的调整（仅记录本次打开页面后的操作）'"
-        @click="undoLast"
-      >
-        <ZkIcon name="undo-2" :size="16" style="margin-right: 4px" />撤回
-      </button>
       <el-dropdown @command="(m: 'week' | 'teacher' | 'classroom') => exportCsv(m)">
         <button class="btn btn-outline" type="button">
           <ZkIcon name="download" :size="16" style="margin-right: 4px" />导出课表<ZkIcon name="chevron-down" :size="13" style="margin-left: 2px" />
@@ -1945,6 +2362,7 @@ watch(
       <span v-if="conflictCount" class="badge badge-error">
         <ZkIcon name="alert-triangle" :size="12" style="margin-right: 4px" />{{ conflictCount }} 处冲突待调整
       </span>
+      <!-- 冲突处置与视角概览已移到课表下方（2026-10-22 用户要求），工具栏只留上方这枚冲突计数徽标 -->
     </div>
   </div>
 
@@ -2012,7 +2430,7 @@ watch(
       </span>
     </div>
     <!-- 空态提示：选中学期后查不到课次时，大概率是课次没关联学期（term_id 为 NULL）被筛掉 -->
-    <div v-if="!loading && !refreshing && !allCells.length && filters.termId" class="move-hint">
+    <div v-if="!loadError && !loading && !refreshing && !allCells.length && filters.termId" class="move-hint">
       <ZkIcon name="alert-triangle" :size="14" />
       <span>
         当前学期筛选下没有课次（本周课程可能未关联学期，被学期过滤排除了）——把上方「学期」切回
@@ -2028,6 +2446,36 @@ watch(
         <button class="btn btn-outline" @click="gotoThisWeek">本周</button>
         <div class="sched-week">{{ weekRangeLabel }}</div>
         <span v-if="weekNoLabel" class="week-no">{{ weekNoLabel }}</span>
+        <!-- 撤回组（2026-10-22 用户指令：挪到「第 N 周」右边、整组居中）。
+             撤回栈本来就存到 30 步，界面只露了最后一步 ⇒ 另挂「本次调整记录」列出每一步并可回退到任意一步之前 -->
+        <span class="undo-group">
+          <button
+            class="btn btn-outline"
+            type="button"
+            :disabled="!historyStack.length || busy"
+            :title="undoLabel ? `撤回上一步：${undoLabel}` : '暂无可撤回的调整（仅记录本次打开页面后的操作）'"
+            @click="undoLast"
+          >
+            <ZkIcon name="undo-2" :size="16" style="margin-right: 4px" />撤回
+          </button>
+          <el-dropdown trigger="click" popper-class="sched-undo-popper" @command="(n: number) => undoToStep(n)">
+            <button
+              class="btn btn-outline"
+              type="button"
+              :disabled="!historyStack.length || busy"
+              title="列出本次打开页面后的每一步调整；点某一步 = 连撤到这一步之前"
+            >
+              本次调整记录（{{ historyStack.length }}）<ZkIcon name="chevron-down" :size="13" style="margin-left: 2px" />
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item v-for="h in undoHistory" :key="h.no" :command="h.depth">
+                  第 {{ h.no }} 步 · {{ h.label }}
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        </span>
       </div>
       <button class="btn btn-outline" @click="shiftWeek(7)">
         下一周<ZkIcon name="chevron-right" :size="15" style="margin-left: 4px" />
@@ -2046,7 +2494,13 @@ watch(
           · {{ weekStats.conflicts }} 处冲突待调整
         </span>
       </template>
-      <span v-else class="muted">本周暂无课次</span>
+      <span v-else class="muted">{{ loading ? '正在读取本周课次…' : loadError ? '读取失败，下面不是真实课表' : '本周暂无课次' }}</span>
+    </div>
+    <!-- 失败态（2026-10-22 缺陷 2）：读取失败时明确说「读取失败」并给重试入口，不再与空表同形 -->
+    <div v-if="loadError" class="move-hint is-error">
+      <ZkIcon name="alert-triangle" :size="14" />
+      <span>课表读取失败——下面的空格子不代表本周没课，是接口没返回。</span>
+      <button class="btn btn-outline btn-sm" type="button" :disabled="loading" @click="load()">重试</button>
     </div>
     <table class="sched">
       <thead>
@@ -2067,6 +2521,8 @@ watch(
             v-for="c in row.cells"
             :key="c.weekday"
             class="cell"
+            :data-wd="c.weekday"
+            :data-pn="row.period.seq"
             :class="{
               'is-today-col': c.weekday === todayWeekday,
               'drop-ok': dropMode(c.weekday, row.period.seq) === 'ok',
@@ -2098,13 +2554,15 @@ watch(
                   v-for="(s, idx) in c.list"
                   :key="s.scheduleId"
                   class="cblock"
+                  :data-sid="s.scheduleId"
                   :class="[
                     conflictOf(s).length ? 'c-conf' : ['c-ok', courseTone(s.courseId)],
                     {
                       'c-dragging': draggingCell?.scheduleId === s.scheduleId,
                       'c-peer': hoverCourseId !== null && s.courseId === hoverCourseId,
                       'c-join-target': isChoiceHover(c.weekday, row.period.seq, s),
-                      'c-swap-target': isSwapOnlyHover(c.weekday, row.period.seq, s)
+                      'c-swap-target': isSwapOnlyHover(c.weekday, row.period.seq, s),
+                      'c-jump': s.scheduleId === jumpTargetId
                     }
                   ]"
                   :style="
@@ -2113,13 +2571,18 @@ watch(
                       : undefined
                   "
                   draggable="true"
-                  :title="cardTitle(s)"
+                  role="button"
+                  :tabindex="cardTabindex(c.weekday, row.period.seq, s.scheduleId)"
+                  :aria-label="cardAria(s, c.list.length)"
                   @dragstart="onCellBlockDragStart(s, $event)"
                   @dragend="onDragEnd"
                   @dragover.stop="onBlockDragOver(c.weekday, row.period.seq, s, $event)"
                   @drop.stop="onBlockDrop(c.weekday, row.period.seq, s, $event)"
-                  @mouseenter="hoverCourseId = s.courseId ?? null"
-                  @mouseleave="hoverCourseId = null"
+                  @mouseenter="onCardEnter($event, s, c.weekday, row.period.seq)"
+                  @mouseleave="onCardLeave"
+                  @focus="onCardFocus(s, c.weekday, row.period.seq, $event)"
+                  @blur="hideCardTip"
+                  @keydown="onGridKey($event, c.weekday, row.period.seq, s)"
                   @click="onCardClick(s, c.weekday, row.period.seq, c.list.length)"
                 >
                   <!-- 未发布标识（C-24）：draft 课次学生/教师端不可见，点「发布课表」后才可见 -->
@@ -2134,7 +2597,7 @@ watch(
                   >
                     <ZkIcon name="arrow-left-right" :size="11" />同一教师 · 只能互换
                   </span>
-                  <b>{{ s.courseName || '（未命名课程）' }}</b>
+                  <b><span class="tone-mark" aria-hidden="true">{{ courseMark(s.courseId) }}</span>{{ s.courseName || '（未命名课程）' }}</b>
                   <span class="who"><ZkIcon name="users" :size="11" />{{ s.clazzName || '未填班级' }}</span>
                   <span class="who"><ZkIcon name="user" :size="11" />{{ s.teacherName || '—' }}</span>
                   <span class="who"><ZkIcon name="map-pin" :size="11" />{{ s.roomName || '未指定教室' }}</span>
@@ -2165,10 +2628,14 @@ watch(
             >
               <ZkIcon name="chevron-up" :size="12" />收起（同段共 {{ c.list.length }} 节）
             </button>
-            <!-- 空格子：点一下手动新增 -->
+            <!-- 空格子：点一下手动新增（键盘：方向键走到本格按回车，同一条路径） -->
             <div
               v-if="!c.list.length"
               class="cblock c-empty"
+              role="button"
+              :tabindex="emptyTabindex(c.weekday, row.period.seq)"
+              :aria-label="emptyCellAria(c.weekday, row.period.seq)"
+              @keydown="onGridKey($event, c.weekday, row.period.seq, null)"
               @click="openCreate(c.weekday, row.period.seq)"
             >
               <template v-if="dropMode(c.weekday, row.period.seq) === 'ok'">
@@ -2181,6 +2648,85 @@ watch(
         </tr>
       </tbody>
     </table>
+
+    <!-- 全网格共用的卡片明细悬浮层：虚拟触发（不克隆卡片节点，DOM 结构零改动），
+         显示/隐藏由卡片的 mouseenter/focus 驱动，manual 模式故 EP 不会自行接线 -->
+    <el-tooltip
+      v-model:visible="cardTipVisible"
+      trigger="manual"
+      effect="dark"
+      placement="right"
+      virtual-triggering
+      :virtual-ref="cardTipEl"
+      :persistent="false"
+      :show-arrow="false"
+      popper-class="sched-card-popper"
+    >
+      <template #content>
+        <div class="sched-tip">
+          <div
+            v-for="(ln, i) in cardTipLines"
+            :key="i"
+            class="sched-tip-line"
+            :class="{ 'is-head': i === 0 }"
+          >
+            {{ ln }}
+          </div>
+          <div class="sched-tip-hint">{{ cardTipHint }}</div>
+        </div>
+      </template>
+    </el-tooltip>
+
+    <!-- 冲突处置 + 视角概览（2026-10-22 用户要求：从工具栏移到课表下面，看过课再操作） -->
+    <div class="grid-tools">
+      <button
+        class="btn btn-outline"
+        :class="{ 'btn-primary': onlyConflicts }"
+        type="button"
+        :disabled="!conflictCount"
+        :title="conflictCount ? '课表只显示命中冲突的课次' : '本周当前筛选下没有冲突课次'"
+        @click="onlyConflicts = !onlyConflicts"
+      >
+        只看冲突{{ conflictCount ? `（${conflictCount}）` : '' }}
+      </button>
+      <!-- 逐个跳转：按「节次 → 星期」的阅读顺序走，跳到时自动展开叠牌格并描边 -->
+      <div v-if="onlyConflicts && conflictQueue.length" class="conflict-jump">
+        <button class="btn btn-outline" type="button" :disabled="jumpIdx <= 0" @click="jumpConflict(-1)">上一处</button>
+        <span class="muted small mono">{{ jumpIdx >= 0 ? jumpIdx + 1 : '—' }} / {{ conflictQueue.length }}</span>
+        <button class="btn btn-outline" type="button" @click="jumpConflict(1)">下一处</button>
+      </div>
+      <span class="spacer" style="flex: 1"></span>
+      <div class="view-switch">
+        <button
+          v-for="v in VIEW_OPTIONS"
+          :key="v.m"
+          class="btn btn-outline"
+          :class="{ 'btn-primary': viewMode === v.m }"
+          type="button"
+          :title="`按${v.t}看本周谁占了几节、谁的课撞了（点同一按钮退出）`"
+          @click="setViewMode(v.m)"
+        >
+          {{ v.t }}视角
+        </button>
+      </div>
+    </div>
+    <!-- 视角概览：点一行 = 课表只看它（只在渲染层收窄，其余行仍可点，切换不用先取消） -->
+    <div v-if="viewMode && roster.length" class="roster-bar">
+      <div class="small muted" style="margin-bottom: 8px">{{ rosterHead }}</div>
+      <div style="display: flex; flex-wrap: wrap; gap: 8px">
+        <button
+          v-for="r in roster"
+          :key="r.key"
+          class="btn btn-outline"
+          :class="{ 'btn-primary': rosterFocus === r.key }"
+          type="button"
+          :title="rosterFocus === r.key ? '取消「只看它」，恢复整周课表' : `课表只看「${r.label}」${r.conflicts ? ` · 其中 ${r.conflicts} 节有冲突` : ''}`"
+          @click="pickRoster(r)"
+        >
+          {{ r.label }} · {{ r.lessons }} 节<span v-if="r.conflicts" class="roster-conf"> · 冲突 {{ r.conflicts }}</span>
+        </button>
+      </div>
+    </div>
 
     <div class="row mt16" style="gap: 16px; flex-wrap: wrap">
       <span class="row small"><i class="legend-dot ok"></i>正常</span>
@@ -2551,12 +3097,26 @@ watch(
       </div>
       <ul class="small muted" style="padding-left: 18px; line-height: 2; margin: 10px 0 0">
         <li>只排「待排课程」池里的课，<b>课表上已有的课一律不动</b>（锁定保护）</li>
-        <li>找位规则：教师空闲优先；教室按「容量 ≥ 选课人数、余量最小」自动匹配，无合适教室则不填</li>
+        <li>找位规则：在该教师空闲的时段里挑「最合适」的一格，不是挑第一个空的——同一班级尽量摊到不同天，周一~周五节数拉平，同一教师的课连着上</li>
+        <li>教室：按「容量 ≥ 选课人数、余量最小」自动匹配，无合适教室则不填</li>
         <li>排不下的课跳过并在结束后报告，不会卡住其他课</li>
       </ul>
+      <!-- 班级（2026-10-22 丙）：课程接口不出班级字段，不选就排成"未填班级"的课次（按班级筛选看不到） -->
+      <div class="detail-row">
+        <span class="detail-k">班级</span>
+        <div style="flex: 1; min-width: 0">
+          <el-select v-model="autoClass" placeholder="不指定（放回的课次自动沿用原班级）" clearable filterable style="width: 100%">
+            <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
+          </el-select>
+          <div class="small muted">
+            待排 {{ poolEntries.length }} 门 × 每周 1 节 ≈ 需 {{ poolEntries.length * effectiveRepeatTimes }} 次保存，门数多时要等一会儿，进度显示在这里
+          </div>
+        </div>
+      </div>
       <p v-if="autoProgress" class="small" style="margin: 12px 0 0">
         <ZkIcon name="refresh-cw" :size="13" style="margin-right: 4px" />{{ autoProgress }}
       </p>
+      <p v-else-if="autoRunning" class="small muted" style="margin: 12px 0 0">准备中…</p>
     </template>
     <template v-else>
       <p style="margin-top: 0">
@@ -2706,6 +3266,16 @@ watch(
 .week-center .btn {
   height: 36px;
   padding: 0 14px;
+}
+/* 撤回组：两个控件当一个整体，与「第 N 周」标签贴右排；组内间距沿用中列的 10px 口径 */
+.undo-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.undo-group > .btn,
+.undo-group :deep(.el-dropdown) > .btn {
+  white-space: nowrap;
 }
 /* 周日期范围：翻周条中间的块状标签。
    ★ 中性深灰描边样式，刻意与课程签（品牌绿底）区分——两者都是"块状"，同色系会混淆 */
@@ -3017,6 +3587,44 @@ watch(
   border-style: dashed;
   cursor: grabbing;
 }
+/* 逐个跳转的当前目标卡：描边 + 外发光，1.6s 后自动撤（不改底色，冲突红仍然可见） */
+.cblock.c-jump {
+  box-shadow: 0 0 0 3px var(--error), 0 6px 18px rgba(239, 68, 68, 0.35);
+  transform: translateY(-1px);
+}
+/* 「只看冲突」旁边的上一处/下一处计数组 */
+.conflict-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+/* 视角切换三按钮：与筛选框同行，靠右成组 */
+.view-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+/* 课表下方工具条（2026-10-22 从工具栏移来：看完课再决定"只看冲突 / 换视角"） */
+.grid-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+/* 视角概览条：跟着上面的按钮，聚焦态用淡底强调 */
+.roster-bar {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-soft);
+}
+.roster-conf {
+  color: var(--error);
+}
 /**
  * ★ 落库后回读用的是「软遮罩」：可见（用户知道在刷新）但不吃指针事件。
  * Element Plus 的 .el-loading-mask 默认 rgba(255,255,255,.9) + z-index 2000 + pointer-events:auto，
@@ -3050,6 +3658,12 @@ watch(
 .move-hint > span {
   flex: 1;
   min-width: 0;
+}
+/* 失败态（2026-10-22 缺陷 2）：复用提示条布局，只换配色，与「拖动提示」区分开 */
+.move-hint.is-error {
+  background: rgba(217, 45, 32, 0.08);
+  border-color: var(--error, #d92d20);
+  color: var(--error, #d92d20);
 }
 .c-empty {
   /* ★ 绝对定位撑满格子（td.cell 已 position:relative）：上下左右各留 5px 与 padding 对齐，
@@ -3490,5 +4104,100 @@ watch(
 .week-no-inline {
   color: var(--brand-800);
   font-weight: 600;
+}
+
+/* ---------- 键盘可达（2026-10-22 第一档）：可见焦点环 ----------
+ * outline 不占布局，不改叠牌几何；取深品牌色，与冲突红、可放置虚线区分得开 */
+.cblock:focus-visible {
+  outline: 2px solid var(--brand-800);
+  outline-offset: 1px;
+}
+
+/* 配色第二通道：形状标记（色相 + 形状双编码，色觉障碍与黑白打印下仍可分辨课程） */
+.tone-mark {
+  margin-right: 3px;
+  font-size: 9px;
+}
+
+/* 卡片明细悬浮层的内部结构（tooltip 插槽里的节点带本组件 scope，样式照常命中） */
+.sched-tip {
+  max-width: 320px;
+  line-height: 1.7;
+}
+.sched-tip-line.is-head {
+  font-weight: 600;
+}
+.sched-tip-hint {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.28);
+  font-size: 11px;
+  opacity: 0.78;
+}
+
+/* ---------- 窄视口（≤900px，2026-10-22 补第一处响应式）----------
+ * 现状：全页零条 @media，6 列固定布局在 900px 以下把卡片压成一列文字、按钮溢出卡片。
+ * 课表列宽不能靠换行解决（节次行头 96px + 5 天），所以这里给课表一条横向滚动，
+ * 其余条状区域改为换行。宽视口下这些规则不命中，渲染结果与改动前逐像素相同。 */
+@media (max-width: 900px) {
+  .card-pad {
+    overflow-x: auto;
+  }
+  .sched {
+    min-width: 620px;
+  }
+  .page-head,
+  .toolbar,
+  .week-pager,
+  .week-stats,
+  .grid-tools,
+  .roster-bar {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+  /* 页头右侧按钮组：全局规则 .page-head .actions{display:flex;gap:10px} 不换行，
+     765px 视口下整组 530px 宽、比容器多出 17px ⇒ 顶穿 main 让页面横向滚动。
+     这里只在本页作用域内允许它换行（全局样式不在我可改范围） */
+  .page-head .actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    row-gap: 6px;
+  }
+  /* 翻周条中列现在带撤回组，780px 下 1fr auto 1fr 会把中列撑到溢出：
+     改用 flex 居中并允许换行（上一周/下一周跟着一起排，不再钉在两端） */
+  .week-pager {
+    display: flex;
+    justify-content: center;
+    column-gap: 8px;
+  }
+  .week-center,
+  .undo-group {
+    flex-wrap: wrap;
+    justify-content: center;
+    row-gap: 8px;
+  }
+  .sched th,
+  .sched td.slot {
+    padding: 6px 4px;
+    font-size: 11px;
+  }
+  .cblock {
+    font-size: 11px;
+  }
+  .cblock .who {
+    font-size: 10px;
+  }
+}
+</style>
+
+<style>
+/* 悬浮层与下拉面板被 teleport 到 body 上，scoped 选择器（[data-v-*]）够不到它们的根节点，
+   故单独开这一块。只写这两条，类名带 sched- 前缀不会撞到其他页面 */
+.sched-card-popper {
+  max-width: 340px;
+}
+.sched-undo-popper {
+  max-height: 320px;
+  overflow-y: auto;
 }
 </style>

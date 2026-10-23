@@ -4,8 +4,8 @@ import { ADMIN_MENUS } from '@/config/menu';
 import { useUserStore } from '@/store/user';
 
 /**
- * 已实现页面（本轮 3 页）。其余 9 页先挂占位页，路由与菜单一次到位，
- * 后续逐页替换 PAGE_LOADERS 里的一行即可，不动路由结构。
+ * 已实现页面（12 个菜单页中的 6 页）。其余 6 页挂占位页，路由与菜单一次到位，
+ * 后续逐页在此表补一行即可，不动路由结构。
  */
 const PAGE_LOADERS: Record<string, () => Promise<unknown>> = {
   '/admin/dashboard': () => import('@/views/admin/dashboard/index.vue'),
