@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import type { FormInstance, FormRules, TableInstance } from 'element-plus';
@@ -125,6 +125,8 @@ function rowIndex(i: number) {
 }
 
 function onSearch() {
+  // 去首尾空格：粘贴「张三 」或表格复制来的账号名很常见，带着空格走 LIKE '% 张三 %' 实测 0 命中
+  query.keyword = query.keyword.trim();
   query.page = 1;
   fetchList();
 }
@@ -144,6 +146,61 @@ function clearKeyword() {
   query.page = 1;
   fetchList();
 }
+
+/* ---------------- 窄视口把三个筛选下拉收进「筛选」浮层 ----------------
+ * 折行本身不裁切内容（实测溢出 0），但工具栏在 1366/1440 下折成两行、高 102px，
+ * 把列表首屏往下推 ~44px。单行需要 左组固有宽 + 右组固有宽 + 间距 + 内边距，
+ * 实测值见 style 里 .toolbar 那条注释 ⇒ 视口要到 ~1627px 才容得下，所以断点定在 1680px 以下启用浮层。
+ * 只用 CSS 换容器、不复制一份下拉（两套下拉会各自记住弹层状态，筛选值虽然同源但维护成本翻倍）；
+ * 浮层里改筛选 = 走同一个 onSearch，切换断点不丢值。
+ */
+const FILTER_BREAKPOINT = 1680;
+const compactFilter = ref(false);
+const filterPanelOpen = ref(false);
+const filterHostRef = ref<HTMLElement>();
+let filterMql: MediaQueryList | null = null;
+
+/** 已生效的筛选条件数（关键词不算：它有自带的 ✕ 和独立视觉位置）。
+    用 truthy 而不是 `!== ''`：EP 的 clearable 清空时发的是 undefined，按空串比会把已清掉的筛选计进徽标。 */
+const filterCount = computed(
+  () => [query.roleKey, query.status].filter(Boolean).length + (query.deptId != null ? 1 : 0)
+);
+
+function toggleFilterPanel() {
+  filterPanelOpen.value = !filterPanelOpen.value;
+}
+/** 点浮层与开关按钮之外任意处即收起（用捕获阶段，先于浮层内控件的 click，才能靠 contains 判边界）。
+    ★ EP 的下拉面板被传送到 body，不在 .filter-host 里 ⇒ 不加这条例外，选完一个筛选就会被当成「点外面」
+      把整个浮层收掉（实测到：选「学生」后浮层关闭，想再加一个状态筛选得重开）。
+      浮层开着时能出现在屏幕上的 popper 只可能是它自己的三个下拉，所以按 .el-popper 整类放行是安全的。 */
+function onDocClick(event: MouseEvent) {
+  const host = filterHostRef.value;
+  if (!host) return;
+  const target = event.target as HTMLElement | null;
+  if (typeof target?.closest === 'function' && target.closest('.el-popper')) return;
+  if (!host.contains(target)) filterPanelOpen.value = false;
+}
+function syncCompactFilter(matches: boolean) {
+  compactFilter.value = matches;
+  if (!matches) filterPanelOpen.value = false;
+}
+function onFilterBreakpoint(e: MediaQueryListEvent) {
+  syncCompactFilter(e.matches);
+}
+
+onMounted(() => {
+  filterMql = window.matchMedia(`(max-width: ${FILTER_BREAKPOINT - 1}px)`);
+  syncCompactFilter(filterMql.matches);
+  filterMql.addEventListener('change', onFilterBreakpoint);
+});
+onUnmounted(() => {
+  filterMql?.removeEventListener('change', onFilterBreakpoint);
+  document.removeEventListener('click', onDocClick, true);
+});
+watch(filterPanelOpen, (open) => {
+  document.removeEventListener('click', onDocClick, true);
+  if (open) document.addEventListener('click', onDocClick, true);
+});
 
 onMounted(() => {
   // 角色成员反查入口：/admin/accounts?roleKey=teacher（来自角色管理页成员数点击）
@@ -303,6 +360,7 @@ async function submitForm() {
       const res = await createUser(payload);
       ElMessage.success('新增成功');
       if (res?.tempPassword) {
+        pwdMode.value = 'create';
         pwdTitle.value = '请转交给使用者';
         pwdResult.value = res.tempPassword;
         pwdVisible.value = true;
@@ -437,13 +495,22 @@ async function toggleStatus(row: AdminUserVo) {
   } catch {
     return;
   }
-  ElMessage.success('操作成功');
+  // 提示写明做了什么、对哪个账号（request.ts 只在失败时弹提示，成功这条由本页发，不会重复）
+  ElMessage.success(`${next === '0' ? '已启用' : '已停用'}账号「${row.username}」`);
   fetchList();
 }
 
 const pwdVisible = ref(false);
 const pwdResult = ref('');
 const pwdTitle = ref('重置密码');
+/** 口令弹窗的两条来源要分别给标题和正文：新建账号没有「原密码」，重置密码也不是「转交新口令」。
+    标题原本只在新增分支改写、重置分支不回落 ⇒ 先新增再重置会沿用「请转交给使用者」（实测到）。 */
+const pwdMode = ref<'create' | 'reset'>('reset');
+const pwdLead = computed(() =>
+  pwdMode.value === 'create'
+    ? '已给该账号下发初始密码，请转交本人；对方首次登录时须改为自己设置的密码。'
+    : '已重置为默认密码，原密码立即失效。对方首次登录时须修改为新密码。'
+);
 async function doResetPwd(row: AdminUserVo) {
   const ok = await ElMessageBox.confirm(`确定要重置账号「${row.username}」的登录密码吗？原密码将立即失效。`, '重置密码', { type: 'warning' }).catch(() => false);
   if (!ok) return;
@@ -454,6 +521,8 @@ async function doResetPwd(row: AdminUserVo) {
     return;
   }
   pwdResult.value = res?.tempPassword ?? '';
+  pwdMode.value = 'reset';
+  pwdTitle.value = '重置密码';
   pwdVisible.value = true;
 }
 
@@ -501,6 +570,18 @@ async function doDelete(row: AdminUserVo) {
   fetchList();
 }
 
+/**
+ * 操作列「更多」下拉的分发。低频四项（足迹 / 重置密码 / 停用启用 / 删除）收进下拉后，
+ * 列宽从 390px 降到实测值（见 style 里 .op-col 那条），1366 视口不必横向滚动就能看全「操作」列。
+ * 锁定关系原样带过来：足迹不锁、重置密码走 resetLockTip、其余走 opLockTip。
+ */
+function onMoreCommand(cmd: string, row: AdminUserVo) {
+  if (cmd === 'footprint') openFootprint(row);
+  else if (cmd === 'reset') doResetPwd(row);
+  else if (cmd === 'toggle') toggleStatus(row);
+  else if (cmd === 'delete') doDelete(row);
+}
+
 /* ---------------- 批量启停 / 批量删除（循环调既有单条接口，后端护栏兜底） ---------------- */
 const selectedRows = ref<AdminUserVo[]>([]);
 const batchLoading = ref(false);
@@ -511,6 +592,12 @@ function onSelectionChange(rows: AdminUserVo[]) {
 
 type BatchKind = 'enable' | 'disable' | 'delete';
 const BATCH_LABEL: Record<BatchKind, string> = { enable: '批量启用', disable: '批量停用', delete: '批量删除' };
+// 三种动作的后果不一样，确认框中间那句必须跟着变（原本批量启用也写着「停用后立即踢下线」）
+const BATCH_NOTE: Record<BatchKind, string> = {
+  delete: '删除后不可恢复，',
+  disable: '停用后立即踢下线，',
+  enable: '启用后对方即可正常登录，'
+};
 
 async function runBatch(kind: BatchKind) {
   const rows = selectedRows.value;
@@ -524,7 +611,7 @@ async function runBatch(kind: BatchKind) {
   const nameList = targets.map((r) => r.username).join('、');
   const verb = kind === 'delete' ? '删除' : kind === 'enable' ? '启用' : '停用';
   const confirmed = await ElMessageBox.confirm(
-    `确定要${verb}以下 ${targets.length} 个账号吗？${kind === 'delete' ? '删除后不可恢复，' : '停用后立即踢下线，'}该操作逐个生效。\n${nameList}` +
+    `确定要${verb}以下 ${targets.length} 个账号吗？${BATCH_NOTE[kind]}该操作逐个生效。\n${nameList}` +
       (admins.length ? `\n（另有 ${admins.length} 个管理员账号已自动跳过）` : ''),
     BATCH_LABEL[kind],
     { type: 'warning', confirmButtonText: `确定${verb}` }
@@ -620,12 +707,12 @@ async function openFootprint(row: AdminUserVo) {
       </el-tooltip>
       <el-tooltip content="勾选后可用（翻页保留，改筛选即清空）" :disabled="!!selectedRows.length" placement="top">
         <el-button :disabled="!selectedRows.length" :loading="batchLoading" @click="runBatch('disable')">
-          <ZkIcon name="ban" :size="15" style="margin-right: 4px" />停用
+          <ZkIcon name="ban" :size="15" style="margin-right: 4px" />停用{{ selectedRows.length ? `（${selectedRows.length}）` : '' }}
         </el-button>
       </el-tooltip>
       <el-tooltip content="勾选后可用（翻页保留，改筛选即清空）" :disabled="!!selectedRows.length" placement="top">
         <el-button :disabled="!selectedRows.length" :loading="batchLoading" type="danger" plain @click="runBatch('delete')">
-          <ZkIcon name="trash-2" :size="15" style="margin-right: 4px" />删除
+          <ZkIcon name="trash-2" :size="15" style="margin-right: 4px" />删除{{ selectedRows.length ? `（${selectedRows.length}）` : '' }}
         </el-button>
       </el-tooltip>
     </div>
@@ -649,25 +736,37 @@ async function openFootprint(row: AdminUserVo) {
       </div>
       <!-- placeholder 必须显式写：三个下拉的「全部」项值都是空串，EP 对空值显示 placeholder
            而不是 option 的 label ⇒ 不写就会一起显示默认的「请选择」，看不出这是筛选器。
-           （原此处有「角色筛选」小字标签，2026-10-22 用户要求删除；placeholder 已自带语义，不补别的标签。） -->
-      <el-select v-model="query.roleKey" filterable style="width: 130px" placeholder="全部角色" @change="onSearch">
-        <el-option v-for="o in ROLE_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
-      </el-select>
-      <el-select v-model="query.status" filterable style="width: 110px" placeholder="全部状态" @change="onSearch">
-        <el-option v-for="o in STATUS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
-      </el-select>
-      <!-- 院系候选来自「现有账号已登记的院系」去重快照：后端无院系 CRUD 端点，拿不到全量院系树 -->
-      <el-select v-model="query.deptId" filterable style="width: 160px" clearable placeholder="全部院系" @change="onSearch">
-        <el-option v-for="o in deptOptions" :key="o.id" :label="o.name" :value="o.id" />
-        <!-- ★ 1022-P2-1：快照只取前 200 条账号，账号总数超过它时未进快照的院系会缺项。
-             不写这行，缺项表现为「下拉里就是所有院系」——用户无从分辨。只在触顶时出现，日常不打扰。 -->
-        <template v-if="deptSnapshotTruncated" #footer>
-          <div class="small muted dept-foot-tip">
-            候选只统计了前 {{ DEPT_SNAPSHOT_SIZE }} 条账号（快照时共 {{ deptSnapshotTotal }} 条），院系可能有缺；
-            要找的院系不在列表里时，直接键入名称过滤，或改用关键词搜索定位。
-          </div>
-        </template>
-      </el-select>
+           （原此处有「角色筛选」小字标签，2026-10-22 用户要求删除；placeholder 已自带语义，不补别的标签。）
+           三个下拉一律 clearable：点 ✕ 即回到「全部」并触发查询，与搜索单元的 ✕ 同一口径。 -->
+      <div ref="filterHostRef" class="filter-host" :class="{ compact: compactFilter, open: filterPanelOpen }">
+        <el-button
+          v-if="compactFilter"
+          class="filter-toggle"
+          :type="filterCount ? 'primary' : 'default'"
+          :aria-expanded="filterPanelOpen"
+          @click="toggleFilterPanel"
+        >筛选{{ filterCount ? `（${filterCount}）` : '' }}</el-button>
+        <div class="filter-panel">
+          <el-select v-model="query.roleKey" filterable clearable style="width: 130px" placeholder="全部角色" @change="onSearch">
+            <el-option v-for="o in ROLE_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+          </el-select>
+          <el-select v-model="query.status" filterable clearable style="width: 110px" placeholder="全部状态" @change="onSearch">
+            <el-option v-for="o in STATUS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+          </el-select>
+          <!-- 院系候选来自「现有账号已登记的院系」去重快照：后端无院系 CRUD 端点，拿不到全量院系树 -->
+          <el-select v-model="query.deptId" filterable clearable style="width: 160px" placeholder="全部院系" @change="onSearch">
+            <el-option v-for="o in deptOptions" :key="o.id" :label="o.name" :value="o.id" />
+            <!-- ★ 1022-P2-1：快照只取前 200 条账号，账号总数超过它时未进快照的院系会缺项。
+                 不写这行，缺项表现为「下拉里就是所有院系」——用户无从分辨。只在触顶时出现，日常不打扰。 -->
+            <template v-if="deptSnapshotTruncated" #footer>
+              <div class="small muted dept-foot-tip">
+                候选只统计了前 {{ DEPT_SNAPSHOT_SIZE }} 条账号（快照时共 {{ deptSnapshotTotal }} 条），院系可能有缺；
+                要找的院系不在列表里时，直接键入名称过滤，或改用关键词搜索定位。
+              </div>
+            </template>
+          </el-select>
+        </div>
+      </div>
       <el-button text @click="resetQuery">重置</el-button>
     </div>
   </div>
@@ -675,8 +774,10 @@ async function openFootprint(row: AdminUserVo) {
   <div class="card">
     <el-table ref="tableRef" v-loading="loading" row-key="userId" :data="rows" style="width: 100%" @selection-change="onSelectionChange">
       <el-table-column type="selection" width="42" reserve-selection />
-      <!-- 列宽是实测值（离线复刻页在 Chrome 150 里量，见 §.workbuddy/tmp/fe-jia/measure-opcol.html）：
-           序号表头「序号」实测需 55px、状态徽标「启用」实测需 79px ⇒ 这两列原本 64/90 已接近下限，收窄反而只剩 1px 余量，故保持原值。 -->
+      <!-- 列宽全部按真页面实测取（10-23 同源 iframe 造 1366 视口，量各列内容宽 + 单元格左右内边距 24px）：
+           序号表头「序号」需 64、用户名行内内容需 240、角色「普通用户」需 90、状态徽标「启用」需 66、
+           两个时间列「2026-10-23 10:19:31」各需 154 ⇒ 依次给 64 / 240 / 100 / 84 / 164，每列留 10~18px 余量。
+           八列合计 42+64+240+100+84+164+164+196 = 1054 ≤ 1366 视口可用的 1069 ⇒ 不再需要横向滚动（收纳前是 1276，差 207）。 -->
       <el-table-column type="index" label="序号" width="64" align="center" :index="rowIndex" />
       <el-table-column label="用户名" min-width="240">
         <template #default="{ row }">
@@ -689,29 +790,26 @@ async function openFootprint(row: AdminUserVo) {
           </div>
         </template>
       </el-table-column>
-      <el-table-column label="角色" min-width="110">
+      <el-table-column label="角色" min-width="100">
         <template #default="{ row }">
           <span class="badge" :class="ROLE_BADGE[primaryRoleKey(row)]">{{ rolesText(row) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="状态" width="90">
+      <el-table-column label="状态" width="84">
         <template #default="{ row }">
           <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="创建时间" width="170" prop="createTime">
+      <el-table-column label="创建时间" width="164" prop="createTime">
         <template #default="{ row }">{{ row.createTime || '—' }}</template>
       </el-table-column>
-      <el-table-column label="最近登录" width="170" prop="loginDate">
+      <el-table-column label="最近登录" width="164" prop="loginDate">
         <template #default="{ row }">{{ row.loginDate || '—' }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="390" align="right" class-name="op-col">
+      <el-table-column label="操作" width="196" align="right" class-name="op-col" fixed="right">
         <template #default="{ row }">
           <el-button text size="small" @click="openDetail(row)">
             <ZkIcon name="eye" :size="14" style="margin-right: 3px" />查看
-          </el-button>
-          <el-button text size="small" @click="openFootprint(row)">
-            <ZkIcon name="history" :size="14" style="margin-right: 3px" />足迹
           </el-button>
           <el-button
             text size="small"
@@ -719,27 +817,20 @@ async function openFootprint(row: AdminUserVo) {
             :title="opLockTip(row) ?? undefined"
             @click="openEdit(row)"
           >编辑</el-button>
-          <el-button
-            text size="small"
-            :disabled="!!resetLockTip(row)"
-            :title="resetLockTip(row) ?? undefined"
-            @click="doResetPwd(row)"
-          >
-            <ZkIcon name="key-round" :size="14" style="margin-right: 3px" />重置密码
-          </el-button>
-          <el-button
-            text size="small"
-            :disabled="!!opLockTip(row)"
-            :title="opLockTip(row) ?? undefined"
-            @click="toggleStatus(row)"
-          >{{ row.status === '0' ? '停用' : '启用' }}</el-button>
-          <el-button
-            text size="small"
-            style="color: var(--error)"
-            :disabled="!!opLockTip(row)"
-            :title="opLockTip(row) ?? undefined"
-            @click="doDelete(row)"
-          >删除</el-button>
+          <!-- 低频四项收进「更多」：常驻 6 个按钮要 367px，收到 196px 后 1366 视口不必横向滚动就看得全 -->
+          <el-dropdown trigger="click" @command="(c: string | number | object) => onMoreCommand(String(c), row)">
+            <el-button text size="small" class="op-more">更多</el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="footprint">足迹</el-dropdown-item>
+                <el-dropdown-item command="reset" :disabled="!!resetLockTip(row)">重置密码</el-dropdown-item>
+                <el-dropdown-item command="toggle" :disabled="!!opLockTip(row)">
+                  {{ row.status === '0' ? '停用' : '启用' }}
+                </el-dropdown-item>
+                <el-dropdown-item command="delete" :disabled="!!opLockTip(row)" class="op-danger">删除</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </template>
       </el-table-column>
     </el-table>
@@ -840,7 +931,7 @@ async function openFootprint(row: AdminUserVo) {
 
   <!-- 重置密码结果 -->
   <el-dialog v-model="pwdVisible" :title="pwdTitle" width="420px">
-    <p class="muted small" style="margin-top: 0">已重置为默认密码，原密码立即失效。对方首次登录时须修改为新密码。</p>
+    <p class="muted small" style="margin-top: 0">{{ pwdLead }}</p>
     <div class="rowline" style="margin-top: 10px">
       <span class="mono" style="font-size: 16px; font-weight: 700">{{ pwdResult }}</span>
       <el-button text @click="copyPwd">
@@ -964,17 +1055,55 @@ async function openFootprint(row: AdminUserVo) {
 
 <style scoped>
 /* 工具栏允许换行：共享样式 .toolbar 是 flex + nowrap（theme.css:216-217），窄视口下不会折行、只会溢出。
-   离线复刻实测（.workbuddy/tmp/fe-jia/measure-toolbar2.html，Chrome 150）：左组固有宽 422 + 右组 878 + 间距 12
-   + 内边距 32 = 单行需 1344px，加上侧栏 224 与主区内边距 56 ⇒ 需视口 1626px 才不换行；
-   1366 视口下溢出 243px、1440 下溢出 169px（最右的「重置」被顶出卡片外，页面出横向滚动条）；1920 下可用 1607 > 需 1312，不溢。
-   .right 也要能换行：只给 .toolbar 换行时，1024 视口下右组 878 > 可用 711，仍溢出 151px；
-   两条都加后 1024 下右组自己折成两行、溢出 0，搜索单元仍是 380 未被压窄。
+   真页面实测（同源 iframe 造视口，10-23）：左组固有宽 425 + 右组 878 + 间距 12 + 内边距 32 = 单行需 1347px，
+   加侧栏 224 与主区内边距 56 ⇒ 视口要到 ~1627px 才容得下单行；1366 可用 1069、1440 可用 1143 ⇒ 都会折成两行（实测高 102px）。
+   折行只压纵向高度、不裁内容（实测溢出 0、搜索单元仍 380），所以保留 wrap 兜底；
+   ≤1679px 另走「筛选」浮层：右组缩成 搜索 380 + 开关 58~94 + 重置 46 + 两处间距 20 = 504~540，
+   与左组 425 相加 973~1009 ≤ 1069 ⇒ 1366 起回到单行（开关带计数时最宽 540，仍放得下）。
+   .right 也要能换行：只给 .toolbar 换行时，1024 视口下右组 878 > 可用 711，仍溢出 151px。
    只改本页作用域（scoped 选择器带 data-v，不影响其它页面的 .toolbar），共享 theme.css 不动。 */
 .toolbar {
   flex-wrap: wrap;
 }
 .toolbar .right {
   flex-wrap: wrap;
+}
+
+/* 筛选组：宽视口就地平铺（.right 的直接子项换成这一个组，项间距仍按 theme.css .right 的 10px，
+   4 个间隔位不变 ⇒ 总宽与收纳前一致，不会因多包一层而变宽）；
+   窄视口换成「筛选」开关 + 绝对定位浮层，浮层里竖排、下拉拉满宽度（内联 style 的宽度只能用 !important 覆盖）。 */
+.filter-host {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  position: relative;
+}
+.filter-panel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.filter-host.compact .filter-panel {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  width: 220px;
+  padding: 12px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--sh-2, 0 8px 24px rgba(15, 23, 42, 0.12));
+}
+.filter-host.compact.open .filter-panel {
+  display: flex;
+}
+.filter-host.compact :deep(.el-select) {
+  width: 100% !important;
 }
 
 /* 列表底部：导入 / 导出（从工具栏移下来） */
@@ -1068,12 +1197,15 @@ async function openFootprint(row: AdminUserVo) {
   color: var(--error, #e5484d);
   margin-left: 6px;
 }
-/* 操作列有 6 个动作，窄列会把按钮挤成两行、撑高行高 —— 强制单行。
-   EP 2.14.3 的 text 按钮只换颜色与边框，内边距仍由 size 给（theme-chalk/el-button.css：
-   .el-button--small{padding:5px 11px;font-size:12px} 与 .el-button+.el-button{margin-left:12px}）。
-   列宽取实测值，不取口算：离线复刻页（.workbuddy/tmp/fe-jia/measure-opcol.html）在 Chrome 150 里量
-   .cell 的 scrollWidth ⇒ 默认 padding 时需 451px（我先前口算 435，偏小 16），
-   压到 padding 7px / 间距 8px 后需 383px（我先前口算 367，偏小 16）⇒ 列宽 380 仍被切 3px，故给 390（余 7px）。 */
+/* 操作列：查看 / 编辑 常驻，其余四项（足迹、重置密码、停用启用、删除）收进「更多」下拉。
+   为什么收：常驻 6 个按钮在真页面实测内容宽 343px + 单元格左右内边距 24px = 需 367px，列宽给到 390；
+   八列合计 1276px 超过 1366 视口可用的 1069px（差 207）⇒「重置密码/停用/删除」落到可视区外，
+   而横向滚动条不可见（EP 自绘条 display:none、容器 scrollbar-width:none）⇒ 使用方看不出右边还有按钮。
+   收纳后的列宽按实测取（同一份收紧规则在 Chrome 150 里量 .workbuddy/tmp/fe-jia/measure-more-col.html）：
+   查看 55 + 编辑 38 + 更多 38 + 两处间距 16 ⇒ 内容需 154、加内边距 178 ⇒ 列宽给 196（余 18）。
+   八列合计随之降到 1054 ≤ 1069 ⇒ 1366 起不必横向滚动；≤1280 仍要滚，所以该列另加 fixed="right" 钉在右侧。
+   EP 的 text 按钮只换颜色与边框，内边距仍由 size 给
+   （theme-chalk/el-button.css：.el-button--small{padding:5px 11px} 与 .el-button+.el-button{margin-left:12px}）⇒ 一并收紧。 */
 :deep(.op-col) .cell {
   white-space: nowrap;
 }
@@ -1082,6 +1214,17 @@ async function openFootprint(row: AdminUserVo) {
 }
 :deep(.op-col) .el-button + .el-button {
   margin-left: 8px;
+}
+:deep(.op-col) .el-button + .el-dropdown {
+  margin-left: 8px;
+}
+/* EP 的 .el-dropdown 自带 margin-top:-1px 与 vertical-align:top，跟同行的 text 按钮会对不齐 */
+:deep(.op-col) .el-dropdown {
+  margin-top: 0;
+  vertical-align: middle;
+}
+:deep(.op-col) .op-more {
+  margin: 0;
 }
 
 /* 表单标签对齐：星号绝对定位脱离文字流，所有标签统一 padding-left:12px

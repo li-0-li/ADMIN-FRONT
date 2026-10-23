@@ -133,6 +133,8 @@ const deltaText = (d: number | undefined | null, suffix = '') =>
 function trendOf(card: StatCard): { text: string; cls: string } | null {
   const s = data.value?.summary;
   if (!s) return null;
+  // 无样本时不显示「较上期 ±0分」——分母都不存在，涨跌是假的
+  if (noScoreSample.value && (card.key === 'avg' || card.key === 'pass')) return null;
   if (card.key === 'avg') {
     const tc = data.value?.termCompare;
     if (tc && tc.curAvg !== undefined && tc.curAvg !== null && tc.prevAvg !== undefined && tc.prevAvg !== null) {
@@ -175,6 +177,19 @@ const catText = (v: string) => CAT_TEXT[String(v)] ?? v;
 
 /* ---------- 院系及格率对比：汇总行取已批改总数，横条按 100% 定标 ---------- */
 const distTotal = computed(() => (data.value?.distribution ?? []).reduce((s, b) => s + b.count, 0));
+/** 没有一份已批改成绩时，平均分/及格率不能写成「0 分 / 0%」——那是把「没数据」显示成「考了 0 分」 */
+const noScoreSample = computed(() => distTotal.value === 0);
+/** 实测：后端只把 termId / courseId 下推到成绩类聚合，deptId 与 major 对平均分、及格率、分数段、排行、预警完全不起作用
+ *  （只影响课程数、分类统计、备课明细）⇒ 带这两个条件时标题不能再写「当前筛选维度」 */
+const scoreDimsIgnored = computed(() => {
+  const d = filters.deptId ? depts.value.find(x => String(x.deptId) === filters.deptId)?.name || '' : '';
+  return [d, filters.major].filter(Boolean) as string[];
+});
+const scoreScope = computed(() => (scoreDimsIgnored.value.length ? '（全学期口径）' : '（当前筛选维度）'));
+/** 分类统计在空集下仍会返回 4 个分类名（值全 0）⇒ 按合计判空，不要摆 4 行 0 出来 */
+const categoriesTotal = computed(() => (data.value?.categories ?? []).reduce((s, c) => s + (c.courseCount ?? 0), 0));
+/** 只判空态行不够：数据行也得收掉，否则屏上是「4 行 0 + 一行空态」 */
+const catRows = computed(() => (categoriesTotal.value ? data.value?.categories ?? [] : []));
 const dpW = (rate: number) => Math.min(100, Math.max(rate > 0 ? 3 : 0, rate));
 /** 份数不足 10 的及格率不稳（5 份里挂 1 份就是 80%），条眼降透明并在口径行里说明 */
 const SMALL_N = 10;
@@ -398,16 +413,16 @@ function buildCsv(): string {
   const closed = alertStatus.value === 'closed';
   const out: string[] = [];
   out.push(csvRow(['全校学情统计报表']));
-  out.push(csvRow(['统计维度', dimBadge.value]));
+  out.push(csvRow(['统计维度', dimBadge.value + (scoreDimsIgnored.value.length ? '（成绩类各块为全学期口径）' : '')]));
   out.push(csvRow(['数据拉取时刻', loadedAt.value || '—']));
   out.push(csvRow([]));
   out.push(csvRow(['总览']));
-  out.push(csvRow(['平均分', num(s?.avgScore), '及格率', num(s?.passRate, '%'), '当前上课课堂', s?.liveClassCount, '预警学生', s?.alertCount]));
+  out.push(csvRow(['平均分', noScoreSample.value ? '—' : num(s?.avgScore), '及格率', noScoreSample.value ? '—' : num(s?.passRate, '%'), '当前上课课堂', s?.liveClassCount, '预警学生', s?.alertCount]));
   out.push(csvRow(['课程数', s?.courseCount, '教师数', s?.teacherCount, '学生数', s?.studentCount, '已批改成绩', distTotal.value]));
   out.push(csvRow([]));
   out.push(csvRow(['课程分类统计']));
   out.push(csvRow(['类别', '课程数', '学生数', '平均分', '及格率']));
-  for (const c of d?.categories ?? []) out.push(csvRow([catText(c.category), c.courseCount, c.studentCount, num(c.avgScore), num(c.passRate, '%')]));
+  for (const c of catRows.value) out.push(csvRow([catText(c.category), c.courseCount, c.studentCount, num(c.avgScore), num(c.passRate, '%')]));
   out.push(csvRow([]));
   out.push(csvRow(['分数段分布']));
   out.push(csvRow(['分数段', '份数']));
@@ -458,7 +473,7 @@ function onExport() {
   a.download = csvFileName();
   a.click();
   URL.revokeObjectURL(url);
-  ElMessage.success('报表已按当前筛选维度生成');
+  ElMessage.success(scoreDimsIgnored.value.length ? '报表已按当前筛选生成（其中成绩类各块仍是全学期口径）' : '报表已按当前筛选维度生成');
 }
 
 onMounted(async () => {
@@ -508,9 +523,9 @@ onMounted(async () => {
           <div class="num" :style="c.key === 'live' ? 'color:var(--brand-600)' : ''">
             {{
               c.key === 'avg'
-                ? num(data.summary?.avgScore)
+                ? (noScoreSample ? '—' : num(data.summary?.avgScore))
                 : c.key === 'pass'
-                  ? num(data.summary?.passRate, '%')
+                  ? (noScoreSample ? '—' : num(data.summary?.passRate, '%'))
                   : c.key === 'live'
                     ? (data.summary?.liveClassCount ?? '—')
                     : (data.summary?.alertCount ?? '—')
@@ -520,6 +535,10 @@ onMounted(async () => {
         </div>
       </div>
       <div v-if="coverage" class="cov-line small muted">{{ coverage }}</div>
+      <!-- 后端把 deptId/major 只下推到了课程数、分类与备课；成绩类六块仍是全学期口径 ⇒ 与其让标题骗人，不如把口径写在屏上 -->
+      <div v-if="scoreDimsIgnored.length" class="scope-note small">
+        已按 {{ scoreDimsIgnored.join(' / ') }} 筛选：只有课程数、分类统计与备课进度跟着变；平均分、及格率、分数段、两张排行与预警名单仍是<b>全学期口径</b>（后端未把这两个条件下推到成绩类聚合，已提需求）。
+      </div>
 
       <!-- 课程分类统计 + 成绩分布 -->
       <div class="grid g2 mt16 pair">
@@ -528,25 +547,26 @@ onMounted(async () => {
           <div class="tbl-wrap">
           <table class="tbl">
             <thead>
-              <tr><th>类别</th><th>课程数</th><th>学生数</th><th>平均分</th><th>及格率</th></tr>
+              <tr><th>#</th><th>类别</th><th>课程数</th><th>学生数</th><th>平均分</th><th>及格率</th></tr>
             </thead>
             <tbody>
-              <tr v-for="(c, i) in data.categories ?? []" :key="c.category">
+              <tr v-for="(c, i) in catRows" :key="c.category">
+                <td class="muted">{{ i + 1 }}</td>
                 <td><span class="badge" :class="catCls(i)">{{ catText(c.category) }}</span></td>
                 <td>{{ c.courseCount }}</td>
                 <td>{{ c.studentCount }}</td>
                 <td>{{ num(c.avgScore) }}</td>
                 <td>{{ num(c.passRate, '%' ) }}</td>
               </tr>
-              <tr v-if="!data.categories?.length">
-                <td colspan="5" class="center muted" style="padding: 24px">暂无分类数据</td>
+              <tr v-if="!catRows.length">
+                <td colspan="6" class="center muted" style="padding: 24px">当前筛选范围内没有课程</td>
               </tr>
             </tbody>
           </table>
           </div>
         </div>
         <div class="card card-pad">
-          <div class="card-title">院系及格率对比（当前筛选维度）</div>
+          <div class="card-title">院系及格率对比{{ scoreScope }}</div>
           <!-- 汇总指标：同一筛选维度下的成绩总览，填充卡片上部并给出读数锚点 -->
           <div v-if="data.distribution?.length" class="dist-meta">
             <div class="dm-item">
@@ -582,7 +602,7 @@ onMounted(async () => {
       <div class="grid g2 mt16 pair">
         <div class="card card-pad">
           <div class="between" style="margin-bottom: 6px">
-            <div class="card-title">分数段分布（当前筛选维度）</div>
+            <div class="card-title">分数段分布{{ scoreScope }}</div>
             <span class="small muted">共 {{ distTotal }} 份已批改成绩</span>
           </div>
           <div v-if="distTotal > 0" class="score-bands">
@@ -667,15 +687,16 @@ onMounted(async () => {
         <table class="tbl">
           <thead>
             <tr v-if="prepDim === 'dept'">
-              <th>院系</th><th>课程数</th><th>教师数</th><th>备课进度</th><th>实验进度</th><th>滞后课程</th><th>状态</th>
+              <th>#</th><th>院系</th><th>课程数</th><th>教师数</th><th>备课进度</th><th>实验进度</th><th>滞后课程</th><th>状态</th>
             </tr>
             <tr v-else>
-              <th>课程</th><th>院系</th><th>任课教师</th><th>备课进度</th><th>实验进度</th><th>状态</th>
+              <th>#</th><th>课程</th><th>院系</th><th>任课教师</th><th>备课进度</th><th>实验进度</th><th>状态</th>
             </tr>
           </thead>
           <tbody>
-            <template v-for="g in prepAggs" :key="g.key">
+            <template v-for="(g, gi) in prepAggs" :key="g.key">
               <tr class="prep-main" @click="togglePrep(g.key)">
+                <td class="muted">{{ gi + 1 }}</td>
                 <td>
                   <div class="row" style="gap: 6px">
                     <!-- ZkIcon 没有登记 chevron-down（画出来是空框），改用一个图标 + 旋转变体。
@@ -710,15 +731,16 @@ onMounted(async () => {
               </tr>
               <!-- 下钻：教师明细 -->
               <tr v-if="prepOpen[g.key]" class="prep-drill">
-                <td :colspan="prepDim === 'dept' ? 7 : 6" style="background: var(--bg-subtle); padding: 0">
+                <td :colspan="prepDim === 'dept' ? 8 : 7" style="background: var(--bg-subtle); padding: 0">
                   <div style="padding: 12px 18px">
                     <div class="small muted" style="margin-bottom: 8px">教师明细（{{ drillRows(g).length }} 条）</div>
                     <table class="tbl drill-tbl">
                       <thead>
-                        <tr><th>教师</th><th>课程</th><th>备课进度</th><th>实验进度</th><th>状态</th></tr>
+                        <tr><th>#</th><th>教师</th><th>课程</th><th>备课进度</th><th>实验进度</th><th>状态</th></tr>
                       </thead>
                       <tbody>
-                        <tr v-for="d in drillRows(g)" :key="d.teacher + d.course">
+                        <tr v-for="(d, di) in drillRows(g)" :key="d.teacher + d.course">
+                          <td class="muted">{{ di + 1 }}</td>
                           <td><div class="row" style="gap: 8px"><span class="avatar sm">{{ (d.teacher || '?')[0] }}</span>{{ d.teacher }}</div></td>
                           <td>{{ d.course }}</td>
                           <td>
@@ -742,7 +764,7 @@ onMounted(async () => {
               </tr>
             </template>
             <tr v-if="!prepAggs.length">
-              <td :colspan="prepDim === 'dept' ? 7 : 6" class="center muted" style="padding: 24px">当前筛选条件下无数据</td>
+              <td :colspan="prepDim === 'dept' ? 8 : 7" class="center muted" style="padding: 24px">当前筛选条件下无数据</td>
             </tr>
           </tbody>
         </table>
@@ -768,10 +790,11 @@ onMounted(async () => {
           <div v-if="data.liveClasses?.length" class="tbl-wrap">
           <table class="tbl">
             <thead>
-              <tr><th>课程</th><th>教师</th><th>教室</th><th>节次</th><th>在线学生</th></tr>
+              <tr><th>#</th><th>课程</th><th>教师</th><th>教室</th><th>节次</th><th>在线学生</th></tr>
             </thead>
             <tbody>
               <tr v-for="(l, i) in data.liveClasses ?? []" :key="i">
+                <td class="muted">{{ i + 1 }}</td>
                 <td>{{ l.course || '—' }}</td>
                 <td>{{ l.teacher || '—' }}</td>
                 <td>{{ l.room || '—' }}</td>
@@ -799,15 +822,17 @@ onMounted(async () => {
             <g stroke="#f1f5f6">
               <line v-for="g in trendPts.grid" :key="g.y" x1="30" :y1="g.y" x2="390" :y2="g.y" />
             </g>
-            <g font-size="9" fill="#94a3b8" text-anchor="end">
-              <text v-for="g in trendPts.grid" :key="'v' + g.y" x="27" :y="g.y + 3">{{ g.v }}</text>
+            <!-- viewBox 400 宽 + width:100% ⇒ 字号是随卡片缩放的用户单位。原来写 9/10，实测渲染只有 7~8px 且 fill 用 ink-400（2.56:1），
+                 轴标签既看不清也读不出值 ⇒ 提到 13 单位（渲染约 10.5px）+ ink-500（4.76:1） -->
+            <g font-size="13" fill="#64748b" text-anchor="end">
+              <text v-for="g in trendPts.grid" :key="'v' + g.y" x="27" :y="g.y + 4">{{ g.v }}</text>
             </g>
             <polyline :points="trendPts.line" fill="none" stroke="#0d9488" stroke-width="2.5" stroke-linecap="round" />
             <g fill="#0d9488">
               <circle v-for="d in trendPts.dots" :key="d.week" :cx="d.cx" :cy="d.cy" r="3.5" />
             </g>
-            <g font-size="10" fill="#94a3b8">
-              <text v-for="d in trendPts.dots" :key="'t' + d.week" :x="d.cx - 8" y="176">{{ d.week }}</text>
+            <g font-size="13" fill="#64748b">
+              <text v-for="d in trendPts.dots" :key="'t' + d.week" :x="d.cx - 9" y="178">{{ d.week }}</text>
             </g>
           </svg>
           <p v-else class="muted small" style="padding: 16px 0">暂无趋势数据</p>
@@ -844,13 +869,14 @@ onMounted(async () => {
         <table class="tbl">
           <thead>
             <tr>
-              <th>学生</th><th>课程</th><th>院系</th><th>类型</th><th>当前分</th><th>等级</th>
+              <th>#</th><th>学生</th><th>课程</th><th>院系</th><th>类型</th><th>当前分</th><th>等级</th>
               <th>{{ alertStatus === 'open' ? '操作' : '处理时间' }}</th>
               <th v-if="alertStatus === 'closed'">处理备注</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="a in sortedAlerts" :key="a.alertId ?? (a.student + a.course)">
+            <tr v-for="(a, ai) in sortedAlerts" :key="a.alertId ?? (a.student + a.course)">
+              <td class="muted">{{ ai + 1 }}</td>
               <td>{{ a.student || '—' }}</td>
               <td>{{ a.course || '—' }}</td>
               <td>{{ a.dept || '—' }}</td>
@@ -929,7 +955,8 @@ onMounted(async () => {
 }
 .dm-label {
   font-size: 12px;
-  color: var(--ink-500);
+  /* ink-500 压在 --bg-50 灰底上实测 4.44:1，差 0.06 不到 AA ⇒ 提到 ink-700（7.07:1） */
+  color: var(--ink-700, #475569);
 }
 /* 院系及格率横条对比：名称 / 轨道 / 数值 / 份数四列 */
 .dept-pass {
@@ -986,8 +1013,9 @@ onMounted(async () => {
 .dp-cnt {
   flex: 0 0 52px;
   text-align: right;
-  font-size: 11px;
-  color: var(--ink-400, #94a3b8);
+  /* 「51 份」是份数分母，不是装饰：原 11px + ink-400 在白底实测 2.56:1，读不清 ⇒ 12px + ink-500（4.76:1，AA） */
+  font-size: 12px;
+  color: var(--ink-500, #64748b);
 }
 /* 分数段分布：五档柱状（<60 红渐深 → 90-100 绿），柱高按最大档定标 */
 .score-bands {
@@ -1118,6 +1146,16 @@ onMounted(async () => {
   margin-top: 8px;
   padding-left: 2px;
 }
+/* 口径提示：写在屏上而不是等别人来问「为什么筛了院系数字没变」。文字用 ink-700 压浅琥珀底，实测对比度 >7:1 */
+.scope-note {
+  margin-top: 10px;
+  padding: 9px 12px;
+  color: var(--ink-700, #475569);
+  background: rgba(180, 83, 9, 0.07);
+  border-left: 3px solid #b45309;
+  border-radius: 6px;
+  line-height: 1.65;
+}
 /* 口径行：条长/颜色/排序的读法写在图下面，不靠读者猜 */
 .caliber {
   margin-top: 8px;
@@ -1128,7 +1166,8 @@ onMounted(async () => {
   padding: 0 4px;
   margin: 0 3px;
   border-radius: 4px;
-  color: #d97706;
+  /* 橙色小 chips 压在 10% 琥珀底上，原 #d97706 只有 2.86:1 ⇒ 同族加深到 amber-700（4.52:1） */
+  color: #b45309;
   background: rgba(217, 119, 6, 0.1);
 }
 /* ZkIcon 未登记 chevron-down（会渲染成空框），下钻箭头用一个图标 + 旋转 */
@@ -1157,7 +1196,8 @@ onMounted(async () => {
   opacity: 0.45;
 }
 .dp-cnt.warn {
-  color: #d97706;
+  /* #d97706 在白底只有 3.19:1 ⇒ 加深到 amber-700（5.02:1） */
+  color: #b45309;
   font-weight: 600;
 }
 .band-label.fail {
