@@ -77,6 +77,19 @@ const refreshing = ref(false);
  *  旧写法 catch 里只清数据，两种空在界面上长得一样，用户只能猜（2026-10-22 复盘缺陷 2）。 */
 const loadError = ref(false);
 const filters = reactive({ courseId: '', teacherId: '', clazzName: '', classroomId: '', major: '', termId: '', schoolId: '' });
+/** 任一维度处于筛选中 ⇒ 工具栏出现「清空筛选」总入口 */
+const anyFilter = computed(() => Object.values(filters).some(v => v !== ''));
+function clearFilters() {
+  filters.courseId = '';
+  filters.teacherId = '';
+  filters.clazzName = '';
+  filters.classroomId = '';
+  filters.major = '';
+  filters.termId = '';
+  filters.schoolId = '';
+  // 学期清空会经 watcher 再 load 一次；非空时这次 load 就是把服务端过滤撤掉的那一次
+  void load();
+}
 /** 学期下拉（后端 ScheduleQueryBo 支持 termId 过滤 ⇒ 服务端筛，变化即重查）；
  *  startDate/endDate 用于「学期第 N 周」标注（2026-10-21） */
 const terms = ref<{ termId: number; name: string; startDate?: string; endDate?: string }[]>([]);
@@ -90,9 +103,17 @@ const clazzMajorMap = ref<Record<string, string>>({});
  * 拉取本周课次。
  * @param soft 落库后的回读（同周同筛选，只是重读一遍）⇒ 遮罩不阻挡；否则整体替换 ⇒ 遮罩阻挡。
  */
+/** 请求序号：翻周 / 换筛选会并发多个 load，只让最后一次的结果落盘（旧响应后到会盖掉新周的数据） */
+let loadSeq = 0;
 async function load(soft = false) {
+  const my = ++loadSeq;
   if (soft) refreshing.value = true;
-  else loading.value = true;
+  else {
+    loading.value = true;
+    // 周或口径变了就先清掉上一批：不清的话摘要条会继续挂着上一周的人数，看起来像"数据没变"
+    allCells.value = [];
+    returnedCells.value = [];
+  }
   loadError.value = false;
   try {
     const res = await listSchedules({
@@ -104,15 +125,18 @@ async function load(soft = false) {
       pageSize: PAGE_SIZE,
       includeDeleted: true
     });
+    if (my !== loadSeq) return;
     const rows = res?.list ?? [];
     allCells.value = rows.filter(c => !c.deleted);
     // 软删行 = 本周被放回待排的课次：每条 = 待排池里的一张签（1 节课 1 签，可拖 1 次）
     returnedCells.value = rows.filter(c => !!c.deleted);
   } catch {
+    if (my !== loadSeq) return;
     allCells.value = [];
     returnedCells.value = [];
     loadError.value = true;
   } finally {
+    if (my !== loadSeq) return;
     // 卡片整批重渲染后原触发元素已离开 DOM，悬浮层不收会浮在原地成为孤儿
     hideCardTip();
     if (soft) refreshing.value = false;
@@ -813,6 +837,13 @@ function onCardFocus(s: ScheduleCell, weekday: number, periodSeq: number, e: Foc
   gridFocus.pn = periodSeq;
   gridFocus.sid = s.scheduleId;
   showCardTip(e.target as HTMLElement | undefined, s, weekday, periodSeq);
+}
+/** 空格子拿到焦点时也把锚点挪过来：弹窗关闭时浏览器会把焦点还给「打开弹窗前那个元素」，
+ * 走不到 onCardFocus，停靠点就会留在原处（Tab 出去再回来落回别的格子） */
+function onEmptyFocus(weekday: number, periodSeq: number) {
+  gridFocus.wd = weekday;
+  gridFocus.pn = periodSeq;
+  gridFocus.sid = null;
 }
 async function focusGridCell(weekday: number, periodSeq: number) {
   const list = cellListAt(weekday, periodSeq);
@@ -1673,6 +1704,9 @@ const createVisible = ref(false);
 const saving = ref(false);
 const form = reactive({ courseId: '', teacherId: '', classroomId: '', clazzName: '', weekday: 1, periodNo: 1 });
 const createTitle = ref('新增课次');
+/** 新增课次弹窗里的「上课班级」下拉，@opened 时把焦点直接放到这个必填项 */
+const clazzSelRef = ref<{ focus?: () => void } | null>(null);
+let focusClazzOnOpen = false;
 const courseList = ref<{ value: string; label: string }[]>([]);
 /** 新增课次弹窗「删除课程」按钮上显示的课程名（按当前选中项反查） */
 const selectedCourseName = computed(
@@ -1811,6 +1845,15 @@ async function openCreate(
   createTitle.value =
     weekday && period ? `拖动排课 · 周${CN[weekday - 1]} ${period.label}` : '新增课次 · 手动选择时间';
   createVisible.value = true;
+  // 班级是唯一推不出来的必填项（课程接口不带班级）⇒ 弹窗开完把焦点放上去，省一次"找框"的点击。
+  // 焦点要等 @opened（EP 的开场动画结束）再设，nextTick 时输入框还没法接收焦点。
+  focusClazzOnOpen = !form.clazzName;
+}
+
+function onCreateOpened() {
+  if (!focusClazzOnOpen) return;
+  focusClazzOnOpen = false;
+  clazzSelRef.value?.focus?.();
 }
 
 async function submitCreate() {
@@ -2289,9 +2332,10 @@ watch(
   <div class="page-head">
     <h1>智能排课</h1>
     <div class="actions">
-      <el-dropdown @command="(m: 'week' | 'teacher' | 'classroom') => exportCsv(m)">
+      <!-- trigger 默认 hover：点一下不开菜单，键盘 / 触屏用户到不了导出 ⇒ 改点击触发 -->
+      <el-dropdown trigger="click" @command="(m: 'week' | 'teacher' | 'classroom') => exportCsv(m)">
         <button class="btn btn-outline" type="button">
-          <ZkIcon name="download" :size="16" style="margin-right: 4px" />导出课表<ZkIcon name="chevron-down" :size="13" style="margin-left: 2px" />
+          <ZkIcon name="download" :size="16" style="margin-right: 4px" />导出课表<i class="icaret" aria-hidden="true"></i>
         </button>
         <template #dropdown>
           <el-dropdown-menu>
@@ -2320,9 +2364,10 @@ watch(
           @update:model-value="onDatePick"
         />
       </div>
-      <!-- 学期：不带 clearable —— 有值时悬停会显示叉叉、箭头消失，与其他空筛选框观感不一；
-           且学期是主口径筛选，误清空会整页换数据，只留下拉箭头 -->
+      <!-- 学期：不带 clearable（有值时悬停显示叉叉会挤掉箭头、观感与其他框不一），但选项表头补一条
+           「全部学期」⇒ 选完仍有回去的路，不用刷新页面 -->
       <el-select v-model="filters.termId" class="f-select" placeholder="全部学期">
+        <el-option label="全部学期" value="" />
         <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="String(t.termId)" />
       </el-select>
       <!-- 学校：≥2 个学校才显示（单校筛选无意义），按课程的 school_id 过滤课表与待排池；
@@ -2358,6 +2403,16 @@ watch(
           <ZkIcon name="list-checks" :size="14" style="margin-right: 4px" />打开
         </button>
       </div>
+      <!-- 六个维度叠起来能叠到"课表一片空"，逐个清太累 ⇒ 有任一筛选时给一个总入口 -->
+      <button
+        v-if="anyFilter"
+        class="btn btn-outline btn-sm"
+        type="button"
+        title="清空学期/专业/课程/班级/教师/教室全部筛选，回到整周课表"
+        @click="clearFilters"
+      >
+        <ZkIcon name="refresh-cw" :size="13" style="margin-right: 4px" />清空筛选
+      </button>
       <!-- 冲突计数徽标（本地推导，口径与后端一致：同节次同教师 / 同教室） -->
       <span v-if="conflictCount" class="badge badge-error">
         <ZkIcon name="alert-triangle" :size="12" style="margin-right: 4px" />{{ conflictCount }} 处冲突待调整
@@ -2465,7 +2520,7 @@ watch(
               :disabled="!historyStack.length || busy"
               title="列出本次打开页面后的每一步调整；点某一步 = 连撤到这一步之前"
             >
-              本次调整记录（{{ historyStack.length }}）<ZkIcon name="chevron-down" :size="13" style="margin-left: 2px" />
+              本次调整记录（{{ historyStack.length }}）<i class="icaret" aria-hidden="true"></i>
             </button>
             <template #dropdown>
               <el-dropdown-menu>
@@ -2494,7 +2549,15 @@ watch(
           · {{ weekStats.conflicts }} 处冲突待调整
         </span>
       </template>
-      <span v-else class="muted">{{ loading ? '正在读取本周课次…' : loadError ? '读取失败，下面不是真实课表' : '本周暂无课次' }}</span>
+      <span v-else class="muted">{{
+        loading
+          ? '正在读取本周课次…'
+          : loadError
+            ? '读取失败，下面不是真实课表'
+            : allCells.length
+              ? `当前筛选下没有课次（本周实有 ${allCells.length} 节，清空筛选即可看到）`
+              : '本周暂无课次'
+      }}</span>
     </div>
     <!-- 失败态（2026-10-22 缺陷 2）：读取失败时明确说「读取失败」并给重试入口，不再与空表同形 -->
     <div v-if="loadError" class="move-hint is-error">
@@ -2610,12 +2673,12 @@ watch(
                     v-if="idx === 0 && c.list.length > 1"
                     class="stack-chip"
                   >
-                    <ZkIcon name="layers" :size="10" />共 {{ c.list.length }} 节
+                    <ZkIcon name="copy" :size="10" />共 {{ c.list.length }} 节
                   </span>
                 </div>
                 <!-- 悬停浮现的展开提示（纯 CSS hover 显隐，不占布局、不挡点击） -->
                 <span class="stack-hint">
-                  <ZkIcon name="chevron-down" :size="10" />同段共 {{ c.list.length }} 节 · 点击展开
+                  <i class="icaret icaret--sm" aria-hidden="true"></i>同段共 {{ c.list.length }} 节 · 点击展开
                 </span>
               </div>
             </div>
@@ -2626,7 +2689,7 @@ watch(
               type="button"
               @click.stop="toggleCellExpand(c.weekday, row.period.seq)"
             >
-              <ZkIcon name="chevron-up" :size="12" />收起（同段共 {{ c.list.length }} 节）
+              <i class="icaret icaret--up" aria-hidden="true"></i>收起（同段共 {{ c.list.length }} 节）
             </button>
             <!-- 空格子：点一下手动新增（键盘：方向键走到本格按回车，同一条路径） -->
             <div
@@ -2635,6 +2698,7 @@ watch(
               role="button"
               :tabindex="emptyTabindex(c.weekday, row.period.seq)"
               :aria-label="emptyCellAria(c.weekday, row.period.seq)"
+              @focus="onEmptyFocus(c.weekday, row.period.seq)"
               @keydown="onGridKey($event, c.weekday, row.period.seq, null)"
               @click="openCreate(c.weekday, row.period.seq)"
             >
@@ -2943,7 +3007,7 @@ watch(
   </el-dialog>
 
   <!-- 新增课次（C-17 真接口，带冲突检查） -->
-  <el-dialog v-model="createVisible" :title="createTitle" width="460px">
+  <el-dialog v-model="createVisible" :title="createTitle" width="460px" @opened="onCreateOpened">
     <el-form label-width="92px" label-position="right">
       <el-form-item label="课程" required>
         <el-select v-model="form.courseId" placeholder="请选择课程" filterable style="width: 100%">
@@ -2957,6 +3021,7 @@ watch(
       </el-form-item>
       <el-form-item label="上课班级" required>
         <el-select
+          ref="clazzSelRef"
           v-model="form.clazzName"
           placeholder="请选择班级"
           filterable
@@ -3240,6 +3305,9 @@ watch(
 .week-pager {
   display: grid;
   grid-template-columns: 1fr auto 1fr;
+  /* 1024px 一带三列刚好塞满（98+529+98 vs 容器 727）⇒ 左右按钮与中列贴死（实测间距 0）
+     留 12px 列间距，窄到放不下时由下面的断点让中列换行 */
+  column-gap: 12px;
   align-items: center;
   margin-bottom: 16px;
   padding: 0 4px;
@@ -3256,15 +3324,16 @@ watch(
   align-items: center;
   gap: 10px;
 }
-/* 两个框统一尺寸：同高 36px、同内边距，观感成一对 */
+/* 两个框统一尺寸：同高 38px、同内边距，与全站 .btn（38px）一个口径
+   （原先定 36px 是为了和日期标签配对，结果同页并存 31/36/38 三档按钮高度） */
 .week-center .sched-week {
   display: inline-flex;
   align-items: center;
-  height: 36px;
+  height: 38px;
   padding: 0 14px;
 }
 .week-center .btn {
-  height: 36px;
+  height: 38px;
   padding: 0 14px;
 }
 /* 撤回组：两个控件当一个整体，与「第 N 周」标签贴右排；组内间距沿用中列的 10px 口径 */
@@ -3276,6 +3345,28 @@ watch(
 .undo-group > .btn,
 .undo-group :deep(.el-dropdown) > .btn {
   white-space: nowrap;
+}
+/* 下拉 / 收起指示角：ZkIcon 白名单里没有 chevron-down、chevron-up（未登记的名字只画一个淡灰方块，
+   页面上就是一个空灰格子）。图标表在 components/* 属禁改路径 ⇒ 页内用纯 CSS 三角补上 */
+.icaret {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  margin-left: 6px;
+  vertical-align: middle;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+}
+.icaret--up {
+  border-top: 0;
+  border-bottom: 5px solid currentColor;
+}
+.icaret--sm {
+  margin-left: 0;
+  border-left-width: 3px;
+  border-right-width: 3px;
+  border-top-width: 4px;
 }
 /* 周日期范围：翻周条中间的块状标签。
    ★ 中性深灰描边样式，刻意与课程签（品牌绿底）区分——两者都是"块状"，同色系会混淆 */
@@ -3325,11 +3416,15 @@ watch(
 .room-filter {
   display: inline-flex;
   flex: 1.5 1 0;
-  min-width: 172px;
+  /* 组内下拉要 100px + 「打开」按钮 ~84px + 边框 ⇒ 整组至少 196px，
+     否则 1280/900 一带整组会被挤到溢出（实测 sw 187 > cw 176） */
+  min-width: 196px;
 }
 .room-filter .f-select {
   flex: 1 1 auto;
-  min-width: 0;
+  /* 曾设 min-width:0 ⇒ 组内下拉能被压到 49px，「全部教室」四个字直接被裁（1280px 实测 sw 56 > cw 49）
+     给到能放下占位文 + 箭头的宽度 */
+  min-width: 100px;
 }
 .room-filter .f-select :deep(.el-select__wrapper) {
   border-top-right-radius: 0;
@@ -4139,6 +4234,27 @@ watch(
  * 现状：全页零条 @media，6 列固定布局在 900px 以下把卡片压成一列文字、按钮溢出卡片。
  * 课表列宽不能靠换行解决（节次行头 96px + 5 天），所以这里给课表一条横向滚动，
  * 其余条状区域改为换行。宽视口下这些规则不命中，渲染结果与改动前逐像素相同。 */
+/* 1024~1180：翻周条中列放不下（撤回组 + 日期标签 + 周次徽标），让它换行而不是把左右按钮挤到相贴 */
+@media (max-width: 1180px) {
+  .week-center {
+    flex-wrap: wrap;
+    justify-content: center;
+    row-gap: 8px;
+  }
+}
+/* ≤480：页头标题与右侧按钮组叠成两行（这一档下 layout/.shell 的固定侧栏本身就会顶出视口，
+   见 20261023 全功能实测报告第五节，页内先把"自己贡献的那一段"收住） */
+@media (max-width: 480px) {
+  .page-head {
+    flex-direction: column;
+    align-items: flex-start;
+    row-gap: 10px;
+  }
+  .page-head .actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
 @media (max-width: 900px) {
   .card-pad {
     overflow-x: auto;
