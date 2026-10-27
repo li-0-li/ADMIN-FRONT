@@ -1,11 +1,17 @@
-import { request, requestBlob } from '@/api/request';
+import { rawRequest, request, requestBlob } from '@/api/request';
 import type { ImportResultVo } from '@/types/admin';
 import type { AdminUserVo, FootprintVo, PageResult, UserCreateVo, UserQuery, UserSaveBo } from '@/types/admin';
 
 const BASE = '/api/v1/admin/users';
 
-/** 列表：分页参数是 page / pageSize（不是 pageNum） */
-export function listUsers(query: UserQuery) {
+/**
+ * 列表：分页参数是 page / pageSize（不是 pageNum）。
+ * 排序键 sortField + sortOrder（值 asc/desc）已由后端 10-26 追认（编号 12 结案）：
+ * 白名单 username/nickName/deptName/status/createTime/loginDate（AdminAccountServiceImpl.java:94-97），
+ * 名单外的字段 WARN 后回落默认序；sortOrder 只对 'desc' 生效，其余一律 asc；先全局排序再分页。
+ * 这里用交叉类型放开这两个键，不动全局 src/types/admin.ts（那是综合线的文件）。
+ */
+export function listUsers(query: UserQuery & { sortField?: string; sortOrder?: 'asc' | 'desc' }) {
   return request<PageResult<AdminUserVo>>({
     url: BASE,
     method: 'get',
@@ -23,17 +29,19 @@ export function updateUser(body: UserSaveBo) {
   return request<boolean>({ url: BASE, method: 'put', data: body });
 }
 
-export function deleteUser(userId: number) {
+/** 以下四个接口的 userId 是 19 位雪花主键：后端 10-26 起按字符串下发，形参跟契约走 `string`（编号 26）。
+ *  走 URL 模板拼接，字符串原样进 path，不会再被 Number 精度截断。 */
+export function deleteUser(userId: string) {
   return request<boolean>({ url: `${BASE}/${userId}`, method: 'delete' });
 }
 
 /** 启停：★ status 走 query，不是 body */
-export function updateUserStatus(userId: number, status: string) {
+export function updateUserStatus(userId: string, status: string) {
   return request<boolean>({ url: `${BASE}/${userId}/status`, method: 'put', params: { status } });
 }
 
 /** 重置密码：返回一次性临时口令 */
-export function resetUserPassword(userId: number) {
+export function resetUserPassword(userId: string) {
   return request<UserCreateVo>({ url: `${BASE}/${userId}/password/reset`, method: 'post' });
 }
 
@@ -58,6 +66,31 @@ export function importUsers(file: File, updateSupport: boolean) {
 }
 
 /** F-1 账号足迹（登录记录 + 操作记录，复用若依自带日志表） */
-export function getUserFootprint(userId: number) {
+export function getUserFootprint(userId: string) {
   return request<FootprintVo>({ url: `${BASE}/${userId}/footprint`, method: 'get' });
+}
+
+/** 若依原生院系节点（只列账号页要用的三个键；后端原生 VO 字段更多，用不到的不去声明） */
+export interface DeptNodeVo {
+  /** ★ 这个端点是若依原生控制器，deptId 没加 @JsonFormat ⇒ 实测仍是裸数字（现库 100~203，未触精度）。
+      类型留成 number | string 并一律 String() 归一，是为了后端日后补注解时不用再改这里。 */
+  deptId: number | string;
+  deptName: string;
+  parentId?: number | string;
+  /** 祖先链，形如 "0" / "0,200" / "0,100,101" ⇒ 截子树靠它，不靠递归找 children */
+  ancestors?: string;
+  status?: string;
+  delFlag?: string;
+}
+
+/**
+ * 编号 23 · 院系候选改走全量：若依原生 GET /system/dept/list（后端路线②）。
+ * 走 rawRequest 而不是 request：原生信封是 {code:200,msg,data:[...]}，data 直接是数组、没有分页壳，
+ * 且这里的 code=200 是成功语义，不能按 admin 模块的 code=0 判。
+ * 非 200（如未授权 403）返回 ok:false 让调用方显示缺口提示，不静默给一个空下拉。
+ */
+export async function listDeptTree(): Promise<{ ok: boolean; code?: number; list: DeptNodeVo[] }> {
+  const body = await rawRequest<DeptNodeVo[]>({ url: '/system/dept/list', method: 'get' });
+  const ok = body.code === undefined || body.code === 200;
+  return { ok, code: body.code, list: ok && Array.isArray(body.data) ? body.data : [] };
 }

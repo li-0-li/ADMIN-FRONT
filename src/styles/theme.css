@@ -22,6 +22,9 @@
   --warning:#d97706; --warning-soft:#fef3c7;
   --error:#dc2626;   --error-soft:#fee2e2;
   --info:#0ea5a0;    --info-soft:var(--brand-100);
+  /* 文字专用深阶：--success/--warning/--error 作正文色时对比度 2.86~4.34，达不到 WCAG AA 的 4.5:1；
+     底纹/圆点/图表仍用上面那组，避免整站语义色一起变深 */
+  --success-strong:#15803d; --warning-strong:#b45309; --error-strong:#b91c1c;
 
   /* 圆角 */
   --r-sm:4px; --r-md:8px; --r-lg:12px; --r-xl:16px; --r-full:9999px;
@@ -77,11 +80,11 @@ h1,h2,h3,h4{margin:0; font-weight:700; color:var(--ink-900)}
   display:inline-flex; align-items:center; gap:4px; padding:2px 9px;
   border-radius:var(--r-full); font-size:12px; font-weight:600; line-height:1.6;
 }
-.badge-success{background:var(--success-soft); color:var(--success)}
-.badge-warning{background:var(--warning-soft); color:var(--warning)}
-.badge-error{background:var(--error-soft); color:var(--error)}
+.badge-success{background:var(--success-soft); color:var(--success-strong)}
+.badge-warning{background:var(--warning-soft); color:var(--warning-strong)}
+.badge-error{background:var(--error-soft); color:var(--error-strong)}
 .badge-info{background:var(--info-soft); color:var(--brand-700)}
-.badge-neutral{background:var(--bg-soft); color:var(--ink-500)}
+.badge-neutral{background:var(--bg-soft); color:var(--ink-700)}
 .badge-brand{background:var(--brand-50); color:var(--brand-700); border:1px solid var(--brand-200)}
 
 .icon-box{
@@ -155,6 +158,8 @@ h1,h2,h3,h4{margin:0; font-weight:700; color:var(--ink-900)}
 .menu-item{
   display:flex; align-items:center; gap:10px; padding:9px 12px;
   border-radius:var(--r-md); color:var(--ink-600); font-weight:500; font-size:14px; cursor:pointer;
+  /* 「退出登录」已从 href=javascript:void(0) 改成 <button>，这里补齐 UA 默认值差异（编号 44） */
+  border:0; background:transparent; font-family:inherit; text-align:left; width:100%;
 }
 .menu-item svg{width:18px;height:18px; flex:none}
 .menu-item:hover{background:var(--bg-soft); color:var(--ink-900)}
@@ -178,7 +183,7 @@ h1,h2,h3,h4{margin:0; font-weight:700; color:var(--ink-900)}
 .stat .label{font-size:13px;color:var(--ink-500)}
 .stat .num{font-size:28px;font-weight:800;color:var(--ink-900);margin-top:6px}
 .stat .trend{font-size:12px;margin-top:6px}
-.stat .up{color:var(--success)} .stat .down{color:var(--error)}
+.stat .up{color:var(--success-strong)} .stat .down{color:var(--error-strong)}
 
 /* course card (我学的课) */
 .course-card{padding:18px; display:flex; flex-direction:column; gap:12px}
@@ -209,8 +214,8 @@ h1,h2,h3,h4{margin:0; font-weight:700; color:var(--ink-900)}
 
 /* tabs (pill) */
 .pilltabs{display:inline-flex;background:var(--bg-soft);border-radius:var(--r-full);padding:3px;gap:2px}
-.pilltabs .pill{padding:6px 16px;border-radius:var(--r-full);font-size:13px;font-weight:600;color:var(--ink-500);cursor:pointer}
-.pilltabs .pill.active{background:var(--brand-600);color:#fff}
+.pilltabs .pill{padding:6px 16px;border-radius:var(--r-full);font-size:13px;font-weight:600;color:var(--ink-700);cursor:pointer}
+.pilltabs .pill.active{background:var(--brand-700);color:#fff}
 
 /* toolbar */
 .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border:1px solid var(--border);border-radius:var(--r-lg);background:#fff;margin-bottom:16px}

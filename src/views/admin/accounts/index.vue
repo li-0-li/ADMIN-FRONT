@@ -11,11 +11,13 @@ import {
   exportUsers,
   getUserFootprint,
   importUsers,
+  listDeptTree,
   listUsers,
   resetUserPassword,
   updateUser,
   updateUserStatus
 } from '@/api/admin/users';
+import type { DeptNodeVo } from '@/api/admin/users';
 import type { AdminUserVo, FootprintVo, ImportResultVo, UserSaveBo } from '@/types/admin';
 import { useUserStore } from '@/store/user';
 
@@ -34,7 +36,9 @@ const ROLE_BADGE: Record<string, string> = {
   student: 'badge-success',
   common: 'badge-neutral'
 };
-/** 角色下拉选项（口径取自演示库实际存在的 roleKey；common 来自角色页成员反查入口） */
+/** 筛选器用的角色词典（口径取自演示库实际存在的 roleKey）。
+ *  ★ common（普通用户）留在筛选器与徽标映射里，存量 common 账号要能筛出来、要显示得对；
+ *    但它已从「新增/编辑表单」的候选里下架，见 roleOptionsForForm（编号 24）。 */
 const ROLE_OPTIONS = [
   { value: '', label: '全部角色' },
   { value: 'admin', label: '管理员' },
@@ -54,35 +58,43 @@ const STATUS_OPTIONS = [
 const loading = ref(false);
 const rows = ref<AdminUserVo[]>([]);
 const total = ref(0);
-const query = reactive({ page: 1, pageSize: 20, keyword: '', roleKey: '', status: '', deptId: undefined as number | undefined });
+const query = reactive({ page: 1, pageSize: 20, keyword: '', roleKey: '', status: '', deptId: undefined as string | undefined, sortField: 'createTime', sortOrder: 'desc' as 'asc' | 'desc' });
 
-/* ---------------- 院系候选（A6）----------------
- * 后端 UserQueryBo 支持 deptId（实跑 ?deptId=201 生效），但管理端**没有院系 CRUD 端点**
- * （admin 模块 dept 端点实测 0 命中，属后端未决账）⇒ 候选只能从现有账号已登记的院系里去重拿。
- * 开页时一次性拉快照做去重，避免候选跟着当前筛选页缩来缩去；代价是「还没有人归属」的新院系不会出现在下拉里。
+/* ---------------- 院系候选（A6 / 编号 23）----------------
+ * 10-26 起换成全量：后端选路线②（给 role 100 授 `system:dept:list`），前端接若依原生 GET /system/dept/list。
+ * 旧实现是「拉前 200 条账号去重当候选」，账号总数一涨就有院系静默缺项，连同触顶提示一起删掉。
  *
- * ★ 已知边界（1022-P2-1，必须写出来）：快照只装得下前 DEPT_SNAPSHOT_SIZE 条账号。
- *   账号总数一旦超过它，没进快照的院系会**静默缺项** —— 使用方会以为「院系就只有下拉里这几个」。
- *   所以触顶时在下拉底部明说统计范围，而不是等人数涨到 200 才发现这是隐形缺陷。
+ * ★ 候选范围取「学校根的子树」，不是整棵 sys_dept。后端 10-26 说明按 schoolId 过滤做不了
+ *   （school 表无 dept_id、sys_dept 无 school_id、zhike_dev 无 DDL 权限），可落地的口径只有按根截 ancestors；
+ *   基础数据页（乙线）按同一口径，两页候选集才一致。
+ *   根不写死：拿 DEFAULT_DEPT_ID 在平铺返回里查自己的 ancestors —— "0" 即本身是根，
+ *   "0,200" 这类取第一个非 0 节点，日后 200 挂到更上层时这里不用改。
  */
-const DEPT_SNAPSHOT_SIZE = 200;
-const deptOptions = ref<{ id: number; name: string }[]>([]);
-const deptSnapshotTotal = ref(0);
-const deptSnapshotTruncated = computed(() => deptSnapshotTotal.value > DEPT_SNAPSHOT_SIZE);
+const deptOptions = ref<{ id: string; name: string }[]>([]);
+/** 接口不通、或按子树筛完为空，都在浮层底部说明；「下拉是空的」不能只让人自己猜 */
+const deptLoadFailed = ref(false);
+
+/** 取某节点所在学校的根 id（一律 String() 归一：原生端点的 deptId 实测还是裸数字，日后加了注解也不用改这里） */
+function schoolRootId(list: DeptNodeVo[], selfId: string): string {
+  const self = list.find(d => String(d.deptId) === selfId);
+  const chain = (self?.ancestors ?? '').split(',').map(s => s.trim()).filter(s => s && s !== '0');
+  return chain.length ? chain[0] : selfId;
+}
+
 async function loadDeptOptions() {
   try {
-    const res = await listUsers({ page: 1, pageSize: DEPT_SNAPSHOT_SIZE });
-    const map = new Map<number, string>();
-    (res?.list ?? []).forEach((r) => {
-      if (typeof r.deptId === 'number' && r.deptName) map.set(r.deptId, r.deptName);
-    });
-    deptOptions.value = [...map.entries()]
-      .map(([id, name]) => ({ id, name }))
+    const res = await listDeptTree();
+    const root = schoolRootId(res.list, DEFAULT_DEPT_ID);
+    const inSchool = res.list.filter(
+      d => String(d.deptId) === root || (d.ancestors ?? '').split(',').map(s => s.trim()).includes(root)
+    );
+    deptOptions.value = inSchool
+      .map(d => ({ id: String(d.deptId), name: d.deptName }))
       .sort((a, b) => a.name.localeCompare(b.name, 'zh'));
-    // 用「快照那一次请求返回的 total」判触顶，不用列表页的 total：后者会随筛选变小，判据不可靠
-    deptSnapshotTotal.value = res?.total ?? 0;
+    deptLoadFailed.value = !res.ok || deptOptions.value.length === 0;
   } catch {
-    /* 候选拉不到不影响列表本身，下拉留空即可（request.ts 已提示） */
+    /* 候选拉不到不影响列表本身（request.ts 已提示），置失败态让浮层说清原因 */
+    deptLoadFailed.value = true;
   }
 }
 
@@ -96,8 +108,9 @@ async function fetchList(keepSelection = false) {
   loading.value = true;
   try {
     const res = await listUsers(query);
-    // ★ 本地排序：最新创建的排最上面（createTime 为 'yyyy-MM-dd HH:mm:ss'，字符串比较即时间序）
-    rows.value = [...(res?.list ?? [])].sort((a, b) => String(b.createTime ?? '').localeCompare(String(a.createTime ?? '')));
+    // 排序已交服务端（sortField/sortOrder 随 query 发出）⇒ 这里不再页内排序，页内排序只能整当前页，
+    // 跨页会各页自己重排一遍，正是 10-22 那句「跨页仍按后端默认序」承认过的缺陷。
+    rows.value = res?.list ?? [];
     total.value = res?.total ?? 0;
   } finally {
     loading.value = false;
@@ -136,6 +149,29 @@ function resetQuery() {
   query.roleKey = '';
   query.status = '';
   query.deptId = undefined;
+  query.page = 1;
+  query.sortField = 'createTime';
+  query.sortOrder = 'desc';
+  // 表头箭头要跟数据一致：clearSort 会派发一次 sort-change（order=null），
+  // 下面 onSortChange 的「已是默认态就直接返回」那条拦住它，避免多打一次接口。
+  tableRef.value?.clearSort();
+  fetchList();
+}
+
+/**
+ * 可排序列的实测口径（10-26 10:38 在现役 8080 包上逐列取样）：
+ * 参数名 sortField + sortOrder（值 asc/desc）；`asc`/`order`/`isAsc`/`desc` 这些写法全部无效（实测两向同序）。
+ * 非白名单列不报错，而是落回默认列 —— 所以这里只开放实测确认过的四列，别猜。
+ * 契约名仍待后端追认（合并总表编号 12）。
+ */
+const SORTABLE_FIELDS: Record<string, string> = { username: 'username', status: 'status', createTime: 'createTime', loginDate: 'loginDate' };
+
+function onSortChange(prop: string, order: string | null) {
+  const nextField = order && SORTABLE_FIELDS[prop] ? SORTABLE_FIELDS[prop] : 'createTime';
+  const nextOrder = order === 'ascending' ? 'asc' : order === 'descending' ? 'desc' : 'desc';
+  if (query.sortField === nextField && query.sortOrder === nextOrder) return;
+  query.sortField = nextField;
+  query.sortOrder = nextOrder;
   query.page = 1;
   fetchList();
 }
@@ -239,8 +275,11 @@ function primaryRoleKey(row: AdminUserVo) {
 /* ---------------- 超级管理员保护 ----------------
  * 若依口径：userId=1 为超管，后端停用/删除均拒绝（checkUserAllowed）。
  * 前端按用户拍板锁死其行操作，防止误操作产生「显示学生徽标的超管」这类误导展示。
+ * ★ 编号 26：后端 10-26 起把 userId 下发成 19 位字符串（`@JsonFormat(shape=STRING)`），判定跟契约一起改字符串。
+ *   留着 `=== 1` 的后果不是编译不过，而是恒为假 ⇒ 超管行不再被锁，删除/停用照发、后端照拒、前端照提示成功。
  */
-const isAdminUser = (row: AdminUserVo) => row.userId === 1;
+const SUPER_ADMIN_ID = '1';
+const isAdminUser = (row: AdminUserVo) => row.userId === SUPER_ADMIN_ID;
 const ADMIN_LOCK_TIP = '超级管理员受保护，不可操作（改密请用右上角「修改密码」）';
 
 /* ---------------- 管理权收敛（用户拍板 10-19）----------------
@@ -256,35 +295,45 @@ const ADMIN_EDIT_TIP = '只有超级管理员可以添加或编辑管理员账�
 const ADMIN_RESET_TIP = '只有超级管理员可以重置管理员密码（改自己的密码请用右上角「修改密码」）';
 /** 行操作锁：超管保护 或 非超管管理其他管理员 */
 function opLockTip(row: AdminUserVo): string | null {
-  if (row.userId === 1) return ADMIN_LOCK_TIP;
+  if (row.userId === SUPER_ADMIN_ID) return ADMIN_LOCK_TIP;
   if (!isSuperAdmin.value && isAdminRow(row) && row.username !== userStore.username) return ADMIN_EDIT_TIP;
   return null;
 }
 /** 重置密码专用锁（用户拍板 10-19 16:00）：非超管对管理员角色的行一律不可重置，含自己的行（自己改密走右上角「修改密码」） */
 function resetLockTip(row: AdminUserVo): string | null {
-  if (row.userId === 1) return ADMIN_LOCK_TIP;
+  if (row.userId === SUPER_ADMIN_ID) return ADMIN_LOCK_TIP;
   if (!isSuperAdmin.value && isAdminRow(row)) return ADMIN_RESET_TIP;
   return null;
 }
-/** 编辑/新增时表单里可用的角色选项：非超管不给「管理员」，但编辑管理员本人时保留原值可显示 */
+/** 编辑/新增时表单里可用的角色选项（编号 24）：
+ *  · 非超管不给「管理员」；
+ *  · `common`（普通用户）已从表单候选下架 —— 后端 IMPORT_ALLOWED_ROLES 只认 teacher/student/admin
+ *    （AdminAccountServiceImpl.java:87），批量导入填 common 会该行失败，手工新建却给一个导入侧填不了的取值，
+ *    两边口径不一致；筛选器与徽标映射仍保留 common，存量 common 账号照样能筛出来、照样显示。
+ *  · 编辑态把该行原角色补回候选（formRoleOriginal）：否则下架后打开一个 common 账号，
+ *    下拉显示为空、一保存就把人家角色改了。 */
 const formRoleOriginal = ref('');
 const roleOptionsForForm = computed(() => {
-  const all = ROLE_OPTIONS.filter(x => x.value);
-  if (isSuperAdmin.value || form.role === 'admin') return all;
-  return all.filter(x => x.value !== 'admin');
+  const all = ROLE_OPTIONS.filter(x => x.value && x.value !== 'common');
+  const list = isSuperAdmin.value ? all : all.filter(x => x.value !== 'admin');
+  const orig = formRoleOriginal.value;
+  if (!orig || list.some(x => x.value === orig)) return list;
+  return [...list, { value: orig, label: ROLE_LABEL[orig] ?? orig }];
 });
 
 /* ---------------- 新增 / 编辑 ---------------- */
 const formVisible = ref(false);
 const formMode = ref<'create' | 'edit'>('create');
 const saving = ref(false);
-/** 新增账号落在的默认院系（演示库 200=示例大学；编辑态一律沿用行原值） */
-const DEFAULT_DEPT_ID = 200;
+/** 新增账号落在的默认院系（演示库 200=示例大学；编辑态一律沿用行原值）。
+ *  字符串字面量：契约里 UserSaveBo.deptId 是 string，且这个值同时是「学校根」的查找入口（见 schoolRootId）。
+ *  ★ 只在唯一赋值点用常量本身，不在八个赋值点各写一次 String()。 */
+const DEFAULT_DEPT_ID = '200';
 /** 表单模型（含单选角色，提交时包成后端要求的 roleKeys 数组） */
-const form = reactive<{ username: string; nickName: string; email: string; phone: string; userNo: string; remark: string; role: string; userId?: number; deptId?: number | null }>({ username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: '', userId: undefined, deptId: undefined });
+const form = reactive<{ username: string; nickName: string; email: string; phone: string; userNo: string; remark: string; role: string; userId?: string; deptId?: string | null }>({ username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: '', userId: undefined, deptId: undefined });
 const formRef = ref<FormInstance>();
 /** 编辑超管时锁死角色下拉（双保险：行按钮已禁用，弹窗内再兜一层） */
-const editingAdmin = computed(() => formMode.value === 'edit' && form.userId === 1);
+const editingAdmin = computed(() => formMode.value === 'edit' && form.userId === SUPER_ADMIN_ID);
 
 /* 表单校验（用户拍板 10-19）：必填=登录账号/用户名/角色/工号学号；选填但格式校验=邮箱/手机号。
    错误以内联红字显示在输入框下方。 */
@@ -316,7 +365,7 @@ function openEdit(row: AdminUserVo) {
     email: row.email ?? '',
     phone: row.phone ?? '',
     userNo: row.userNo ?? '',
-    remark: '',
+    remark: row.remark ?? '',
     // ★ 沿用该行原院系；null（未入院系）也要如实带着，提交时省略该键即可保持原值
     deptId: row.deptId ?? null,
     role: (row.roleKeys ?? [])[0] ?? 'common'
@@ -344,7 +393,7 @@ async function submitForm() {
   try {
     // 后端 BO 收 roleKeys 数组（若依 sys_user_role 关联表），单选包一层。
     // ★ 逐键显式列写（不用 {...form} 摊开）：form 里带 deptId: null 与前端专用的 role，
-    //   摊开会污染契约类型；且「省略某个键」正是下面两条保原值的手法，必须能精确控制发什么。
+    //   摊开会污染契约类型；且「省略某个键」正是下面院系那条保原值的手法，必须能精确控制发什么。
     const payload: UserSaveBo = {
       userId: form.userId,
       username: form.username,
@@ -373,9 +422,8 @@ async function submitForm() {
       //  而旧代码一律发 200，会把「计算机学院(201)」等账号静默挪进「示例大学(200)」）
       if (form.deptId != null) payload.deptId = form.deptId;
       else delete payload.deptId;
-      // A2 保备注：AdminUserVo 不含 remark（列表接口实测 17 个字段无它），前端无从回填，
-      // 留空即「不改」⇒ 省略该键（后端 SysUserMapper.xml:194 `<if test="remark != null">` 不发键才跳过；发空串会真清掉）
-      if (!payload.remark) delete payload.remark;
+      // A2 备注：编辑态已回填原值（列表接口现在带 remark），故此键始终如实发出 ——
+      // 留空发空串即真清空（后端 SysUserMapper.xml:194 `<if test="remark != null">` 对空串成立，只有不发键才跳过该列）
       // 编辑时带原 userId（★ PUT /users 没有 path 段，userId 在 body 里）
       await updateUser(payload);
       ElMessage.success('保存成功');
@@ -753,15 +801,14 @@ async function openFootprint(row: AdminUserVo) {
           <el-select v-model="query.status" filterable clearable style="width: 110px" placeholder="全部状态" @change="onSearch">
             <el-option v-for="o in STATUS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
           </el-select>
-          <!-- 院系候选来自「现有账号已登记的院系」去重快照：后端无院系 CRUD 端点，拿不到全量院系树 -->
+          <!-- 院系候选 = 若依原生 /system/dept/list 里「学校根子树」的全量节点（编号 23，10-26 换掉原来的账号去重快照）。
+               范围与基础数据页同一口径；筛出 0 条是「该院系下确实没有账号」，不是候选缺项。 -->
           <el-select v-model="query.deptId" filterable clearable style="width: 160px" placeholder="全部院系" @change="onSearch">
             <el-option v-for="o in deptOptions" :key="o.id" :label="o.name" :value="o.id" />
-            <!-- ★ 1022-P2-1：快照只取前 200 条账号，账号总数超过它时未进快照的院系会缺项。
-                 不写这行，缺项表现为「下拉里就是所有院系」——用户无从分辨。只在触顶时出现，日常不打扰。 -->
-            <template v-if="deptSnapshotTruncated" #footer>
+            <!-- 只在取不到候选时出现：静默空下拉会被读成「库里没院系」，这是 1022-P2-1 同类的隐形缺陷，必须说清 -->
+            <template v-if="deptLoadFailed" #footer>
               <div class="small muted dept-foot-tip">
-                候选只统计了前 {{ DEPT_SNAPSHOT_SIZE }} 条账号（快照时共 {{ deptSnapshotTotal }} 条），院系可能有缺；
-                要找的院系不在列表里时，直接键入名称过滤，或改用关键词搜索定位。
+                院系候选取不到（可能未授权 system:dept:list，或该学校根下没有院系节点）；可改用关键词搜索定位账号。
               </div>
             </template>
           </el-select>
@@ -772,14 +819,14 @@ async function openFootprint(row: AdminUserVo) {
   </div>
 
   <div class="card">
-    <el-table ref="tableRef" v-loading="loading" row-key="userId" :data="rows" style="width: 100%" @selection-change="onSelectionChange">
+    <el-table ref="tableRef" v-loading="loading" row-key="userId" :data="rows" style="width: 100%" :default-sort="{ prop: 'createTime', order: 'descending' }" @selection-change="onSelectionChange" @sort-change="(s: { prop: string; order: string | null }) => onSortChange(s.prop, s.order)">
       <el-table-column type="selection" width="42" reserve-selection />
       <!-- 列宽全部按真页面实测取（10-23 同源 iframe 造 1366 视口，量各列内容宽 + 单元格左右内边距 24px）：
            序号表头「序号」需 64、用户名行内内容需 240、角色「普通用户」需 90、状态徽标「启用」需 66、
            两个时间列「2026-10-23 10:19:31」各需 154 ⇒ 依次给 64 / 240 / 100 / 84 / 164，每列留 10~18px 余量。
            八列合计 42+64+240+100+84+164+164+196 = 1054 ≤ 1366 视口可用的 1069 ⇒ 不再需要横向滚动（收纳前是 1276，差 207）。 -->
       <el-table-column type="index" label="序号" width="64" align="center" :index="rowIndex" />
-      <el-table-column label="用户名" min-width="240">
+      <el-table-column label="用户名" min-width="240" prop="username" sortable="custom">
         <template #default="{ row }">
           <div class="row" style="gap: 8px">
             <span class="avatar sm">{{ (row.nickName || row.username || '?').slice(0, 1) }}</span>
@@ -790,20 +837,21 @@ async function openFootprint(row: AdminUserVo) {
           </div>
         </template>
       </el-table-column>
+      <!-- 角色列不给排序：后端按 roleKeys 排会落回默认列（10-26 实测），给了箭头就是假可排序 -->
       <el-table-column label="角色" min-width="100">
         <template #default="{ row }">
           <span class="badge" :class="ROLE_BADGE[primaryRoleKey(row)]">{{ rolesText(row) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="状态" width="84">
+      <el-table-column label="状态" width="84" prop="status" sortable="custom">
         <template #default="{ row }">
           <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="创建时间" width="164" prop="createTime">
+      <el-table-column label="创建时间" width="164" prop="createTime" sortable="custom">
         <template #default="{ row }">{{ row.createTime || '—' }}</template>
       </el-table-column>
-      <el-table-column label="最近登录" width="164" prop="loginDate">
+      <el-table-column label="最近登录" width="164" prop="loginDate" sortable="custom">
         <template #default="{ row }">{{ row.loginDate || '—' }}</template>
       </el-table-column>
       <el-table-column label="操作" width="196" align="right" class-name="op-col" fixed="right">
@@ -838,9 +886,7 @@ async function openFootprint(row: AdminUserVo) {
     <div class="between page-foot" style="padding: 12px 16px">
       <span class="small muted">
         共 {{ total }} 条记录
-        <!-- ★ 排序只在当前页内生效：后端 listUsers 固定 order by u.user_id，翻页后各页之间仍是按 userId 排。
-             真正的「全站按创建时间倒序」要后端加排序参数（已作为 B2 报后端线），前端不假装它是全局排序。 -->
-        <span class="muted small">（「创建时间」为当前页内倒序，跨页仍按后端默认序）</span>
+        <span class="muted small">（点表头排序走服务端，整表重排、跨页连续）</span>
       </span>
       <div class="mini-pager">
         <button
@@ -918,9 +964,8 @@ async function openFootprint(row: AdminUserVo) {
       </el-form-item>
       <el-form-item label="备注" prop="remark">
         <el-input v-model="form.remark" type="textarea" :rows="2" />
-        <!-- 列表接口返回的 AdminUserVo 不含 remark（B1 已报后端），编辑态回填不了原备注，
-             所以必须把「留空 = 不改」这件事写在明面上，否则使用者以为留空就是清空。 -->
-        <span v-if="!form.remark" class="fc-ph ta">{{ formMode === 'create' ? '选填' : '留空表示不修改原备注' }}</span>
+        <!-- 编辑态会把原备注回填进来，所以「留空」在两种来源下语义不同，提示分开写 -->
+        <span v-if="!form.remark" class="fc-ph ta">{{ formMode === 'create' ? '选填' : '留空并保存会清掉该账号的原备注' }}</span>
       </el-form-item>
     </el-form>
     <template #footer>
@@ -968,9 +1013,11 @@ async function openFootprint(row: AdminUserVo) {
     <div class="stack" style="gap: 12px">
       <div class="small muted" style="line-height: 1.7">
         1. 先<a href="javascript:void(0)" style="color: var(--brand-600)" @click="onDownloadTemplate">下载导入模板</a>，
-        按列头填好（登录账号、角色标识必填，角色取值 teacher / student / admin）；<br />
-        2. 新导入的账号一律发默认密码 <b>zk123456</b>，首次登录强制改密，与手工新建口径一致；<br />
-        3. 单次最多 500 行；导入 admin（管理员）角色行需要超级管理员身份。
+        按列头填好（<b>登录账号</b>、<b>角色标识</b>必填；角色标识只能填 <code>teacher</code> / <code>student</code> / <code>admin</code>，
+        与后端白名单逐字一致，填别的值只有该行失败、其余行照常导入）；<br />
+        2. 模板里的「状态」「最近登录」「创建时间」三列是导出留档用的，导入时忽略，填了不生效；<br />
+        3. 新导入的账号一律发默认密码 <b>zk123456</b>，首次登录强制改密，与手工新建口径一致；<br />
+        4. 单次最多 500 行；导入 admin（管理员）角色行需要超级管理员身份。
       </div>
       <label class="imp-file" :class="{ active: importFile }">
         <input type="file" accept=".xlsx,.xls" @change="onFilePick" />

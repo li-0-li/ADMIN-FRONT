@@ -9,15 +9,16 @@ export interface PageResult<T> {
 
 /** AdminUserVo */
 export interface AdminUserVo {
-  userId: number;
+  /** 19 位雪花主键：后端 10-26 起按字符串下发（`@JsonFormat(shape = STRING)`），按数字比较会打在不存在的行上 */
+  userId: string;
   username: string;
   nickName: string;
   email: string;
   phone: string;
   status: string;
-  deptId: number;
+  deptId: string;
   deptName: string;
-  schoolId: number;
+  schoolId: string;
   schoolName: string;
   userNo: string;
   bizStatus: string;
@@ -25,7 +26,10 @@ export interface AdminUserVo {
   createTime: string;
   /** 最近登录时间（sys_user.login_date），从未登录为 null */
   loginDate?: string | null;
+  /** 备注（sys_user.remark），未填为 null */
+  remark?: string | null;
   roleKeys: string[];
+  /** 角色 ID 是基线里的手工小整数（1 超管 / 100 平台管理员），后端显式登记为不发字符串，故保持数字 */
   roleIds: number[];
 }
 
@@ -36,18 +40,18 @@ export interface UserQuery {
   keyword?: string;
   roleKey?: string;
   status?: string;
-  deptId?: number;
+  deptId?: string;
 }
 
 /** UserSaveBo —— 注意：PUT /users 没有 path，userId 在 body 里 */
 export interface UserSaveBo {
-  userId?: number;
+  userId?: string;
   username?: string;
   nickName?: string;
   email?: string;
   phone?: string;
   roleKeys?: string[];
-  deptId?: number;
+  deptId?: string;
   userNo?: string;
   remark?: string;
 }
@@ -133,7 +137,7 @@ export interface DashboardSummary {
 
 /** 创建类接口返回的一次性临时口令 */
 export interface UserCreateVo {
-  userId: number;
+  userId: string;
   tempPassword: string;
 }
 
@@ -336,6 +340,8 @@ export interface AnalyticsSummary {
   passRateDelta: number;
   liveClassCount: number;
   alertCount: number;
+  /** 预警学生去重人数（口径 distinct student_id where status='open'）；alertCount 是条数，两者可以不等 */
+  alertStudents?: number;
   /** 预警数变化（负数 = 比上期减少） */
   alertDelta: number;
   courseCount: number;
@@ -409,6 +415,9 @@ export interface AnalyticsTermCompare {
   curPass?: number | null;
   prevAvg?: number | null;
   prevPass?: number | null;
+  /** 两学期各自的去重学生数（不是行数）；10-26 后端新增，数值是否有意义取决于成绩提交覆盖面 */
+  curCount?: number | null;
+  prevCount?: number | null;
 }
 
 /** 备课与实验进度明细（教师 × 课程，前端按院系/课程聚合） */

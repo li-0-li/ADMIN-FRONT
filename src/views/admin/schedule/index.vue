@@ -2501,36 +2501,6 @@ watch(
         <button class="btn btn-outline" @click="gotoThisWeek">本周</button>
         <div class="sched-week">{{ weekRangeLabel }}</div>
         <span v-if="weekNoLabel" class="week-no">{{ weekNoLabel }}</span>
-        <!-- 撤回组（2026-10-22 用户指令：挪到「第 N 周」右边、整组居中）。
-             撤回栈本来就存到 30 步，界面只露了最后一步 ⇒ 另挂「本次调整记录」列出每一步并可回退到任意一步之前 -->
-        <span class="undo-group">
-          <button
-            class="btn btn-outline"
-            type="button"
-            :disabled="!historyStack.length || busy"
-            :title="undoLabel ? `撤回上一步：${undoLabel}` : '暂无可撤回的调整（仅记录本次打开页面后的操作）'"
-            @click="undoLast"
-          >
-            <ZkIcon name="undo-2" :size="16" style="margin-right: 4px" />撤回
-          </button>
-          <el-dropdown trigger="click" popper-class="sched-undo-popper" @command="(n: number) => undoToStep(n)">
-            <button
-              class="btn btn-outline"
-              type="button"
-              :disabled="!historyStack.length || busy"
-              title="列出本次打开页面后的每一步调整；点某一步 = 连撤到这一步之前"
-            >
-              本次调整记录（{{ historyStack.length }}）<i class="icaret" aria-hidden="true"></i>
-            </button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item v-for="h in undoHistory" :key="h.no" :command="h.depth">
-                  第 {{ h.no }} 步 · {{ h.label }}
-                </el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
-        </span>
       </div>
       <button class="btn btn-outline" @click="shiftWeek(7)">
         下一周<ZkIcon name="chevron-right" :size="15" style="margin-left: 4px" />
@@ -2759,6 +2729,34 @@ watch(
         <span class="muted small mono">{{ jumpIdx >= 0 ? jumpIdx + 1 : '—' }} / {{ conflictQueue.length }}</span>
         <button class="btn btn-outline" type="button" @click="jumpConflict(1)">下一处</button>
       </div>
+      <!-- 撤回组（2026-10-26 用户指令：从翻周条中列挪到课表左下、贴着「只看冲突」）。
+           撤回栈存到 30 步，界面只露最后一步不够 ⇒ 另挂「本次调整记录」列出每一步并可回退到任意一步之前 -->
+      <span class="undo-group">
+        <button
+          class="btn btn-outline"
+          type="button"
+          :disabled="!historyStack.length || busy"
+          :title="undoLabel ? `撤回上一步：${undoLabel}` : '暂无可撤回的调整（仅记录本次打开页面后的操作）'"
+          @click="undoLast"
+        >
+          <ZkIcon name="undo-2" :size="16" style="margin-right: 4px" />撤回
+        </button>
+        <el-dropdown trigger="click" popper-class="sched-undo-popper" @command="(n: number) => undoToStep(n)">
+          <button
+            class="btn btn-outline"
+            type="button"
+            :disabled="!historyStack.length || busy"
+            title="列出本次打开页面后的每一步调整；点某一步 = 连撤到这一步之前"
+          >
+            本次调整记录（{{ historyStack.length }}）<i class="icaret" aria-hidden="true"></i>
+          </button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item v-for="h in undoHistory" :key="h.no" :command="h.depth">第 {{ h.no }} 步 · {{ h.label }}</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+      </span>
       <span class="spacer" style="flex: 1"></span>
       <div class="view-switch">
         <button
@@ -3145,7 +3143,7 @@ watch(
   <!-- 自动排课（本地实现）：待排池贪心找空位，逐条真落库；结束出报告 -->
   <el-dialog v-model="autoVisible" title="自动排课" width="560px" :close-on-click-modal="!autoRunning">
     <template v-if="!autoReport">
-      <p class="small" style="margin-top: 0">把「待排课程」池里的课程自动找空闲时段排入课表：</p>
+      <p class="small" style="margin-top: 0">把「待排课程」池里的课自动排进空位；<b>课表上已有的课一律不动</b>。</p>
       <div class="detail-row">
         <span class="detail-k">重复</span>
         <div style="flex: 1; min-width: 0">
@@ -3160,12 +3158,7 @@ watch(
           </div>
         </div>
       </div>
-      <ul class="small muted" style="padding-left: 18px; line-height: 2; margin: 10px 0 0">
-        <li>只排「待排课程」池里的课，<b>课表上已有的课一律不动</b>（锁定保护）</li>
-        <li>找位规则：在该教师空闲的时段里挑「最合适」的一格，不是挑第一个空的——同一班级尽量摊到不同天，周一~周五节数拉平，同一教师的课连着上</li>
-        <li>教室：按「容量 ≥ 选课人数、余量最小」自动匹配，无合适教室则不填</li>
-        <li>排不下的课跳过并在结束后报告，不会卡住其他课</li>
-      </ul>
+      <p class="small muted" style="margin: 10px 0 0">在教师空闲时段里挑最优格（同班级分天、五天拉平、同人连着上），教室按容量最贴自动配，排不进的最后统一报告。</p>
       <!-- 班级（2026-10-22 丙）：课程接口不出班级字段，不选就排成"未填班级"的课次（按班级筛选看不到） -->
       <div class="detail-row">
         <span class="detail-k">班级</span>
@@ -3173,9 +3166,6 @@ watch(
           <el-select v-model="autoClass" placeholder="不指定（放回的课次自动沿用原班级）" clearable filterable style="width: 100%">
             <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
           </el-select>
-          <div class="small muted">
-            待排 {{ poolEntries.length }} 门 × 每周 1 节 ≈ 需 {{ poolEntries.length * effectiveRepeatTimes }} 次保存，门数多时要等一会儿，进度显示在这里
-          </div>
         </div>
       </div>
       <p v-if="autoProgress" class="small" style="margin: 12px 0 0">
@@ -3336,11 +3326,11 @@ watch(
   height: 38px;
   padding: 0 14px;
 }
-/* 撤回组：两个控件当一个整体，与「第 N 周」标签贴右排；组内间距沿用中列的 10px 口径 */
+/* 撤回组：两个控件当一个整体（现挂在课表下方工具条 `.grid-tools` 里，跟着那条的 8px 间距口径） */
 .undo-group {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 .undo-group > .btn,
 .undo-group :deep(.el-dropdown) > .btn {
@@ -4234,7 +4224,7 @@ watch(
  * 现状：全页零条 @media，6 列固定布局在 900px 以下把卡片压成一列文字、按钮溢出卡片。
  * 课表列宽不能靠换行解决（节次行头 96px + 5 天），所以这里给课表一条横向滚动，
  * 其余条状区域改为换行。宽视口下这些规则不命中，渲染结果与改动前逐像素相同。 */
-/* 1024~1180：翻周条中列放不下（撤回组 + 日期标签 + 周次徽标），让它换行而不是把左右按钮挤到相贴 */
+/* 1024~1180：翻周条中列（本周按钮 + 日期范围 + 周次徽标）放不下时让它换行，而不是把左右按钮挤到相贴 */
 @media (max-width: 1180px) {
   .week-center {
     flex-wrap: wrap;
@@ -4279,8 +4269,8 @@ watch(
     justify-content: flex-end;
     row-gap: 6px;
   }
-  /* 翻周条中列现在带撤回组，780px 下 1fr auto 1fr 会把中列撑到溢出：
-     改用 flex 居中并允许换行（上一周/下一周跟着一起排，不再钉在两端） */
+  /* 780px 下翻周条的 1fr auto 1fr 仍会把中列撑到溢出：改用 flex 居中并允许换行
+     （上一周/下一周跟着一起排，不再钉在两端） */
   .week-pager {
     display: flex;
     justify-content: center;

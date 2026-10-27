@@ -179,13 +179,8 @@ const catText = (v: string) => CAT_TEXT[String(v)] ?? v;
 const distTotal = computed(() => (data.value?.distribution ?? []).reduce((s, b) => s + b.count, 0));
 /** 没有一份已批改成绩时，平均分/及格率不能写成「0 分 / 0%」——那是把「没数据」显示成「考了 0 分」 */
 const noScoreSample = computed(() => distTotal.value === 0);
-/** 实测：后端只把 termId / courseId 下推到成绩类聚合，deptId 与 major 对平均分、及格率、分数段、排行、预警完全不起作用
- *  （只影响课程数、分类统计、备课明细）⇒ 带这两个条件时标题不能再写「当前筛选维度」 */
-const scoreDimsIgnored = computed(() => {
-  const d = filters.deptId ? depts.value.find(x => String(x.deptId) === filters.deptId)?.name || '' : '';
-  return [d, filters.major].filter(Boolean) as string[];
-});
-const scoreScope = computed(() => (scoreDimsIgnored.value.length ? '（全学期口径）' : '（当前筛选维度）'));
+/** 10-26 后端已把 deptId/major/courseId 下推到成绩类聚合（实测 deptId=203 时平均分/及格率/两张排行/预警全变）
+ *  ⇒ 原「成绩类各块仍是全学期口径」的临时判定与标题后缀一并撤掉（编号 29） */
 /** 分类统计在空集下仍会返回 4 个分类名（值全 0）⇒ 按合计判空，不要摆 4 行 0 出来 */
 const categoriesTotal = computed(() => (data.value?.categories ?? []).reduce((s, c) => s + (c.courseCount ?? 0), 0));
 /** 只判空态行不够：数据行也得收掉，否则屏上是「4 行 0 + 一行空态」 */
@@ -413,7 +408,7 @@ function buildCsv(): string {
   const closed = alertStatus.value === 'closed';
   const out: string[] = [];
   out.push(csvRow(['全校学情统计报表']));
-  out.push(csvRow(['统计维度', dimBadge.value + (scoreDimsIgnored.value.length ? '（成绩类各块为全学期口径）' : '')]));
+  out.push(csvRow(['统计维度', dimBadge.value]));
   out.push(csvRow(['数据拉取时刻', loadedAt.value || '—']));
   out.push(csvRow([]));
   out.push(csvRow(['总览']));
@@ -473,7 +468,7 @@ function onExport() {
   a.download = csvFileName();
   a.click();
   URL.revokeObjectURL(url);
-  ElMessage.success(scoreDimsIgnored.value.length ? '报表已按当前筛选生成（其中成绩类各块仍是全学期口径）' : '报表已按当前筛选维度生成');
+  ElMessage.success('报表已按当前筛选维度生成');
 }
 
 onMounted(async () => {
@@ -499,7 +494,7 @@ onMounted(async () => {
       <el-select v-model="filters.termId" class="f-sel" placeholder="学期" filterable>
         <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="String(t.termId)" />
       </el-select>
-      <el-select v-model="filters.deptId" class="f-sel" placeholder="全部院系" clearable filterable>
+      <el-select v-model="filters.deptId" class="f-sel" placeholder="全部院系" clearable filterable title="按任课教师所属院系筛选（sys_dept），不是学生院系；该口径以后端 10-27 确认为准">
         <el-option v-for="d in depts" :key="d.deptId" :label="d.name" :value="String(d.deptId)" />
       </el-select>
       <!-- 专业：与智能排课页同维度；course.major 是文本列，按专业名过滤 -->
@@ -520,7 +515,11 @@ onMounted(async () => {
           <div class="label">
             <ZkIcon :name="c.icon" :size="13" style="vertical-align: -2px; margin-right: 4px" />{{ c.label }}
           </div>
-          <div class="num" :style="c.key === 'live' ? 'color:var(--brand-600)' : ''">
+          <div
+            class="num"
+            :style="c.key === 'live' ? 'color:var(--brand-600)' : ''"
+            :title="c.key === 'alert' ? '去重后的学生人数（后端 summary.alertStudents）—— 不等于下方预警名单的行数：同一学生可同时命中多条预警' : ''"
+          >
             {{
               c.key === 'avg'
                 ? (noScoreSample ? '—' : num(data.summary?.avgScore))
@@ -528,16 +527,16 @@ onMounted(async () => {
                   ? (noScoreSample ? '—' : num(data.summary?.passRate, '%'))
                   : c.key === 'live'
                     ? (data.summary?.liveClassCount ?? '—')
-                    : (data.summary?.alertCount ?? '—')
+                    : (data.summary?.alertStudents ?? '—')
             }}
           </div>
           <div v-if="trendOf(c)" class="trend" :class="trendOf(c)!.cls">{{ trendOf(c)!.text }}</div>
         </div>
       </div>
       <div v-if="coverage" class="cov-line small muted">{{ coverage }}</div>
-      <!-- 后端把 deptId/major 只下推到了课程数、分类与备课；成绩类六块仍是全学期口径 ⇒ 与其让标题骗人，不如把口径写在屏上 -->
-      <div v-if="scoreDimsIgnored.length" class="scope-note small">
-        已按 {{ scoreDimsIgnored.join(' / ') }} 筛选：只有课程数、分类统计与备课进度跟着变；平均分、及格率、分数段、两张排行与预警名单仍是<b>全学期口径</b>（后端未把这两个条件下推到成绩类聚合，已提需求）。
+      <!-- 后端 10-26 已确认并落地：院系 = 任课教师所属院系，且 deptId/major/courseId 已下推到成绩类聚合 ⇒ 这行从「临时口径声明」转为常驻定义 -->
+      <div class="scope-note small">
+        本页的「院系」按<b>任课教师所属院系</b>计（后端 course → teacher_id → sys_user.dept_id → sys_dept，10-26 确认），<b>不是学生院系</b>；筛选中的院系/专业/课程会同时下推到平均分、及格率、分数段、两张排行与预警名单，各块同口径。
       </div>
 
       <!-- 课程分类统计 + 成绩分布 -->
@@ -566,7 +565,7 @@ onMounted(async () => {
           </div>
         </div>
         <div class="card card-pad">
-          <div class="card-title">院系及格率对比{{ scoreScope }}</div>
+          <div class="card-title">院系及格率对比</div>
           <!-- 汇总指标：同一筛选维度下的成绩总览，填充卡片上部并给出读数锚点 -->
           <div v-if="data.distribution?.length" class="dist-meta">
             <div class="dm-item">
@@ -594,7 +593,7 @@ onMounted(async () => {
               </div>
             </template>
           </div>
-          <div v-if="data.deptPassRates?.length" class="caliber small muted">条长 = 及格率；份数 &lt;{{ SMALL_N }} 的行标<span class="cnt-warn">橙色的份数</span>并降条不透明度。</div>
+          <div v-if="data.deptPassRates?.length" class="caliber small muted">院系列 = 任课教师所属院系（口径待后端 10-27 确认）；条长 = 及格率；份数 &lt;{{ SMALL_N }} 的行标<span class="cnt-warn">橙色的份数</span>并降条不透明度。</div>
         </div>
       </div>
 
@@ -602,7 +601,7 @@ onMounted(async () => {
       <div class="grid g2 mt16 pair">
         <div class="card card-pad">
           <div class="between" style="margin-bottom: 6px">
-            <div class="card-title">分数段分布{{ scoreScope }}</div>
+            <div class="card-title">分数段分布</div>
             <span class="small muted">共 {{ distTotal }} 份已批改成绩</span>
           </div>
           <div v-if="distTotal > 0" class="score-bands">
@@ -649,7 +648,7 @@ onMounted(async () => {
         <div v-if="teacherRanks.length" class="tbl-wrap">
         <table class="tbl">
           <thead>
-            <tr><th>#</th><th>教师</th><th>院系</th><th>课程数</th><th>批改份数</th><th>平均分</th><th>及格率</th></tr>
+            <tr><th>#</th><th>教师</th><th title="任课教师所属院系（待后端确认口径）">院系</th><th>课程数</th><th>批改份数</th><th>平均分</th><th>及格率</th></tr>
           </thead>
           <tbody>
             <tr v-for="(t, i) in teacherRanks" :key="t.teacherId">
@@ -687,10 +686,10 @@ onMounted(async () => {
         <table class="tbl">
           <thead>
             <tr v-if="prepDim === 'dept'">
-              <th>#</th><th>院系</th><th>课程数</th><th>教师数</th><th>备课进度</th><th>实验进度</th><th>滞后课程</th><th>状态</th>
+              <th>#</th><th title="任课教师所属院系（待后端确认口径）">院系</th><th>课程数</th><th>教师数</th><th>备课进度</th><th>实验进度</th><th>滞后课程</th><th>状态</th>
             </tr>
             <tr v-else>
-              <th>#</th><th>课程</th><th>院系</th><th>任课教师</th><th>备课进度</th><th>实验进度</th><th>状态</th>
+              <th>#</th><th>课程</th><th title="任课教师所属院系（待后端确认口径）">院系</th><th>任课教师</th><th>备课进度</th><th>实验进度</th><th>状态</th>
             </tr>
           </thead>
           <tbody>
@@ -869,7 +868,7 @@ onMounted(async () => {
         <table class="tbl">
           <thead>
             <tr>
-              <th>#</th><th>学生</th><th>课程</th><th>院系</th><th>类型</th><th>当前分</th><th>等级</th>
+              <th>#</th><th>学生</th><th>课程</th><th title="任课教师所属院系（待后端确认口径）">院系</th><th>类型</th><th>当前分</th><th>等级</th>
               <th>{{ alertStatus === 'open' ? '操作' : '处理时间' }}</th>
               <th v-if="alertStatus === 'closed'">处理备注</th>
             </tr>
