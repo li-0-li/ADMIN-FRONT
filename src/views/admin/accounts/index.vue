@@ -58,6 +58,15 @@ const STATUS_OPTIONS = [
 const loading = ref(false);
 const rows = ref<AdminUserVo[]>([]);
 const total = ref(0);
+/**
+ * 列表加载失败态（P1-1）。
+ * 原实现 fetchList 只有 try/finally、没有 catch ⇒ 接口一挂，rows 保持空数组，
+ * 页面照常渲染成「暂无数据 + 共 0 条记录」，屏幕上「后端挂了」和「这个学校真的没账号」
+ * 长得一模一样、都零报错（CDP 断网实测复现）。request.ts 那条 toast 3 秒就没了，
+ * 用户回头看页面仍然是空表 ⇒ 必须在页面里留下一个不会自己消失的痕迹。
+ * 存文案而不是布尔：无数据(空态) / 取数失败(错误态) / 加载中 是三件事，要各自画出来。
+ */
+const loadError = ref('');
 const query = reactive({ page: 1, pageSize: 20, keyword: '', roleKey: '', status: '', deptId: undefined as string | undefined, sortField: 'createTime', sortOrder: 'desc' as 'asc' | 'desc' });
 
 /* ---------------- 院系候选（A6 / 编号 23）----------------
@@ -112,6 +121,14 @@ async function fetchList(keepSelection = false) {
     // 跨页会各页自己重排一遍，正是 10-22 那句「跨页仍按后端默认序」承认过的缺陷。
     rows.value = res?.list ?? [];
     total.value = res?.total ?? 0;
+    loadError.value = '';
+  } catch {
+    /* ★ P1-1：失败必须同时做三件事——清空 rows（不留上一次查询的残行，否则会显示"别的筛选的结果"）、
+       把 total 归零（页码数跟着归零，不会留一个点不动的 /3 页）、落一条常驻错误文案。
+       这里只吞异常不另弹 toast：request.ts 已弹过一次，重复弹会让同一故障看起来像两个问题。 */
+    rows.value = [];
+    total.value = 0;
+    loadError.value = '列表加载失败：没有取到账号数据，可能是网络中断、后端服务未启动或登录状态已过期。';
   } finally {
     loading.value = false;
   }
@@ -518,9 +535,29 @@ function onFilePick(e: Event) {
   importFile.value = input.files && input.files[0] ? input.files[0] : null;
 }
 
+/**
+ * 导入模板下载（P1-2）。
+ * ★ 实测：后端进程重启后**第一次**请求 /import-template 用了 84.1 秒才返回 3,885 字节，
+ *   之后三次分别是 0.107 / 0.069 / 0.084 秒 ⇒ 是冷启动开销，不是坏接口。
+ *   但 request.ts 的 axios 超时上限是 30 秒 ⇒ 那一次点击在浏览器里**必然失败**。
+ *   前端改不了超时（那是共享禁改点，已列 P2 交协调线），能做的是两件事：
+ *   ① 给按钮一个 loading/文案态，避免用户以为没反应而连点；
+ *   ② 失败时说清「这是慢、不是坏」并给出可操作下一步 —— 默认那句英文 Network Error 指导不了任何人。
+ */
+const tplLoading = ref(false);
 async function onDownloadTemplate() {
-  const blob = await downloadImportTemplate();
-  saveBlob(blob, '账号导入模板.xlsx');
+  if (tplLoading.value) return;
+  tplLoading.value = true;
+  try {
+    const blob = await downloadImportTemplate();
+    saveBlob(blob, '账号导入模板.xlsx');
+    ElMessage.success('模板已开始下载');
+  } catch {
+    // 不重复弹 request.ts 那条通用错误：这里给的是能直接照做的说法
+    ElMessage.warning('模板没下载下来：后端刚启动时首次生成模板较慢（实测最慢约 84 秒），超过 30 秒会被判超时。请等一会儿再点一次；若反复失败，请让运维确认后端是否正常。');
+  } finally {
+    tplLoading.value = false;
+  }
 }
 
 async function onSubmitImport() {
@@ -834,6 +871,15 @@ async function openFootprint(row: AdminUserVo) {
   </div>
 
   <div class="card">
+    <!-- P1-1 失败态：独立于空态存在。出现时不遮表格（遮了就看不到"上一次的结果已清空"），
+         而是压一条常驻提示 + 重试按钮；文案不会自己消失，区别于 request.ts 那条 3 秒 toast。 -->
+    <div v-if="loadError" class="load-fail" role="alert">
+      <ZkIcon name="alert-triangle" :size="16" />
+      <span class="load-fail-text">{{ loadError }}</span>
+      <el-button text :loading="loading" @click="fetchList()">
+        <ZkIcon v-if="!loading" name="refresh-cw" :size="14" style="margin-right: 4px" />重新加载
+      </el-button>
+    </div>
     <el-table ref="tableRef" v-loading="loading" row-key="userId" :data="rows" style="width: 100%" :default-sort="{ prop: 'createTime', order: 'descending' }" @selection-change="onSelectionChange" @sort-change="(s: { prop: string; order: string | null }) => onSortChange(s.prop, s.order)">
       <el-table-column type="selection" width="42" reserve-selection />
       <!-- 列宽全部按真页面实测取（10-23 同源 iframe 造 1366 视口，量各列内容宽 + 单元格左右内边距 24px）：
@@ -899,12 +945,29 @@ async function openFootprint(row: AdminUserVo) {
           </el-dropdown>
         </template>
       </el-table-column>
+      <!-- P2 空态：EP 自带的空态只有「暂无数据」四个字，不说为什么空、也不说下一步做什么。
+           这里把最常见的两个原因（筛选太窄 / 库里真的没号）和对应动作写出来；
+           失败态复用同一个块但换文案，避免"空表"这一种视觉承载两种互斥语义。 -->
+      <template #empty>
+        <div class="empty-block">
+          <ZkIcon name="users" :size="26" />
+          <div class="empty-title">{{ loadError ? '数据未取到' : '没有符合条件的账号' }}</div>
+          <div v-if="loadError" class="small muted">原因见上方提示条，可点「重新加载」重试。</div>
+          <div v-else class="small muted">
+            当前「关键词 / 角色 / 状态 / 院系」组合下没有账号。可点上方「重置」清空筛选，或用「新增账号」建号。
+          </div>
+        </div>
+      </template>
     </el-table>
 
     <div class="between page-foot" style="padding: 12px 16px">
       <span class="small muted">
-        共 {{ total }} 条记录
-        <span class="muted small">（点表头排序走服务端，整表重排、跨页连续）</span>
+        <!-- 失败时不能照常印「共 0 条记录」：那个数字会被读成"库里真没有"，是本次最误导的一处 -->
+        <template v-if="loadError">记录数未取到（加载失败）</template>
+        <template v-else>
+          共 {{ total }} 条记录
+          <span class="muted small">（点表头排序走服务端，整表重排、跨页连续）</span>
+        </template>
       </span>
       <div class="mini-pager">
         <button
@@ -1039,7 +1102,7 @@ async function openFootprint(row: AdminUserVo) {
   <el-dialog v-model="importVisible" title="批量导入账号" width="520px">
     <div class="stack" style="gap: 12px">
       <div class="small muted" style="line-height: 1.7">
-        1. 先<a href="javascript:void(0)" style="color: var(--brand-600)" @click="onDownloadTemplate">下载导入模板</a>，
+        1. 先<span v-if="tplLoading" class="muted">模板生成中，请稍候…</span><span v-else><a href="javascript:void(0)" style="color: var(--brand-600)" @click="onDownloadTemplate">下载导入模板</a></span>，
         按列头填好（<b>登录账号</b>、<b>角色标识</b>必填；角色标识只能填 <code>teacher</code> / <code>student</code> / <code>admin</code>，
         与后端白名单逐字一致，填别的值只有该行失败、其余行照常导入）；<br />
         2. 模板里的「状态」「最近登录」「创建时间」三列是导出留档用的，导入时忽略，填了不生效；<br />
@@ -1559,5 +1622,39 @@ async function openFootprint(row: AdminUserVo) {
   color: var(--danger-600, #d54941);
   max-height: 140px;
   overflow: auto;
+}
+
+/* P1-1 失败提示条：用警示色，但刻意不做整块红底 —— 红底在管理后台里的既有语义是
+   "你这个操作被拒绝了"，而这里的语义是"数据没取到、可以重试"，两者混淆会让人以为是权限问题。 */
+.load-fail {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--danger-100, #fbe3e1);
+  background: var(--danger-50, #fef6f5);
+  color: var(--danger-600, #d54941);
+  font-size: 13px;
+}
+.load-fail-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.6;
+}
+
+/* P2 空态：给图标 + 主标题 + 说明三行，替掉 EP 那行「暂无数据」 */
+.empty-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 28px 16px;
+  color: var(--ink-400, #9aa3b2);
+  line-height: 1.7;
+}
+.empty-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink-700, #3a4256);
 }
 </style>
