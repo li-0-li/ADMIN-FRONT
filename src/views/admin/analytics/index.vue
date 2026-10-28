@@ -68,9 +68,29 @@ async function loadPickers() {
 /** 聚合接口一次拉全页数据 ⇒ 并发响应必须只认最后一次，否则慢的那次会覆盖新筛选结果 */
 let reqSeq = 0;
 let mergeTimer: number | undefined;
+/**
+ * 失败原因（存文案不存布尔：2026-10-28 交付前复查发现原来失败与"后端返回空"共用一句
+ * 「加载失败或暂无数据」，用户看不出是网络问题还是真的没数据，也看不到后端说了什么）。
+ * 与账号页 P1-1 同一处理方式，保持两条线一致。
+ */
+const loadError = ref('');
+/**
+ * 上次「成功拿到数据」时对应的筛选维度快照。
+ * 用途只有一个：挡住导出的口径错配 —— dimBadge 是实时的（改筛选立刻变），data 是滞后的
+ * （要等接口回来）。两者不同步时导出，CSV 首行写的是新维度、数据是旧全量，等于交出一份
+ * 自己都对不上的报表。2026-10-28 实测可复现（选专业后立刻导出：维度写"计算机科学与技术"、
+ * 课程数仍是 13 门）。
+ * ⚠️ 必须把 alertStatus 一起纳入快照：dimBadge 只含学期/院系/专业/课程，**不含预警页签**，
+ * 而 CSV 里的预警名单是按页签取的（待处理 / 已处理）。只比 dimBadge 的话，切页签后立刻导出
+ * 会漏过门禁，导出「已处理」的标题配「待处理」的名单。
+ */
+const loadedDim = ref('');
+/** 口径快照 = 可见筛选维度 + 预警页签（两者都决定 CSV 某一节的内容） */
+const dimSnapshot = () => `${dimBadge.value}|${alertStatus.value}`;
 
 async function load() {
   const seq = ++reqSeq;
+  const dimAtReq = dimSnapshot();
   loading.value = true;
   try {
     const res = await getSchoolAnalytics({
@@ -82,6 +102,8 @@ async function load() {
     });
     if (seq !== reqSeq) return;
     data.value = res;
+    loadedDim.value = dimAtReq;
+    loadError.value = '';
     loadedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     // 院系选项随每次聚合返回 ⇒ 只增不减地合并进本地列表。
     // 后端 deptOptions 会跟着课程筛选一起缩小，直接整表替换会让已选中的院系从下拉里消失：
@@ -93,9 +115,13 @@ async function load() {
       }
       depts.value = [...byId.values()];
     }
-  } catch {
+  } catch (e) {
     if (seq !== reqSeq) return;
     data.value = null;
+    // request.ts 已经 toast 过一次，这里再落一条常驻文案：toast 几秒就没了，
+    // 而「这页为什么是空的」需要留在屏上，且要能区分失败与真的没数据
+    const msg = String((e as { message?: string })?.message ?? '').trim();
+    loadError.value = msg || '学情数据读取失败（网络或登录状态异常）';
   } finally {
     if (seq === reqSeq) loading.value = false;
   }
@@ -437,8 +463,9 @@ const alertSortHint = computed(() =>
  */
 const csvCell = (v: unknown): string => {
   let s = v === undefined || v === null ? '' : String(v);
-  // 课程名/学生名/备注是库里的文本，写成 =1+1 之类会被 Excel 当公式执行 ⇒ 前置单引号阻断
-  if (typeof v === 'string' && /^[=+@]/.test(s)) s = `'${s}`;
+  // 课程名/学生名/备注是库里的文本，写成 =1+1 或 -2+3 会被 Excel 当公式执行 ⇒ 前置单引号阻断
+  // 2026-10-28 补：原正则只有 [=+@]，漏了 - 与制表/回车 —— 这三个同样是 Excel/Sheets 的公式起始符
+  if (typeof v === 'string' && /^[=+\-@\t\r]/.test(s)) s = `'${s}`;
   return `"${s.replace(/"/g, '""')}"`;
 };
 const csvRow = (cells: unknown[]): string => `${cells.map(csvCell).join(',')}\r\n`;
@@ -499,6 +526,13 @@ function csvFileName(): string {
 function onExport() {
   if (!data.value) {
     ElMessage.warning('当前没有可导出的数据，请先重新加载');
+    return;
+  }
+  /* 口径一致性门禁：筛选一变 dimBadge 立刻变，但 data 要等接口回来。
+     这两个不同步时导出，CSV 首行写新维度、数据是旧全量 —— 2026-10-28 实测复现过。
+     loading 单独挡不住 150ms 防抖窗口（reloadSoon 还没把 loading 置 true），所以以维度快照为准。 */
+  if (loading.value || loadedDim.value !== dimSnapshot()) {
+    ElMessage.warning('筛选已变更但数据还没刷新完，请等加载完成后再导出');
     return;
   }
   // BOM 不能省：没有它 Excel 直接双击打开中文 CSV 会乱码
@@ -856,7 +890,11 @@ onMounted(async () => {
         </div>
         <div class="card card-pad">
           <div class="between" style="align-items: baseline; margin-bottom: 4px">
-            <div class="card-title">成绩趋势（近 {{ data.trend?.length ?? 0 }} 周）</div>
+            <!-- 原标题写「近 {{ trend.length }} 周」是错的：后端统计窗口固定近 8 周（TREND_WEEKS=8），
+                 但 group by weekofyear 只返回「有提交的周」⇒ length 是采样点数，不是时间窗长度。
+                 2026-10-28 实测：窗口 8 周，标题写「近 6 周」，用户会以为只统计了 6 周。
+                 改成直说采样周数；无数据时不写「近 0 周」那种自相矛盾的话。 -->
+            <div class="card-title">成绩趋势（{{ data.trend?.length ? `${data.trend.length} 个有数据的周` : '暂无数据' }}）</div>
             <span class="small muted">纵轴：周平均分</span>
           </div>
           <svg v-if="trendPts" viewBox="0 0 400 200" style="width: 100%; height: auto">
@@ -893,6 +931,12 @@ onMounted(async () => {
               </text>
             </svg>
           </div>
+          <!-- 后端 experimentRate = published<=0 ? 0 : done/published*100（AdminStatsServiceImpl.java:211-216），
+               且出参不带 published 数 ⇒ 前端分不出「没有已发布实验任务」与「有任务但无人提交」，
+               两者都渲染成 0%。不补假数据，改成把这条限制写在环下面。 -->
+          <p v-if="!data.experimentRate" class="small muted" style="text-align: center; margin-top: 4px">
+            0% 无法区分「本学期没有已发布实验任务」与「有任务但无人提交」
+          </p>
         </div>
       </div>
 
@@ -949,9 +993,19 @@ onMounted(async () => {
       </div>
     </template>
 
-    <!-- 接口失败 / 无数据：页内缺口提示（不裸报红） -->
+    <!-- 接口失败 / 无数据：页内缺口提示（不裸报红）。
+         2026-10-28 交付前复查：原来两种情况共用一句「学情数据加载失败或暂无数据」，
+         用户看不出是网络/登录问题还是真的没数据，也看不到后端返回了什么 ⇒ 按 loadError 分流。 -->
     <div v-else-if="!loading" class="card card-pad center" style="padding: 48px">
-      <p class="muted">学情数据加载失败或暂无数据。</p>
+      <template v-if="loadError">
+        <p class="empty-main">学情数据读取失败</p>
+        <p class="small muted" style="margin-top: 6px">{{ loadError }}</p>
+        <p class="small muted" style="margin-top: 6px">若反复失败，先确认登录未过期、后端 8080 与数据库隧道都在。</p>
+      </template>
+      <template v-else>
+        <p class="empty-main">当前筛选范围内没有可比对的数据</p>
+        <p class="small muted" style="margin-top: 6px">试试放宽筛选（清空院系 / 专业 / 课程），或换一个学期。</p>
+      </template>
       <button class="btn btn-outline" style="margin-top: 12px" @click="load">
         <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />重新加载
       </button>
