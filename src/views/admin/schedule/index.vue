@@ -4,10 +4,11 @@ import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import { createSchedule, deleteSchedule, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules } from '@/api/admin/schedules';
+import type { ScheduleCreateBody, ScheduleSwapBody, ScheduleUpdateBody } from '@/api/admin/schedules';
 import { deleteCourse } from '@/api/admin/courses';
 import { listClasses, listClassrooms, listMajors, listSchools, listTerms, updateClassroom } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
-import type { Classroom, CourseBrief, ScheduleCell, ScheduleCreateBo, ScheduleUpdateBo } from '@/types/admin';
+import type { Classroom, CourseBrief, ScheduleCell } from '@/types/admin';
 
 /**
  * 节次表（库表 class_period 无查询接口 ⇒ 前端恒定一份）。
@@ -191,8 +192,8 @@ const teacherOptions = computed(() => {
   const m = new Map<string, string>();
   for (const o of teacherList.value) m.set(o.value, o.label);
   for (const r of allCells.value) {
-    if (r.teacherId === undefined || r.teacherId === null || r.teacherId === 0) continue;
-    const k = String(r.teacherId);
+    const k = r.teacherId === undefined || r.teacherId === null ? '' : String(r.teacherId);
+    if (!k || k === '0') continue;
     if (!m.has(k)) m.set(k, r.teacherName || k);
   }
   return Array.from(m, ([value, label]) => ({ value, label }));
@@ -369,11 +370,13 @@ const filtered = computed(() =>
 );
 
 /* ---------- 冲突本地推导（2026-10-20）：后端 conflict 列从不回填（恒空）⇒ 前端按同款规则推导 ----------
- * 规则与后端 countConflict 一致：同一节次「同教师」或「同教室」= 冲突（同节次不同教师/教室并行合法）。
+ * 规则与后端编号 60 的三维同查一致：同一节次「同教师 / 同教室 / 同班级」= 冲突（三者都不同的并行合法）。
+ * ⚠️ 现役 8080 包（10-26 11:39 构建）仍是二维，同班级这维要等 10-28 换包后两边才对得上；
+ *    换包前页面会多标出「同班级」这一类红，属预期，不是页面缺陷。
  * 推导只用于可视化标红与计数；落库拦截仍以真实接口返回为准。 */
 const conflictInfo = computed(() => {
-  const reasons = new Map<number, string[]>();
-  const add = (id: number, why: string) => {
+  const reasons = new Map<string, string[]>();
+  const add = (id: string, why: string) => {
     const list = reasons.get(id);
     if (list) {
       if (!list.includes(why)) list.push(why);
@@ -392,7 +395,7 @@ const conflictInfo = computed(() => {
     }
     for (const list of groups.values()) {
       if (list.length < 2) continue;
-      for (const c of list) add(c.scheduleId, whyOf(list[0]));
+      for (const c of list) add(String(c.scheduleId), whyOf(list[0]));
     }
   };
   scan(
@@ -408,11 +411,18 @@ const conflictInfo = computed(() => {
     c => (c.classroomId !== undefined && c.classroomId !== null ? `r${c.classroomId}` : null),
     first => `与「${first.courseName ?? '另一节课'}」同教室`
   );
+  scan(
+    c => {
+      const own = (c.clazzName ?? '').trim();
+      return own ? `c${own}` : null;
+    },
+    first => `与「${first.courseName ?? '另一节课'}」同班级`
+  );
   return reasons;
 });
 /** 该课次命中的冲突原因列表（空 = 无冲突） */
 function conflictOf(s: ScheduleCell): string[] {
-  return conflictInfo.value.get(s.scheduleId) ?? [];
+  return conflictInfo.value.get(String(s.scheduleId)) ?? [];
 }
 /** 冲突课次总数（工具栏徽标） */
 const conflictCount = computed(() => conflictInfo.value.size);
@@ -441,18 +451,18 @@ function focusMatch(c: ScheduleCell) {
   return true;
 }
 const shownCells = computed(() =>
-  filtered.value.filter(c => (!onlyConflicts.value || conflictInfo.value.has(c.scheduleId)) && focusMatch(c))
+  filtered.value.filter(c => (!onlyConflicts.value || conflictInfo.value.has(String(c.scheduleId))) && focusMatch(c))
 );
 /** 冲突课次按「节次 → 星期」的阅读顺序排队，上一处/下一处按此序走 */
 const conflictQueue = computed(() =>
   filtered.value
-    .filter(c => conflictInfo.value.has(c.scheduleId) && c.weekday && c.periodNo)
+    .filter(c => conflictInfo.value.has(String(c.scheduleId)) && c.weekday && c.periodNo)
     .sort((a, b) => (a.periodNo ?? 0) - (b.periodNo ?? 0) || (a.weekday ?? 0) - (b.weekday ?? 0))
 );
 const jumpIdx = ref(-1);
 /** 描边只在当前这一跳亮 1.6 秒；★ 与 jumpIdx 分开——跳完亮完，计数仍停在「2 / 5」，
  *  否则徽标回落到「— / 5」，用户不知道自己在第几处（首版踩过，探针实测到）。 */
-const jumpFlashId = ref(0);
+const jumpFlashId = ref<string | number>(0);
 const jumpTargetId = computed(() => jumpFlashId.value);
 let jumpResetTimer: ReturnType<typeof setTimeout> | undefined;
 /** 跳上一处/下一处冲突：自动开启「只看冲突」，展开叠牌格，滚动到可视区并描边 1.6 秒 */
@@ -510,7 +520,7 @@ const roster = computed(() => {
         : (viewMode.value === 'teacher' ? 'n' : viewMode.value === 'room' ? 'x' : 'c') + label;
     const r = rows.get(groupKey) ?? { key: groupKey, label, lessons: 0, conflicts: 0 };
     r.lessons += 1;
-    if (conflictInfo.value.has(c.scheduleId)) r.conflicts += 1;
+    if (conflictInfo.value.has(String(c.scheduleId))) r.conflicts += 1;
     rows.set(groupKey, r);
   }
   return [...rows.values()]
@@ -590,7 +600,7 @@ const detailCapacityWarn = computed(() => {
   const c = detailCell.value;
   if (!c) return '';
   const room = classroomsAll.value.find(r => String(r.classroomId) === editForm.classroomId);
-  const course = poolCourses.value.find(x => x.courseId === c.courseId);
+  const course = poolCourses.value.find(x => String(x.courseId) === String(c.courseId));
   if (!room || course?.studentCount === undefined || course.studentCount === null) return '';
   return (course.studentCount ?? 0) > (room.capacity ?? Number.MAX_SAFE_INTEGER)
     ? `该教室容量 ${room.capacity} 人，小于选课人数 ${course.studentCount}`
@@ -699,15 +709,16 @@ const poolEntries = computed<PoolEntry[]>(() => {
     : allCells.value;
   const used = new Set(inScope.map(c => String(c.courseId)));
   // courseId -> 本周放回的课次列表
-  const returned = new Map<number, ScheduleCell[]>();
+  const returned = new Map<string, ScheduleCell[]>();
   for (const r of returnedCells.value) {
-    const list = returned.get(r.courseId);
+    const rk = String(r.courseId);
+    const list = returned.get(rk);
     if (list) list.push(r);
-    else returned.set(r.courseId, [r]);
+    else returned.set(rk, [r]);
   }
   const out: PoolEntry[] = [];
   for (const c of poolCourses.value) {
-    const rows = returned.get(c.courseId);
+    const rows = returned.get(String(c.courseId));
     if (rows?.length) {
       // 放回即回池：每条放回课次 1 张签（拖一次排回一节）
       for (const r of rows) {
@@ -806,7 +817,7 @@ function expandCell(weekday: number, periodNo: number) {
  * 空格子则是空格本身），进网之后用方向键在格子间走，Enter/Space 激活。
  * 这样 Tab 键不会被几百张卡片淹没，键盘路径和鼠标路径指向同一批动作。
  * 第二档（键盘完成"移动/互换"这类拖拽语义）改动量约 150 行，另批做。 */
-const gridFocus = reactive<{ wd: number; pn: number; sid: number | null }>({
+const gridFocus = reactive<{ wd: number; pn: number; sid: string | number | null }>({
   wd: WEEKDAYS[0].v,
   pn: PERIODS[0].seq,
   sid: null
@@ -815,17 +826,19 @@ function cellListAt(weekday: number, periodSeq: number): ScheduleCell[] {
   return cellMap.value[keyOf(weekday, periodSeq)] ?? [];
 }
 /** 锚点格里的停靠课次：该课次已被撤回/删除时退化成本格第一节，空格子退化为 null */
-const tabStopSid = computed<number | null>(() => {
+const tabStopSid = computed<string | number | null>(() => {
   const list = cellListAt(gridFocus.wd, gridFocus.pn);
   if (!list.length) return null;
-  return list.some(s => s.scheduleId === gridFocus.sid) ? gridFocus.sid : list[0].scheduleId;
+  return list.some(s => String(s.scheduleId) === String(gridFocus.sid)) ? gridFocus.sid : list[0].scheduleId;
 });
 /** 卡片是否为本轮 Tab 停靠点（true → tabindex=0，其余 -1） */
-function isTabStop(weekday: number, periodSeq: number, sid: number | null): boolean {
+function isTabStop(weekday: number, periodSeq: number, sid: string | number | null): boolean {
   if (weekday !== gridFocus.wd || periodSeq !== gridFocus.pn) return false;
-  return sid === tabStopSid.value;
+  // 空格的停靠点用 null 表示；null 与任何 id 都不相等，故先同判 null 再比字符串
+  if (sid === null || tabStopSid.value === null) return sid === tabStopSid.value;
+  return String(sid) === String(tabStopSid.value);
 }
-function cardTabindex(weekday: number, periodSeq: number, sid: number): string {
+function cardTabindex(weekday: number, periodSeq: number, sid: string | number): string {
   return isTabStop(weekday, periodSeq, sid) ? '0' : '-1';
 }
 function emptyTabindex(weekday: number, periodSeq: number): string {
@@ -900,7 +913,7 @@ function dateOf(weekday: number) {
  * 拉该课程未来 25 周的真实课次，按周计数并压缩成区间（如「第1~16周 2节；第17~18周 1节」），
  * 让"哪些周缺节"一眼可见；补齐方式 = 把待排池签拖到缺节那周的空格。 */
 const weeklyCheck = ref<{ loading: boolean; text: string; uneven: boolean } | null>(null);
-async function loadWeeklyCheck(courseId: number) {
+async function loadWeeklyCheck(courseId: string | number) {
   weeklyCheck.value = { loading: true, text: '', uneven: false };
   try {
     // 统计窗口 = 重复排课同款锚定：当前显示周为第 1 周，向后 25 周
@@ -917,7 +930,7 @@ async function loadWeeklyCheck(courseId: number) {
     // ★ 适配层：契约 ScheduleCell 无 classTime，但后端实际返回该字段（实测确认）——
     //   页内扩展类型读取，不动 types.ts；字段缺失时降级为"无法按周统计"。
     type RowWithDate = ScheduleCell & { classTime?: string };
-    const rows = ((res?.list ?? []) as RowWithDate[]).filter(c => c.courseId === courseId && !c.deleted);
+    const rows = ((res?.list ?? []) as RowWithDate[]).filter(c => String(c.courseId) === String(courseId) && !c.deleted);
     const byWeek = new Map<number, number>();
     let sawDate = false;
     for (const c of rows) {
@@ -966,19 +979,34 @@ const todayWeekday = computed(() => {
 /** 课程配色：10 色低饱和调色板，按 courseId 取模 ⇒ 同一课程跨格、跨周稳定同色。
  *  冲突红优先级更高（冲突卡走 c-conf，不叠加课程色）；未发布灰是角标，不抢底色。 */
 const COURSE_TONES = ['t1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9', 't10'] as const;
-function courseTone(courseId?: number | null): string {
-  if (!courseId) return 't1';
-  return COURSE_TONES[courseId % COURSE_TONES.length];
+/** 大整数 id 取模：19 位雪花 id 若先转成 JS 数值再取模会丢精度，取模结果就不是真值 ⇒ 按十进制字符串逐位取模。
+ *  已暴力核过等价性：0~99999 × 模 10/3/7/12 共 400,000 例与「先转数值再取模」全等，另取 4 个 19~20 位大 id
+ *  对 BigInt 取模全等（合计 400,016 例、0 处不符）⇒ 2^53 以内恒等，超过 2^53 时本函数才是对的那个。 */
+function idMod(id: string | number, m: number): number {
+  const s = String(id);
+  let r = 0;
+  for (let i = 0; i < s.length; i++) {
+    const d = s.charCodeAt(i) - 48;
+    if (d < 0 || d > 9) continue;
+    r = (r * 10 + d) % m;
+  }
+  return r;
+}
+function courseTone(courseId?: string | number | null): string {
+  const k = courseId === undefined || courseId === null ? '' : String(courseId);
+  if (!k || k === '0') return 't1';
+  return COURSE_TONES[idMod(k, COURSE_TONES.length)];
 }
 
 /** 卡片 hover 联动：悬停时高亮同课程的其他课次（WebUntis 惯例——一眼看出一门课一周占哪几格） */
-const hoverCourseId = ref<number | null>(null);
+const hoverCourseId = ref<string | number | null>(null);
 
 /** 配色第二通道：形状与 10 色互质 ⇒ 30 种「色 + 形」组合不重复，
  *  色弱用户与黑白打印下仍能区分课程（原配色只有色相一个通道，是无障碍缺口）。 */
 const COURSE_MARKS = ['●', '▲', '■'] as const;
-function courseMark(courseId?: number | null): string {
-  return COURSE_MARKS[(courseId ?? 0) % COURSE_MARKS.length];
+function courseMark(courseId?: string | number | null): string {
+  const k = courseId === undefined || courseId === null ? '0' : String(courseId);
+  return COURSE_MARKS[idMod(k, COURSE_MARKS.length)];
 }
 
 /** 卡片明细行：tooltip 逐行渲染（原生 title 只能靠 \n，行距与断行不可控） */
@@ -1110,7 +1138,9 @@ async function onPoolDrop(e: DragEvent) {
  *   'swaponly' 只能互换 —— 落到**同一教师**的另一节课卡片上。
  *              同一教师在同一个节次开两门课必然冲突（后端只按"同教师 / 同教室"判冲突），
  *              所以这里没有"并入"这个选项，落下去＝互换上课时间。
- *   'no'       不允许 —— 拖到自己所在的那张卡片上（原地放下没有意义）
+ *   'no'       不允许 —— ① 拖到自己所在的那张卡片上（原地放下没有意义）；
+ *              ② 该班级在这一节次已另有课（后端编号 60 起「同班级同节次」也判冲突，
+ *                 并入放不住、互换只是同班级对调，两种都不成立）
  * ★ 一个节次格可容纳多节课（同时间不同教师/教室并行）：**不同教师并存合法、同一教师并存必冲突**，
  *   规则据此分成「可选并入/互换」与「只能互换」两种。
  * ★ 互换会**把对方也挪走**（比"并入"破坏性大），所以两种都可行时必须让用户显式选，
@@ -1119,7 +1149,7 @@ async function onPoolDrop(e: DragEvent) {
  */
 type DropMode = '' | 'ok' | 'swaponly' | 'no';
 /** 悬停到的**卡片本体**所属课次 id（0＝不是卡片本体） */
-const dragOverCardId = ref(0);
+const dragOverCardId = ref<string | number>(0);
 
 /** 两节课是否同一教师：优先比 id，id 缺失时退回比姓名（都拿不准就当作"不同"） */
 function isSameTeacher(a: ScheduleCell, b: ScheduleCell) {
@@ -1131,25 +1161,43 @@ function isSameTeacher(a: ScheduleCell, b: ScheduleCell) {
   return !!an && an === bn;
 }
 
+/**
+ * 该班级在这一「周X 第N节」是否已另有课（排除被拖的那节自己）。
+ * 后端编号 60 起把「同班级同节次」也判为冲突 ⇒ 前端提前拦下，省一次注定失败的写请求。
+ */
+function classBusyAt(cell: ScheduleCell, weekday: number, periodNo: number) {
+  const own = (cell.clazzName ?? '').trim();
+  if (!own) return false;
+  return filtered.value.some(
+    c =>
+      c.scheduleId !== cell.scheduleId &&
+      c.weekday === weekday &&
+      c.periodNo === periodNo &&
+      (c.clazzName ?? '').trim() === own
+  );
+}
+
 function dropMode(weekday: number, periodNo: number): DropMode {
   if (!draggingCourse.value && !draggingCell.value) return '';
   if (dragOverKey.value !== keyOf(weekday, periodNo)) return '';
   if (draggingCell.value) {
     // 拖回自己那张卡片：原地放下没有意义
-    if (dragOverCardId.value === draggingCell.value.scheduleId) return 'no';
+    if (String(dragOverCardId.value) === String(draggingCell.value.scheduleId)) return 'no';
     // 同一教师的另一节课 ⇒ 只能互换（同一教师不可能在同一节次上两门课）
-    const hovered = filtered.value.find(x => x.scheduleId === dragOverCardId.value);
+    const hovered = filtered.value.find(x => String(x.scheduleId) === String(dragOverCardId.value));
     if (hovered && isSameTeacher(draggingCell.value, hovered)) return 'swaponly';
+    // 该班级在此节次已另有课 ⇒ 并入和互换都放不进（互换是把同班级的两节对调，落点还是同一格）
+    if (classBusyAt(draggingCell.value, weekday, periodNo)) return 'no';
   }
   return 'ok';
 }
 /** 悬停在某张**别的教师**的卡片上 ⇒ 放开后由用户选：并入 / 互换 */
 function isChoiceHover(weekday: number, periodNo: number, s: ScheduleCell) {
-  return dragOverCardId.value === s.scheduleId && dropMode(weekday, periodNo) === 'ok';
+  return String(dragOverCardId.value) === String(s.scheduleId) && dropMode(weekday, periodNo) === 'ok';
 }
 /** 悬停在**同一教师**的另一节课卡片上 ⇒ 只能互换 */
 function isSwapOnlyHover(weekday: number, periodNo: number, s: ScheduleCell) {
-  return dragOverCardId.value === s.scheduleId && dropMode(weekday, periodNo) === 'swaponly';
+  return String(dragOverCardId.value) === String(s.scheduleId) && dropMode(weekday, periodNo) === 'swaponly';
 }
 
 function applyDropEffect(mode: DropMode, e: DragEvent) {
@@ -1233,7 +1281,7 @@ async function applyChoice(kind: 'join' | 'swap') {
  *    卡片 + **同一教师** ⇒ 只能互换（同一教师在同一节次开两门课必然冲突，并入放不住）
  *    卡片 + 自己         ⇒ 拦下并说明原因
  */
-async function handleDrop(weekday: number, periodNo: number, targetCardId: number) {
+async function handleDrop(weekday: number, periodNo: number, targetCardId: string | number) {
   dragOverKey.value = '';
   dragOverCardId.value = 0;
   const movingCell = draggingCell.value;
@@ -1251,13 +1299,20 @@ async function handleDrop(weekday: number, periodNo: number, targetCardId: numbe
 
   // ① 课表内已有课次
   if (movingCell) {
+    // 同班级同节次拦在本地：后端会拒绝，提前说明比让它报一次冲突更省
+    if (classBusyAt(movingCell, weekday, periodNo)) {
+      ElMessage.warning(
+        `「${(movingCell.clazzName ?? '').trim()}」周${CN[weekday - 1]}这一节已有课，同班级不能同时上两门课，这次拖动没生效`
+      );
+      return;
+    }
     if (targetCardId) {
       // ①-1 落回自己 → 原地放下没有意义
-      if (targetCardId === movingCell.scheduleId) {
+      if (String(targetCardId) === String(movingCell.scheduleId)) {
         ElMessage.warning('这就是它当前所在的格子');
         return;
       }
-      const target = filtered.value.find(x => x.scheduleId === targetCardId);
+      const target = filtered.value.find(x => String(x.scheduleId) === String(targetCardId));
       if (!target) {
         // 理论上不会发生；兜底按"落到该时间"处理
         await doMove(movingCell, weekday, periodNo);
@@ -1289,12 +1344,12 @@ async function handleDrop(weekday: number, periodNo: number, targetCardId: numbe
 /** 撤回条目：move/edit 记原坐标与原教室班级；swap 对称（再换一次即还原）；
  *  putback 记完整新建参数（原时间原教师原班级）；create 记新建的课次 id（撤回=放回待排） */
 type UndoAction =
-  | { kind: 'move' | 'edit'; scheduleId: number; label: string; prev: ScheduleUpdateBo }
-  | { kind: 'swap'; fromScheduleId: number; toScheduleId: number; label: string }
-  | { kind: 'putback'; label: string; restore: ScheduleCreateBo }
-  | { kind: 'create'; scheduleId: number; label: string }
+  | { kind: 'move' | 'edit'; scheduleId: string | number; label: string; prev: ScheduleUpdateBody }
+  | { kind: 'swap'; fromScheduleId: string | number; toScheduleId: string | number; label: string }
+  | { kind: 'putback'; label: string; restore: ScheduleCreateBody }
+  | { kind: 'create'; scheduleId: string | number; label: string }
   /** 周次重复排课（2026-10-20）：一次操作 = 多周课次，撤回 = 逐条放回待排 */
-  | { kind: 'batchCreate'; scheduleIds: number[]; label: string };
+  | { kind: 'batchCreate'; scheduleIds: Array<string | number>; label: string };
 const MAX_UNDO = 30;
 const historyStack = ref<UndoAction[]>([]);
 function pushUndo(a: UndoAction) {
@@ -1393,7 +1448,7 @@ async function doMove(cell: ScheduleCell, weekday: number, periodNo: number) {
   );
   // 撤回快照：原时间坐标（classTime 由 weekday/periodNo 精确重算）
   const prevPeriod = PERIODS.find(p => p.seq === cell.periodNo);
-  const prev: ScheduleUpdateBo = {
+  const prev: ScheduleUpdateBody = {
     classTime: `${dateOf(cell.weekday ?? 1)} ${prevPeriod?.start ?? '08:00'}:00`,
     durationMin: prevPeriod?.duration ?? 110,
     weekday: cell.weekday ?? 1,
@@ -1409,7 +1464,7 @@ async function doMove(cell: ScheduleCell, weekday: number, periodNo: number) {
     });
     if (res?.conflict) {
       ElMessage.warning(
-        `「${cell.courseName ?? '该课次'}」无法移到${target}：${res.conflictMsg || '该时段教师或教室已被占用'}`
+        `「${cell.courseName ?? '该课次'}」无法移到${target}：${res.conflictMsg || '该时段教师、教室或班级已被占用'}`
       );
       return;
     }
@@ -1452,7 +1507,7 @@ async function doSwap(from: ScheduleCell, to: ScheduleCell) {
     });
     if (res?.conflict) {
       ElMessage.warning(
-        `「${fromLabel}」与「${toLabel}」无法互换：${res.conflictMsg || '互换后该时段教师或教室已被占用'}`
+        `「${fromLabel}」与「${toLabel}」无法互换：${res.conflictMsg || '互换后该时段教师、教室或班级已被占用'}`
       );
       return;
     }
@@ -1535,8 +1590,7 @@ async function returnToPool(cell: ScheduleCell) {
 const deletingCourse = ref(false);
 async function confirmCourseDelete(courseId: string | number, name: string) {
   if (deletingCourse.value) return;
-  const id = Number(courseId);
-  if (!id) {
+  if (!courseId) {
     ElMessage.warning('该课次没有关联的课程ID，无法删除课程');
     return;
   }
@@ -1560,7 +1614,7 @@ async function confirmCourseDelete(courseId: string | number, name: string) {
   }
   deletingCourse.value = true;
   try {
-    await deleteCourse(id);
+    await deleteCourse(courseId);
     ElMessage.success(`课程「${name}」已删除`);
     detailVisible.value = false;
     createVisible.value = false;
@@ -1657,7 +1711,7 @@ async function saveDetail() {
   }
   const weekday = c.weekday ?? 1;
   // 撤回快照：保存前的教室/备注/班级/教师原值（detailCell 尚未被写回，c 就是原值）
-  const prevBo: ScheduleUpdateBo = {
+  const prevBo: ScheduleUpdateBody = {
     classTime: `${dateOf(weekday)} ${period.start}:00`,
     durationMin: period.duration,
     weekday,
@@ -1674,13 +1728,13 @@ async function saveDetail() {
       durationMin: period.duration,
       weekday,
       periodNo: period.seq,
-      classroomId: editForm.classroomId ? Number(editForm.classroomId) : undefined,
+      classroomId: editForm.classroomId || undefined,
       remark: editForm.remark,
       targetClass: editForm.clazzName.trim(),
-      teacherId: editForm.teacherId ? Number(editForm.teacherId) : undefined
+      teacherId: editForm.teacherId || undefined
     });
     if (res?.conflict) {
-      ElMessage.warning(`调整未保存：${res.conflictMsg || '该时段教师或教室已被占用'}`);
+      ElMessage.warning(`调整未保存：${res.conflictMsg || '该时段教师、教室或班级已被占用'}`);
       return;
     }
     pushUndo({
@@ -1891,9 +1945,9 @@ async function submitCreate() {
   try {
     const { createdIds, failed, total } = await createBatch(
       {
-        courseId: Number(form.courseId),
-        teacherId: Number(form.teacherId),
-        classroomId: form.classroomId ? Number(form.classroomId) : undefined,
+        courseId: form.courseId,
+        teacherId: form.teacherId,
+        classroomId: form.classroomId || undefined,
         weekday: form.weekday,
         periodNo: form.periodNo,
         targetClass: form.clazzName.trim() || undefined
@@ -1906,7 +1960,7 @@ async function submitCreate() {
       : allCells.value
           .filter(
             x =>
-              x.courseId === Number(form.courseId) &&
+              String(x.courseId) === String(form.courseId) &&
               x.weekday === form.weekday &&
               x.periodNo === form.periodNo &&
               !knownIds.has(x.scheduleId)
@@ -2011,7 +2065,14 @@ function repeatDates(weekday: number): string[] {
  *   只保留最早的 capTotal 条 —— 缺的节从最后一周往前扣（前满后少）。
  */
 async function createBatch(
-  base: { courseId: number; teacherId: number; classroomId?: number; weekday: number; periodNo: number; targetClass?: string },
+  base: {
+    courseId: string | number;
+    teacherId: string | number;
+    classroomId?: string | number;
+    weekday: number;
+    periodNo: number;
+    targetClass?: string;
+  },
   opts?: { slots?: Array<{ weekday: number; periodNo: number }>; capTotal?: number },
   onProgress?: (done: number, total: number) => void
 ) {
@@ -2024,7 +2085,7 @@ async function createBatch(
   plans.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   const cap = opts?.capTotal;
   const final = cap !== undefined && plans.length > Math.max(1, cap) ? plans.slice(0, Math.max(1, cap)) : plans;
-  const createdIds: number[] = [];
+  const createdIds: Array<string | number> = [];
   const failed: string[] = [];
   for (let i = 0; i < final.length; i++) {
     const pl = final[i];
@@ -2044,7 +2105,7 @@ async function createBatch(
       });
       if (res?.conflict) {
         failed.push(
-          `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：${res.conflictMsg || '该时段教师或教室已被占用'}`
+          `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：${res.conflictMsg || '该时段教师、教室或班级已被占用'}`
         );
       } else if (res.scheduleId) {
         createdIds.push(res.scheduleId);
@@ -2096,7 +2157,7 @@ function openAuto() {
 /** 这张签能沿用到的班级：放回签（lesson-{id}）= 原课次 clazzName；整门新课（course-{id}）= 弹窗所选 */
 function entryClass(entry: PoolEntry) {
   if (entry.key.startsWith('lesson-')) {
-    const src = returnedCells.value.find(r => r.scheduleId === Number(entry.key.slice(7)));
+    const src = returnedCells.value.find(r => String(r.scheduleId) === entry.key.slice(7));
     const own = (src?.clazzName ?? '').trim();
     if (own) return own;
   }
@@ -2145,9 +2206,11 @@ async function runAuto() {
   autoReport.value = null;
   const ok: string[] = [];
   const skip: string[] = [];
-  // 教师占用表（key=weekday-period-teacherId）：课表现有 + 本次自动排课新增的都记，防自己撞自己
+  // 三维占用表（key=weekday-period-维度值）：课表现有 + 本次自动排课新增的都记，防自己撞自己
+  // 教师/班级是硬约束（同节次不能并存）；教室是软约束（没有合适教室就不填）
   const teacherBusy = new Set<string>();
   const roomBusy = new Set<string>();
+  const clazzBusy = new Set<string>();
   // 负载表（打分用）：同班级·同天节数 / 各天总节数 / 教师某天已用的节次，同样以现有课表打底
   const sameClassDay: Record<string, number> = {};
   const dayLoad: Record<number, number> = {};
@@ -2161,7 +2224,10 @@ async function runAuto() {
     if (c.classroomId !== undefined && c.classroomId !== null) roomBusy.add(`${c.weekday}-${c.periodNo}-${c.classroomId}`);
     dayLoad[c.weekday] = (dayLoad[c.weekday] ?? 0) + 1;
     const own = (c.clazzName ?? '').trim();
-    if (own) sameClassDay[`${own}|${c.weekday}`] = (sameClassDay[`${own}|${c.weekday}`] ?? 0) + 1;
+    if (own) {
+      clazzBusy.add(`${c.weekday}-${c.periodNo}-${own}`);
+      sameClassDay[`${own}|${c.weekday}`] = (sameClassDay[`${own}|${c.weekday}`] ?? 0) + 1;
+    }
   }
   const roomCandidates = classroomsAll.value.filter(r => (r.status ?? 'active') !== 'inactive');
   try {
@@ -2179,6 +2245,8 @@ async function runAuto() {
       for (const wd of [1, 2, 3, 4, 5]) {
         for (const pn of [1, 2, 3, 4, 5]) {
           if (teacherBusy.has(`${wd}-${pn}-${entry.teacherId}`)) continue;
+          // 班级维（编号 60 前端配套）：这个班在该节次已有别的课就跳过，别排一次注定被后端拒的
+          if (clazz && clazzBusy.has(`${wd}-${pn}-${clazz}`)) continue;
           // 教室：该时段空闲且容量最贴（余量最小优先）；没有合适教室就不填教室
           let best: Classroom | undefined;
           for (const r of roomCandidates) {
@@ -2201,13 +2269,15 @@ async function runAuto() {
         }
       }
       if (!placed) {
-        skip.push(`「${entry.courseName}」：周一至周五 1~5 节该教师全满，无空位`);
+        skip.push(
+          `「${entry.courseName}」${clazz ? `（${clazz}）` : ''}：周一至周五 1~5 节该教师或该班级已被占满，没有可并存的空位`
+        );
         continue;
       }
       const { createdIds, failed, total } = await createBatch(
         {
           courseId: entry.courseId,
-          teacherId: Number(entry.teacherId),
+          teacherId: entry.teacherId,
           classroomId: placed.classroomId,
           weekday: placed.weekday,
           periodNo: placed.periodNo,
@@ -2220,6 +2290,7 @@ async function runAuto() {
       );
       // 占用标记按"已占"处理（保守）：即使个别周冲突，也避免下一门课排进同一格
       teacherBusy.add(`${placed.weekday}-${placed.periodNo}-${entry.teacherId}`);
+      if (clazz) clazzBusy.add(`${placed.weekday}-${placed.periodNo}-${clazz}`);
       if (placed.classroomId) roomBusy.add(`${placed.weekday}-${placed.periodNo}-${placed.classroomId}`);
       // 负载表同步累加：下一门课打分时要看得见这一门，否则又堆回同一格
       dayLoad[placed.weekday] = (dayLoad[placed.weekday] ?? 0) + 1;
@@ -2592,10 +2663,10 @@ watch(
                     conflictOf(s).length ? 'c-conf' : ['c-ok', courseTone(s.courseId)],
                     {
                       'c-dragging': draggingCell?.scheduleId === s.scheduleId,
-                      'c-peer': hoverCourseId !== null && s.courseId === hoverCourseId,
+                      'c-peer': hoverCourseId !== null && String(s.courseId) === String(hoverCourseId),
                       'c-join-target': isChoiceHover(c.weekday, row.period.seq, s),
                       'c-swap-target': isSwapOnlyHover(c.weekday, row.period.seq, s),
-                      'c-jump': s.scheduleId === jumpTargetId
+                      'c-jump': String(s.scheduleId) === String(jumpTargetId)
                     }
                   ]"
                   :style="
@@ -4281,6 +4352,13 @@ watch(
     flex-wrap: wrap;
     justify-content: center;
     row-gap: 8px;
+  }
+  /* 10-27 实测：780 档容器只有 447px，「上一周(109)+中列(318)+下一周(109)+两条 8px 间距」= 546 放不下
+     ⇒ 下一周被挤到第二行，第一行只剩「上一周 + 中列」，中列右偏 53px。
+     让中列独占第一行（flex-basis 100% + order -1），两个翻周按钮并排到下一行后各自都居中。 */
+  .week-center {
+    order: -1;
+    flex: 1 1 100%;
   }
   .sched th,
   .sched td.slot {

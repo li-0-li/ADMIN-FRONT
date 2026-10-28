@@ -51,7 +51,11 @@ export interface UserSaveBo {
   email?: string;
   phone?: string;
   roleKeys?: string[];
-  deptId?: string;
+  /**
+   * 编号 66：后端 mapper 的 `if test="deptId != 0"` 把**显式 null** 落成「清空所属院系」，
+   * 缺省=保持原值。契约里原来只有 `string`，页面无法表达「主动摘掉院系」⇒ 甲本轮故意不提供该项。
+   */
+  deptId?: string | null;
   userNo?: string;
   remark?: string;
 }
@@ -207,12 +211,13 @@ export interface CertReviewResult {
 /**
  * 课程池用到的课程摘要。取自 `GET /api/v1/courses` 的 list 行（实测字段）。
  * ★ teacherId / teacherName 是课程自带的授课教师 —— 拖动排课时默认用它预选教师。
+ * 编号 66：两个 id 转 string（后端 CourseVo 带 `@JsonFormat(STRING)`，实测响应体就是带引号字符串）。
  */
 export interface CourseBrief {
-  courseId: number;
+  courseId: string;
   courseName: string;
   courseCode?: string;
-  teacherId?: number;
+  teacherId?: string;
   teacherName?: string;
   studentCount?: number;
   /** active | certifying | archived */
@@ -222,19 +227,25 @@ export interface CourseBrief {
 
 /** GET /api/v1/schedules —— 一行 = 一个课次（后端按 class_time 排序，无按格聚合） */
 export interface ScheduleCell {
-  scheduleId: number;
-  courseId: number;
+  /**
+   * 编号 66：五个 id 转 string —— 后端 ScheduleCellVo 对应字段全带 `@JsonFormat(STRING)`，
+   * 实测响应体为带引号字符串；此处继续声明 number 会诱导后来的人写 `Number()`，
+   * 19 位雪花 id 一旦过 `Number()` 就丢精度（课排到不存在的行上）。
+   * `deleted`（软删标记 0/1）与 weekday/periodNo 不是 id，保持 number。
+   */
+  scheduleId: string;
+  courseId: string;
   /** 所属学期（course.term_id）——待排池「已排」判定按学期口径用 */
-  termId?: number;
+  termId?: string;
   /** 软删标记（1=已放回待排）：仅 includeDeleted 查询返回的行带值 */
   deleted?: number;
   courseName?: string;
   courseCode?: string;
   /** 上课班级（后端取 schedule.target_class，是冗余字符串，非 join 班级表） */
   clazzName?: string;
-  teacherId?: number;
+  teacherId?: string;
   teacherName?: string;
-  classroomId?: number;
+  classroomId?: string;
   /** 后端取 classroom.name */
   roomName?: string;
   /** 1 周一 ~ 7 周日 */
@@ -273,9 +284,13 @@ export interface ScheduleQuery {
 
 /** POST /api/v1/schedules 入参（★ 无 remark 字段，备注后端不接收） */
 export interface ScheduleCreateBo {
-  courseId: number;
-  teacherId: number;
-  classroomId?: number;
+  /**
+   * 编号 66：id 一律 string。页面从读接口拿到的就是字符串（后端 Vo 带 `@JsonFormat(STRING)`），
+   * 再 `Number()` 回写就会在 19 位雪花 id 上丢精度、把课排到不存在的行上。
+   */
+  courseId: string;
+  teacherId: string;
+  classroomId?: string;
   /** yyyy-MM-dd HH:mm:ss */
   classTime: string;
   durationMin: number;
@@ -291,7 +306,7 @@ export interface ScheduleCreateBo {
 
 /** POST 出参：命中冲突时**不落库**，返回 conflict=true + conflictMsg */
 export interface ScheduleCreateResult {
-  scheduleId?: number | null;
+  scheduleId?: string | null;
   conflict: boolean;
   conflictMsg?: string | null;
 }
@@ -309,12 +324,13 @@ export interface ScheduleUpdateBo {
   weekday: number;
   /** 节次序号（= class_period.seq） */
   periodNo: number;
-  classroomId?: number;
+  /** 编号 66：id 走字符串，理由同 `ScheduleCreateBo` */
+  classroomId?: string;
   remark?: string;
   /** 上课班级（schedule.target_class）：null/缺省=不改，空串=清空 */
   targetClass?: string;
   /** 授课教师：null/缺省=沿用原教师 */
-  teacherId?: number;
+  teacherId?: string;
 }
 
 /**
@@ -323,10 +339,14 @@ export interface ScheduleUpdateBo {
  *   课程 / 教师 / 教室**跟着课次本身走**、不随格子移动。
  */
 export interface ScheduleSwapBo {
+  /**
+   * 编号 66：转 string。两枚值直接取自 `ScheduleCell.scheduleId`（Vo 已带 `@JsonFormat(STRING)`），
+   * 保持 number 会逼页面写 `Number()` 回宽，19 位雪花 id 丢精度后互换到不存在的课次。
+   */
   /** 被拖动的课次（源） */
-  fromScheduleId: number;
+  fromScheduleId: string;
   /** 被落在其上的课次（目标，格子里原有的那节） */
-  toScheduleId: number;
+  toScheduleId: string;
 }
 
 /* ================= 全校学情（#13 GET /api/v1/admin/analytics/school） ================= */

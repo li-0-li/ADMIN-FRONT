@@ -159,16 +159,20 @@ function resetQuery() {
 }
 
 /**
- * 可排序列的实测口径（10-26 10:38 在现役 8080 包上逐列取样）：
- * 参数名 sortField + sortOrder（值 asc/desc）；`asc`/`order`/`isAsc`/`desc` 这些写法全部无效（实测两向同序）。
- * 非白名单列不报错，而是落回默认列 —— 所以这里只开放实测确认过的四列，别猜。
- * 契约名仍待后端追认（合并总表编号 12）。
+ * 可排序列的口径（后端 10-27 已追认，编号 12 结案）：参数名 sortField + sortOrder（值 asc/desc）。
+ * 白名单是 username/nickName/deptName/status/createTime/loginDate（AdminAccountServiceImpl.java:94-97），
+ * 名单外的字段 WARN 后回落默认序、不报错；本页只开放**实测确认过的四列**，别猜。
+ * nickName/deptName 后端支持排序，但本页把两者放进「登录账号」列的副行、不是独立列 ⇒ 不挂箭头（挂了也没有可点表头）。
  */
 const SORTABLE_FIELDS: Record<string, string> = { username: 'username', status: 'status', createTime: 'createTime', loginDate: 'loginDate' };
 
 function onSortChange(prop: string, order: string | null) {
   const nextField = order && SORTABLE_FIELDS[prop] ? SORTABLE_FIELDS[prop] : 'createTime';
-  const nextOrder = order === 'ascending' ? 'asc' : order === 'descending' ? 'desc' : 'desc';
+  const nextOrder = order === 'ascending' ? 'asc' : 'desc';
+  // 第三次点击 = 取消态：数据回到默认序（createTime desc），但 EP 不会自己把箭头指回去，
+  // 表头就变成「无箭头 + 有顺序」的误导状态（10:48 真浏览器复现：th 的 descending 类直接消失）。
+  // sort() 会再派发一次 sort-change，被下面那条「已是目标态就返回」吃掉 ⇒ 不多发请求。
+  if (!order) tableRef.value?.sort('createTime', 'descending');
   if (query.sortField === nextField && query.sortOrder === nextOrder) return;
   query.sortField = nextField;
   query.sortOrder = nextOrder;
@@ -305,43 +309,51 @@ function resetLockTip(row: AdminUserVo): string | null {
   if (!isSuperAdmin.value && isAdminRow(row)) return ADMIN_RESET_TIP;
   return null;
 }
-/** 编辑/新增时表单里可用的角色选项（编号 24）：
+/** 编辑/新增时表单里可用的角色选项（编号 24 + A5）：
  *  · 非超管不给「管理员」；
- *  · `common`（普通用户）已从表单候选下架 —— 后端 IMPORT_ALLOWED_ROLES 只认 teacher/student/admin
- *    （AdminAccountServiceImpl.java:87），批量导入填 common 会该行失败，手工新建却给一个导入侧填不了的取值，
- *    两边口径不一致；筛选器与徽标映射仍保留 common，存量 common 账号照样能筛出来、照样显示。
- *  · 编辑态把该行原角色补回候选（formRoleOriginal）：否则下架后打开一个 common 账号，
- *    下拉显示为空、一保存就把人家角色改了。 */
-const formRoleOriginal = ref('');
+ *  · `common`（普通用户）已从表单候选下架 —— 后端 `IMPORT_ALLOWED_ROLES` 只认 teacher/student/admin
+ *    （AdminAccountServiceImpl.java:87），而且实测连手工新建发 common 也回 code=500（`resolveRoleIds` 拒授框架内置角色），
+ *    给一个必然报错的取值没有意义；筛选器与徽标映射仍保留 common，存量 common 账号照样能筛出来、照样显示。
+ *  · 编辑态把该行**全部**原角色补回候选（A5）：一是 common 这类已下架值要能显示原样，
+ *    二是多角色账号补回全部才不会让提示里的角色在下拉里找不到。 */
+const formRolesOriginal = ref<string[]>([]);
 const roleOptionsForForm = computed(() => {
   const all = ROLE_OPTIONS.filter(x => x.value && x.value !== 'common');
   const list = isSuperAdmin.value ? all : all.filter(x => x.value !== 'admin');
-  const orig = formRoleOriginal.value;
-  if (!orig || list.some(x => x.value === orig)) return list;
-  return [...list, { value: orig, label: ROLE_LABEL[orig] ?? orig }];
+  const missing = formRolesOriginal.value.filter(k => k && !list.some(x => x.value === k));
+  if (!missing.length) return list;
+  return [...list, ...missing.map(k => ({ value: k, label: ROLE_LABEL[k] ?? k }))];
+});
+/** 该账号原有多于一个角色时的提示文案（A5：单选是 10-19 拍板，但后端契约是数组，静默降级必须说出来） */
+const multiRoleHint = computed(() => {
+  const keys = formRolesOriginal.value;
+  if (formMode.value !== 'edit' || keys.length < 2) return '';
+  return `该账号原有 ${keys.length} 个角色（${keys.map(k => ROLE_LABEL[k] ?? k).join('、')}），本页角色为单选，保存后只保留所选的那一个`;
 });
 
 /* ---------------- 新增 / 编辑 ---------------- */
 const formVisible = ref(false);
 const formMode = ref<'create' | 'edit'>('create');
 const saving = ref(false);
-/** 新增账号落在的默认院系（演示库 200=示例大学；编辑态一律沿用行原值）。
- *  字符串字面量：契约里 UserSaveBo.deptId 是 string，且这个值同时是「学校根」的查找入口（见 schoolRootId）。
- *  ★ 只在唯一赋值点用常量本身，不在八个赋值点各写一次 String()。 */
+/** 新增账号默认落在的院系（演示库 200=示例大学）；A2 起这个值在弹窗里可选可改。
+ *  写成字符串字面量：契约里 UserSaveBo.deptId 是 string，且这个值同时是「学校根」的查找入口（见 schoolRootId），
+ *  集中在这一个常量里，赋值点不再各自 String()。 */
 const DEFAULT_DEPT_ID = '200';
 /** 表单模型（含单选角色，提交时包成后端要求的 roleKeys 数组） */
 const form = reactive<{ username: string; nickName: string; email: string; phone: string; userNo: string; remark: string; role: string; userId?: string; deptId?: string | null }>({ username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: '', userId: undefined, deptId: undefined });
 const formRef = ref<FormInstance>();
 /** 编辑超管时锁死角色下拉（双保险：行按钮已禁用，弹窗内再兜一层） */
 const editingAdmin = computed(() => formMode.value === 'edit' && form.userId === SUPER_ADMIN_ID);
+/** 编辑的行原本未入院系 —— 下拉要显式说出来，否则空下拉会被读成「候选没加载出来」 */
+const deptWasEmpty = computed(() => formMode.value === 'edit' && form.deptId == null);
 
-/* 表单校验（用户拍板 10-19）：必填=登录账号/用户名/角色/工号学号；选填但格式校验=邮箱/手机号。
-   错误以内联红字显示在输入框下方。 */
+/* 表单校验（用户拍板 10-19，A3 起 nickName 的中文口径统一为「姓名」，与导入模板列头同词）：
+   必填=登录账号/姓名/角色/工号学号；选填但格式校验=邮箱/手机号。错误以内联红字显示在输入框下方。 */
 const EMAIL_RE = /^[\w.+-]+@[\w-]+(\.[\w-]+)+$/;
 const PHONE_RE = /^1[3-9]\d{9}$/;
 const rules: FormRules = {
   username: [{ required: true, message: '登录账号为必填', trigger: 'blur' }],
-  nickName: [{ required: true, message: '用户名为必填', trigger: 'blur' }],
+  nickName: [{ required: true, message: '姓名为必填', trigger: 'blur' }],
   role: [{ required: true, message: '角色为必选', trigger: 'change' }],
   userNo: [{ required: true, message: '工号/学号为必填', trigger: 'blur' }],
   email: [{ pattern: EMAIL_RE, message: '邮箱格式不正确', trigger: 'blur' }],
@@ -350,8 +362,8 @@ const rules: FormRules = {
 
 function openCreate() {
   formMode.value = 'create';
-  Object.assign(form, { username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: '', userId: undefined, deptId: undefined });
-  formRoleOriginal.value = '';
+  Object.assign(form, { username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: '', userId: undefined, deptId: DEFAULT_DEPT_ID });
+  formRolesOriginal.value = [];
   formRef.value?.clearValidate();
   formVisible.value = true;
 }
@@ -366,18 +378,18 @@ function openEdit(row: AdminUserVo) {
     phone: row.phone ?? '',
     userNo: row.userNo ?? '',
     remark: row.remark ?? '',
-    // ★ 沿用该行原院系；null（未入院系）也要如实带着，提交时省略该键即可保持原值
-    deptId: row.deptId ?? null,
+    // A2：行原院系回填后可在弹窗里改；null（未入院系）如实带着，提交时省略该键即保持原值不变
+    deptId: row.deptId || null,
     role: (row.roleKeys ?? [])[0] ?? 'common'
   });
-  formRoleOriginal.value = form.role;
+  formRolesOriginal.value = [...(row.roleKeys ?? [])];
   formRef.value?.clearValidate();
   formVisible.value = true;
 }
 
 async function submitForm() {
   // 管理权收敛：非超管不能创建/提升为管理员角色（编辑管理员本人保持原角色不拦）
-  if (!isSuperAdmin.value && form.role === 'admin' && formRoleOriginal.value !== 'admin') {
+  if (!isSuperAdmin.value && form.role === 'admin' && !formRolesOriginal.value.includes('admin')) {
     ElMessage.warning(ADMIN_EDIT_TIP);
     return;
   }
@@ -405,7 +417,8 @@ async function submitForm() {
       roleKeys: [form.role]
     };
     if (formMode.value === 'create') {
-      payload.deptId = DEFAULT_DEPT_ID;
+      // A2：院系由弹窗里选（默认 200 示例大学）；|| 兜底只为防「下拉取不到候选」时发出去一个空值
+      payload.deptId = form.deptId || DEFAULT_DEPT_ID;
       const res = await createUser(payload);
       ElMessage.success('新增成功');
       if (res?.tempPassword) {
@@ -415,15 +428,17 @@ async function submitForm() {
         pwdVisible.value = true;
       }
     } else {
-      // A1 保院系：行原值有院系就带上，原本未入院系则省略该键
-      //（省略键 ⇒ 后端 AdminAccountServiceImpl:169 setDeptId(null) → SysUserMapper.xml:183 `<if test="deptId != 0">`
-      //  在 OGNL 下 null != 0 为真 ⇒ 仍然执行 dept_id = NULL。本分支里该行 dept_id 本来就是 NULL，所以结果「等于不变」；
-      //  ★ 这只是「写回同一个 NULL」，不是「后端跳过了该列」，不能推广到有院系的行（那里发 null 会真的摘掉院系）。
-      //  而旧代码一律发 200，会把「计算机学院(201)」等账号静默挪进「示例大学(200)」）
+      // A2 + A1：编辑态院系下拉回填原值，用户改了就发新值；原本是「未入院系」(null) 且没选新院系 ⇒ 省略该键保持原样。
+      // ★ 这里刻意**不提供**「主动摘掉院系」的选项：省略键 ≠ 跳过该列 —— 后端 AdminAccountServiceImpl:169 setDeptId(null)
+      //   → SysUserMapper.xml:183 `<if test="deptId != 0">` 在 OGNL 下 null != 0 为真 ⇒ 照样执行 dept_id = NULL。
+      //   所以对有院系的行发 null 会真的摘掉院系，而契约 UserSaveBo.deptId 类型是 `string`（不含 null），
+      //   要支持这条高危动作得先改契约并让后端确认语义，不在本次范围内。
+      // 旧代码一律发 200，会把「计算机学院(201)」等账号静默挪进「示例大学(200)」—— 这条由 A1 保原值挡掉。
       if (form.deptId != null) payload.deptId = form.deptId;
       else delete payload.deptId;
-      // A2 备注：编辑态已回填原值（列表接口现在带 remark），故此键始终如实发出 ——
+      // 编号 25 备注：编辑态已回填原值（列表接口现在带 remark），故此键始终如实发出 ——
       // 留空发空串即真清空（后端 SysUserMapper.xml:194 `<if test="remark != null">` 对空串成立，只有不发键才跳过该列）
+      // 编辑时带原 userId（★ PUT /users 没有 path 段，userId 在 body 里）
       // 编辑时带原 userId（★ PUT /users 没有 path 段，userId 在 body 里）
       await updateUser(payload);
       ElMessage.success('保存成功');
@@ -772,10 +787,10 @@ async function openFootprint(row: AdminUserVo) {
           <input
             v-model="query.keyword"
             class="su-input"
-            aria-label="搜索账号 / 姓名 / 手机号 / 工号学号"
+            aria-label="搜索登录账号 / 姓名 / 手机号 / 工号学号"
             @keyup.enter="onSearch"
           />
-          <span v-if="!query.keyword" class="su-ph">搜索账号 / 姓名 / 手机号 / 工号学号</span>
+          <span v-if="!query.keyword" class="su-ph">搜索登录账号 / 姓名 / 手机号 / 工号学号</span>
         </div>
         <button v-if="query.keyword" class="su-clear" title="清空" aria-label="清空搜索" @click="clearKeyword">
           <ZkIcon name="x" :size="13" />
@@ -822,17 +837,20 @@ async function openFootprint(row: AdminUserVo) {
     <el-table ref="tableRef" v-loading="loading" row-key="userId" :data="rows" style="width: 100%" :default-sort="{ prop: 'createTime', order: 'descending' }" @selection-change="onSelectionChange" @sort-change="(s: { prop: string; order: string | null }) => onSortChange(s.prop, s.order)">
       <el-table-column type="selection" width="42" reserve-selection />
       <!-- 列宽全部按真页面实测取（10-23 同源 iframe 造 1366 视口，量各列内容宽 + 单元格左右内边距 24px）：
-           序号表头「序号」需 64、用户名行内内容需 240、角色「普通用户」需 90、状态徽标「启用」需 66、
-           两个时间列「2026-10-23 10:19:31」各需 154 ⇒ 依次给 64 / 240 / 100 / 84 / 164，每列留 10~18px 余量。
-           八列合计 42+64+240+100+84+164+164+196 = 1054 ≤ 1366 视口可用的 1069 ⇒ 不再需要横向滚动（收纳前是 1276，差 207）。 -->
+           登录账号列需 240（副行原为「姓名 · 邮箱」，A1 起改成「姓名 · 院系」；院系名比邮箱短 ⇒ 240 仍是够的，
+           隐藏态 viewport=0x0 量不了宽，这条按"变短方向"判断，可视窗口里要复扫一次溢出）、角色「普通用户」需 90、
+           状态徽标「启用」需 66、两个时间列「2026-10-23 10:19:31」各需 154 ⇒ 依次给 64 / 240 / 100 / 84 / 164，每列留 10~18px 余量。
+           八列合计 42+64+240+100+84+164+164+196 = 1054 ≤ 1366 视口可用的 1069 ⇒ 不再需要横向滚动（收纳前是 1276，差 207）。
+           ★ A1 决定不另开「院系」列（加 120 要腾 105，能省的只有 38），改成把院系放进本列副行 ⇒ 零列宽代价。 -->
       <el-table-column type="index" label="序号" width="64" align="center" :index="rowIndex" />
-      <el-table-column label="用户名" min-width="240" prop="username" sortable="custom">
+      <el-table-column label="登录账号" min-width="240" prop="username" sortable="custom">
         <template #default="{ row }">
           <div class="row" style="gap: 8px">
             <span class="avatar sm">{{ (row.nickName || row.username || '?').slice(0, 1) }}</span>
             <span>
               <div style="font-weight: 600; color: var(--ink-900)">{{ row.username }}</div>
-              <div class="small muted">{{ row.nickName }}<span v-if="row.email"> · {{ row.email }}</span></div>
+              <!-- A1：副行 = 姓名 · 院系，让「按院系筛选」在列表上就能核对；邮箱挪到详情抽屉与编辑弹窗 -->
+              <div class="small muted">{{ row.nickName }} · {{ row.deptName || '未入院系' }}</div>
             </span>
           </div>
         </template>
@@ -940,15 +958,24 @@ async function openFootprint(row: AdminUserVo) {
         <el-input v-model="form.username" :disabled="formMode === 'edit'" />
         <span v-if="formMode === 'create' && !form.username" class="fc-ph">用于登录，创建后不可改</span>
       </el-form-item>
-      <el-form-item label="用户名" prop="nickName">
+      <el-form-item label="姓名" prop="nickName">
         <el-input v-model="form.nickName" />
-        <span v-if="!form.nickName" class="fc-ph">真实姓名</span>
+        <span v-if="!form.nickName" class="fc-ph">真实姓名（导入模板同列头也叫「姓名」）</span>
       </el-form-item>
       <el-form-item label="角色" prop="role">
         <el-select v-model="form.role" style="width: 100%" :disabled="editingAdmin" placeholder="请选择角色">
           <el-option v-for="o in roleOptionsForForm" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
         <div v-if="editingAdmin" class="small muted" style="margin-top: 2px">超级管理员角色不可修改</div>
+        <!-- A5：本页角色是单选（10-19 拍板），而后端契约 roleKeys 是数组 ⇒ 多角色账号必须当场说清会降级 -->
+        <div v-if="multiRoleHint" class="small" style="margin-top: 2px; color: var(--warn-600, #b45309)">{{ multiRoleHint }}</div>
+      </el-form-item>
+      <!-- A2：院系可选可改（候选 = 编号 23 打通的本校子树全量）；不提供「主动摘掉院系」，理由写在提交分支的注释里 -->
+      <el-form-item label="所属院系" prop="deptId">
+        <el-select v-model="form.deptId" filterable clearable style="width: 100%" :placeholder="formMode === 'create' ? '示例大学（默认）' : '选择院系'">
+          <el-option v-for="o in deptOptions" :key="o.id" :label="o.name" :value="o.id" />
+        </el-select>
+        <div v-if="deptWasEmpty" class="small muted" style="margin-top: 2px">该账号当前未入院系；不选则保持不变，选一个院系即归入</div>
       </el-form-item>
       <el-form-item label="工号/学号" prop="userNo">
         <el-input v-model="form.userNo" />
@@ -992,7 +1019,7 @@ async function openFootprint(row: AdminUserVo) {
   <el-dialog v-model="detailVisible" title="账号详情" width="480px">
     <div v-if="detailRow" class="stack" style="gap: 10px">
       <div class="pf-row"><span class="k">登录账号</span><span>{{ detailRow.username }}</span></div>
-      <div class="pf-row"><span class="k">用户名</span><span>{{ detailRow.nickName }}</span></div>
+      <div class="pf-row"><span class="k">姓名</span><span>{{ detailRow.nickName }}</span></div>
       <div class="pf-row"><span class="k">角色</span><span>{{ rolesText(detailRow) }}</span></div>
       <div class="pf-row"><span class="k">状态</span><span class="badge" :class="statusBadge(detailRow.status)">{{ statusLabel(detailRow.status) }}</span></div>
       <div class="pf-row"><span class="k">邮箱</span><span>{{ detailRow.email || '—' }}</span></div>
@@ -1017,7 +1044,8 @@ async function openFootprint(row: AdminUserVo) {
         与后端白名单逐字一致，填别的值只有该行失败、其余行照常导入）；<br />
         2. 模板里的「状态」「最近登录」「创建时间」三列是导出留档用的，导入时忽略，填了不生效；<br />
         3. 新导入的账号一律发默认密码 <b>zk123456</b>，首次登录强制改密，与手工新建口径一致；<br />
-        4. 单次最多 500 行；导入 admin（管理员）角色行需要超级管理员身份。
+        4. 单次最多 500 行；导入 admin（管理员）角色行需要超级管理员身份；<br />
+        5. 导入的账号统一归入<b>示例大学</b>（模板不含院系列，院系名在校内不唯一、按名称解析必歧义）；需归入具体学院，请导入后用该行的「编辑」改。
       </div>
       <label class="imp-file" :class="{ active: importFile }">
         <input type="file" accept=".xlsx,.xls" @change="onFilePick" />

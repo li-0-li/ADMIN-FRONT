@@ -20,10 +20,12 @@ const data = ref<SchoolAnalyticsVo | null>(null);
 const loadedAt = ref('');
 
 /* ---------- 筛选：学期 / 院系 / 专业 / 课程（院系 = 任课教师所属部门，后端 deptId 过滤） ---------- */
-const terms = ref<{ termId: number; name: string }[]>([]);
-const depts = ref<{ deptId: number; name: string }[]>([]);
+// 三个下拉的 id 一律归一成 string：10-27 实测后端已逐字段 @JsonFormat(shape=STRING)，
+// 而 src/types/admin.ts 的契约还写着 number ⇒ 不照抄契约、也不用 as number 假声明（Number() 会把 19 位雪花 ID 静默打错）
+const terms = ref<{ termId: string; name: string }[]>([]);
+const depts = ref<{ deptId: string; name: string }[]>([]);
 const majors = ref<string[]>([]);
-const courses = ref<{ courseId: number; name: string }[]>([]);
+const courses = ref<{ courseId: string; name: string }[]>([]);
 const filters = reactive({ termId: '', deptId: '', major: '', courseId: '' });
 /** 预警名单状态：open 待处理 / closed 已处理（闭环切换） */
 const alertStatus = ref<'open' | 'closed'>('open');
@@ -45,14 +47,14 @@ async function loadPickers() {
     ]);
     terms.value = (tRes?.list ?? [])
       .filter(t => t.termId !== undefined)
-      .map(t => ({ termId: t.termId as number, name: t.name || String(t.termId) }));
+      .map(t => ({ termId: String(t.termId), name: t.name || String(t.termId) }));
     // 专业选项 = 专业主表（course.major 是文本列，按名匹配）；
     // ⚠️ 远端库 major 表曾为空导致下拉无选项，10-20 已按 course.major 去重补种
     majors.value = (mRes?.list ?? []).map(m => m.name || '').filter(Boolean);
     // 课程下拉只列启用中的课程：过滤掉教师端测试遗留的 creating 草稿（111/jljl 之类）
     courses.value = (cRes?.list ?? [])
       .filter(c => c.courseId !== undefined && c.status === 'active')
-      .map(c => ({ courseId: c.courseId as number, name: (c.courseName as string) || String(c.courseId) }));
+      .map(c => ({ courseId: String(c.courseId), name: (c.courseName as string) || String(c.courseId) }));
     // 学期默认选中「当前学期」，没有标记就取第一个
     if (!filters.termId) {
       const cur = tRes?.list?.find(t => t.isCurrent === 1) ?? tRes?.list?.[0];
@@ -72,10 +74,10 @@ async function load() {
   loading.value = true;
   try {
     const res = await getSchoolAnalytics({
-      termId: filters.termId ? Number(filters.termId) : undefined,
-      deptId: filters.deptId ? Number(filters.deptId) : undefined,
+      termId: filters.termId || undefined,
+      deptId: filters.deptId || undefined,
       major: filters.major || undefined,
-      courseId: filters.courseId ? Number(filters.courseId) : undefined,
+      courseId: filters.courseId || undefined,
       alertStatus: alertStatus.value
     });
     if (seq !== reqSeq) return;
@@ -85,9 +87,9 @@ async function load() {
     // 后端 deptOptions 会跟着课程筛选一起缩小，直接整表替换会让已选中的院系从下拉里消失：
     // 下拉回显成裸 id「201」，dimBadge 找不到名字回落成「全部院系」，连导出文件名与 CSV 首行的口径都是错的。
     if (res?.deptOptions?.length) {
-      const byId = new Map(depts.value.map(d => [d.deptId, d]));
+      const byId = new Map(depts.value.map(d => [String(d.deptId), d]));
       for (const d of res.deptOptions) {
-        if (d?.deptId !== undefined && d?.deptName) byId.set(d.deptId, { deptId: d.deptId, name: d.deptName });
+        if (d?.deptId !== undefined && d?.deptName) byId.set(String(d.deptId), { deptId: String(d.deptId), name: d.deptName });
       }
       depts.value = [...byId.values()];
     }
@@ -137,23 +139,29 @@ function trendOf(card: StatCard): { text: string; cls: string } | null {
   if (noScoreSample.value && (card.key === 'avg' || card.key === 'pass')) return null;
   if (card.key === 'avg') {
     const tc = data.value?.termCompare;
-    if (tc && tc.curAvg !== undefined && tc.curAvg !== null && tc.prevAvg !== undefined && tc.prevAvg !== null) {
+    // 分母来自编号 54 的 curCount/prevCount（两学期各自的去重学生数）；prevCount=0 时上期侧无可比样本，不能再写「较上学期」
+    const cnt = tc?.curCount !== undefined && tc?.curCount !== null && tc?.prevCount ? `（${tc.curCount} 人/上期 ${tc.prevCount} 人）` : '';
+    if (tc && tc.curAvg !== undefined && tc.curAvg !== null && tc.prevAvg !== undefined && tc.prevAvg !== null && tc.prevCount) {
       const d = Math.round((tc.curAvg - tc.prevAvg) * 10) / 10;
-      return { text: `较上学期 ${deltaText(d, '分')}`, cls: d >= 0 ? 'up' : 'down' };
+      return { text: `较上学期 ${deltaText(d, '分')}${cnt}`, cls: d >= 0 ? 'up' : 'down' };
     }
     return { text: `较上期 ${deltaText(s.avgScoreDelta, '分')}`, cls: (s.avgScoreDelta ?? 0) >= 0 ? 'up' : 'down' };
   }
   if (card.key === 'pass') {
     // 选中学期且有上一学期数据 ⇒ 显示学期环比（④）；否则回落到自然月环比
     const tc = data.value?.termCompare;
-    if (tc && tc.prevPass !== undefined && tc.prevPass !== null && tc.curPass !== undefined && tc.curPass !== null) {
+    const cnt = tc?.curCount !== undefined && tc?.curCount !== null && tc?.prevCount ? `（${tc.curCount} 人/上期 ${tc.prevCount} 人）` : '';
+    if (tc && tc.prevPass !== undefined && tc.prevPass !== null && tc.curPass !== undefined && tc.curPass !== null && tc.prevCount) {
       const d = Math.round((tc.curPass - tc.prevPass) * 10) / 10;
-      return { text: `较上学期 ${deltaText(d, '%')}`, cls: d >= 0 ? 'up' : 'down' };
+      return { text: `较上学期 ${deltaText(d, '%')}${cnt}`, cls: d >= 0 ? 'up' : 'down' };
     }
     return { text: `较上期 ${deltaText(s.passRateDelta, '%')}`, cls: s.passRateDelta >= 0 ? 'up' : 'down' };
   }
   if (card.key === 'live') return { text: loadedAt.value ? `${loadedAt.value} 拉取` : '当次拉取', cls: 'up' };
-  return { text: `较上期 ${deltaText(s.alertDelta)}`, cls: s.alertDelta <= 0 ? 'up' : 'down' };
+  /* 卡片显示的是「去重学生数」，而 `summary.alertDelta` 的单位后端没声明过（api-docs 无描述；实测 alertCount=9 / alertStudents=4 / alertDelta=-6，
+     「条数差」和「人数差」两种解释都自洽）⇒ 单位确认前不显示这条涨跌：「较上期 −6」挂在 4 人旁边一定会被读成「少 6 人」，那是假话。
+     已派后端（1026-派后端 N5-1）定单位；答复后按「条 / 人」写明再恢复本行。 */
+  return null;
 }
 /** 卡区脚注：百分比要有分母，否则 82.4% 说不出是「多少门课、多少学生」里的 82.4% */
 const coverage = computed(() => {
@@ -229,7 +237,7 @@ const courseRanks = computed(() => data.value?.courseRankings ?? []);
 
 /* ---------- 预警闭环（⑤）：标记已处理 + 填写处理备注 ---------- */
 const handling = ref(false);
-async function onHandleAlert(a: { alertId?: number; student?: string; course?: string }) {
+async function onHandleAlert(a: { alertId?: string | number; student?: string; course?: string }) {
   if (handling.value || !a.alertId) return;
   let note = '';
   try {
@@ -384,6 +392,16 @@ const sortedAlerts = computed<AnalyticsAlert[]>(() => {
   }
   return [...rows].sort((a, b) => levelRank(b.level) - levelRank(a.level) || (a.score ?? 999) - (b.score ?? 999));
 });
+/** 名单当前页签里按姓名去重的学生数（用于在同一页签内把「行 / 人」说清） */
+const alertRowStudents = computed(() => new Set(sortedAlerts.value.map(a => String(a.student ?? ''))).size);
+/** 实测：summary.alertStudents / alertCount / alertDelta 恒为「待处理」口径，切到「已处理」页签时不随表变
+ *  （`count(distinct student_id where status='open')`）⇒ 文案必须按页签分开写，否则会把两个集合当成同一集合对照 */
+const alertCardTitle = computed(() => alertStatus.value === 'open'
+  ? '待处理口径的去重学生数（后端 summary.alertStudents）：同一学生命中多条预警只计 1 人，所以它小于名单行数'
+  : '这张卡始终是「待处理」口径的学生数，不随「已处理」页签变化；下方名单是已处理记录，两个集合不同，不能相减比对');
+const alertCaliberNote = computed(() => alertStatus.value === 'open'
+  ? `本表一行 = 一条待处理预警（现 ${sortedAlerts.value.length} 行，涉及 ${alertRowStudents.value} 名学生）；上方卡片按学生去重，两者不等不是数据错。名单不受 page/pageSize 影响，后端上限 200 条、超出静默截断且无 total。`
+  : `本表一行 = 一条已处理预警（现 ${sortedAlerts.value.length} 行，涉及 ${alertRowStudents.value} 名学生）；上方「预警学生」仍是待处理口径（${data.value?.summary?.alertStudents ?? '—'} 人），与本页签不是同一集合。名单不受 page/pageSize 影响，后端上限 200 条、超出静默截断且无 total。`);
 const alertSortHint = computed(() =>
   alertStatus.value === 'closed' ? '按处理时间最新在前' : '按等级高→低、同级按当前分低→高'
 );
@@ -412,7 +430,7 @@ function buildCsv(): string {
   out.push(csvRow(['数据拉取时刻', loadedAt.value || '—']));
   out.push(csvRow([]));
   out.push(csvRow(['总览']));
-  out.push(csvRow(['平均分', noScoreSample.value ? '—' : num(s?.avgScore), '及格率', noScoreSample.value ? '—' : num(s?.passRate, '%'), '当前上课课堂', s?.liveClassCount, '预警学生', s?.alertCount]));
+  out.push(csvRow(['平均分', noScoreSample.value ? '—' : num(s?.avgScore), '及格率', noScoreSample.value ? '—' : num(s?.passRate, '%'), '当前上课课堂', s?.liveClassCount, '预警学生', s?.alertStudents]));
   out.push(csvRow(['课程数', s?.courseCount, '教师数', s?.teacherCount, '学生数', s?.studentCount, '已批改成绩', distTotal.value]));
   out.push(csvRow([]));
   out.push(csvRow(['课程分类统计']));
@@ -494,11 +512,11 @@ onMounted(async () => {
       <el-select v-model="filters.termId" class="f-sel" placeholder="学期" filterable>
         <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="String(t.termId)" />
       </el-select>
-      <el-select v-model="filters.deptId" class="f-sel" placeholder="全部院系" clearable filterable title="按任课教师所属院系筛选（sys_dept），不是学生院系；该口径以后端 10-27 确认为准">
+      <el-select v-model="filters.deptId" class="f-sel" placeholder="全部院系" clearable filterable title="按任课教师所属院系筛选（sys_dept），不是学生院系；口径 10-26 已与后端确认">
         <el-option v-for="d in depts" :key="d.deptId" :label="d.name" :value="String(d.deptId)" />
       </el-select>
       <!-- 专业：与智能排课页同维度；course.major 是文本列，按专业名过滤 -->
-      <el-select v-model="filters.major" class="f-sel" placeholder="全部专业" clearable filterable>
+      <el-select v-model="filters.major" class="f-sel" placeholder="全部专业" clearable filterable title="按课程所属专业过滤；演示库当前没有课程-专业关联数据，选中后各块为空（不是接口故障）">
         <el-option v-for="m in majors" :key="m" :label="m" :value="m" />
       </el-select>
       <!-- 课程：需求文档（三级功能清单+原型）的第三维；按 course.course_id 过滤 -->
@@ -518,7 +536,7 @@ onMounted(async () => {
           <div
             class="num"
             :style="c.key === 'live' ? 'color:var(--brand-600)' : ''"
-            :title="c.key === 'alert' ? '去重后的学生人数（后端 summary.alertStudents）—— 不等于下方预警名单的行数：同一学生可同时命中多条预警' : ''"
+            :title="c.key === 'alert' ? alertCardTitle : ''"
           >
             {{
               c.key === 'avg'
@@ -593,7 +611,7 @@ onMounted(async () => {
               </div>
             </template>
           </div>
-          <div v-if="data.deptPassRates?.length" class="caliber small muted">院系列 = 任课教师所属院系（口径待后端 10-27 确认）；条长 = 及格率；份数 &lt;{{ SMALL_N }} 的行标<span class="cnt-warn">橙色的份数</span>并降条不透明度。</div>
+          <div v-if="data.deptPassRates?.length" class="caliber small muted">院系列 = 任课教师所属院系（非学生院系）；条长 = 及格率；份数 &lt;{{ SMALL_N }} 的行标<span class="cnt-warn">橙色的份数</span>并降条不透明度。</div>
         </div>
       </div>
 
@@ -648,7 +666,7 @@ onMounted(async () => {
         <div v-if="teacherRanks.length" class="tbl-wrap">
         <table class="tbl">
           <thead>
-            <tr><th>#</th><th>教师</th><th title="任课教师所属院系（待后端确认口径）">院系</th><th>课程数</th><th>批改份数</th><th>平均分</th><th>及格率</th></tr>
+            <tr><th>#</th><th>教师</th><th title="任课教师所属院系（非学生院系）">院系</th><th>课程数</th><th>批改份数</th><th>平均分</th><th>及格率</th></tr>
           </thead>
           <tbody>
             <tr v-for="(t, i) in teacherRanks" :key="t.teacherId">
@@ -686,10 +704,10 @@ onMounted(async () => {
         <table class="tbl">
           <thead>
             <tr v-if="prepDim === 'dept'">
-              <th>#</th><th title="任课教师所属院系（待后端确认口径）">院系</th><th>课程数</th><th>教师数</th><th>备课进度</th><th>实验进度</th><th>滞后课程</th><th>状态</th>
+              <th>#</th><th title="任课教师所属院系（非学生院系）">院系</th><th>课程数</th><th>教师数</th><th>备课进度</th><th>实验进度</th><th>滞后课程</th><th>状态</th>
             </tr>
             <tr v-else>
-              <th>#</th><th>课程</th><th title="任课教师所属院系（待后端确认口径）">院系</th><th>任课教师</th><th>备课进度</th><th>实验进度</th><th>状态</th>
+              <th>#</th><th>课程</th><th title="任课教师所属院系（非学生院系）">院系</th><th>任课教师</th><th>备课进度</th><th>实验进度</th><th>状态</th>
             </tr>
           </thead>
           <tbody>
@@ -868,7 +886,7 @@ onMounted(async () => {
         <table class="tbl">
           <thead>
             <tr>
-              <th>#</th><th>学生</th><th>课程</th><th title="任课教师所属院系（待后端确认口径）">院系</th><th>类型</th><th>当前分</th><th>等级</th>
+              <th>#</th><th>学生</th><th>课程</th><th title="任课教师所属院系（非学生院系）">院系</th><th>类型</th><th>当前分</th><th>等级</th>
               <th>{{ alertStatus === 'open' ? '操作' : '处理时间' }}</th>
               <th v-if="alertStatus === 'closed'">处理备注</th>
             </tr>
@@ -900,6 +918,8 @@ onMounted(async () => {
           <p class="empty-main">{{ alertStatus === 'open' ? '当前筛选范围内没有触发预警的学生' : '还没有已处理的预警记录' }}</p>
           <p class="small muted">{{ alertStatus === 'open' ? '低分、成绩退步、连续未提交的学生会自动出现在这里' : '在「待处理」里点击「标记已处理」后，记录会留痕在这里' }}</p>
         </div>
+        <!-- 编号 51/15 的屏上交代：卡片是「人」，名单是「条」；名单不分页、有 200 条静默截断上限。放在表格之后，与本页其它 .caliber 同位（放表头与表之间会把 card-head 间距顶成 26px） -->
+        <div v-if="sortedAlerts.length" class="caliber small muted">{{ alertCaliberNote }}</div>
       </div>
     </template>
 

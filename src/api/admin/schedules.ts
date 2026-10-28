@@ -22,6 +22,27 @@ import type {
  */
 const SUCCESS = new Set([0, 200]);
 
+/**
+ * 19 位雪花 id 出站一律原样透传，不许经 `Number()`：后端逐字段 `@JsonFormat(shape=STRING)`（实测响应体
+ * `scheduleId`/`courseId`/`teacherId` 带引号 15 / 裸数字 0），入站是 `Long`，收带引号字符串。
+ * ★ 契约里 `courseId/teacherId/classroomId` 仍声明 number（`src/types/admin.ts` 归综合线，编号 66 转 string），
+ *   所以这里只在**接口层**加宽，避免共享工作区在类型翻转前先红。综合线落地后这段别名即可删除。
+ */
+type StringId = string | number;
+export type ScheduleCreateBody = Omit<ScheduleCreateBo, 'courseId' | 'teacherId' | 'classroomId'> & {
+  courseId: StringId;
+  teacherId: StringId;
+  classroomId?: StringId;
+};
+export type ScheduleUpdateBody = Omit<ScheduleUpdateBo, 'classroomId' | 'teacherId'> & {
+  classroomId?: StringId;
+  teacherId?: StringId;
+};
+export type ScheduleSwapBody = Omit<ScheduleSwapBo, 'fromScheduleId' | 'toScheduleId'> & {
+  fromScheduleId: StringId;
+  toScheduleId: StringId;
+};
+
 /** 探测某路径在后端是否存在（含业务报错 422/403 也算存在；只有「无此资源/静态资源」判不存在） */
 async function exists(base: string, probeParams: Record<string, unknown>): Promise<boolean> {
   try {
@@ -69,7 +90,7 @@ export async function listSchedules(query: ScheduleQuery) {
 }
 
 /** C-17 新建课次（带冲突检查）。★ 命中冲突时后端**不落库**，返回 conflict=true */
-export async function createSchedule(body: ScheduleCreateBo) {
+export async function createSchedule(body: ScheduleCreateBody) {
   return request<ScheduleCreateResult>({ url: await schedulePath(), method: 'post', data: body });
 }
 
@@ -78,7 +99,7 @@ export async function createSchedule(body: ScheduleCreateBo) {
  * ★ 教师/课程由后端从原记录继承；`classroomId` 不传则沿用原教室。
  * ★ 命中冲突时后端**不落库**，返回 conflict=true + conflictMsg。
  */
-export async function moveSchedule(scheduleId: number, body: ScheduleUpdateBo) {
+export async function moveSchedule(scheduleId: string | number, body: ScheduleUpdateBody) {
   return request<ScheduleCreateResult>({
     url: `${await schedulePath()}/${scheduleId}`,
     method: 'put',
@@ -91,7 +112,7 @@ export async function moveSchedule(scheduleId: number, body: ScheduleUpdateBo) {
  * ★ 只对调两节课的时间坐标；课程/教师/教室跟着各自课次走。
  * ★ 任一方在新位置与第三节课冲突则后端**整体不写**，返回 conflict=true。
  */
-export async function swapSchedules(body: ScheduleSwapBo) {
+export async function swapSchedules(body: ScheduleSwapBody) {
   return request<ScheduleCreateResult>({
     url: `${await schedulePath()}/swap`,
     method: 'put',
@@ -100,7 +121,7 @@ export async function swapSchedules(body: ScheduleSwapBo) {
 }
 
 /** C-22 放回待排：软删课次，课程随「本周未出现」口径自动回到待排池 */
-export async function deleteSchedule(scheduleId: number) {
+export async function deleteSchedule(scheduleId: string | number) {
   return request<{ removed: boolean }>({
     url: `${await schedulePath()}/${scheduleId}`,
     method: 'delete'
