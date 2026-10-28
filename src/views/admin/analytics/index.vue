@@ -131,11 +131,22 @@ const deltaText = (d: number | undefined | null, suffix = '') =>
   d === undefined || d === null
     ? ''
     : `${d > 0 ? '▲+' : d < 0 ? '▼' : '±'}${Math.round(Math.abs(d) * 10) / 10}${suffix}`;
-/** 预警数减少是好事 ⇒ 颜色反向（down 绿 / up 红） */
+/**
+ * 预警涨跌的配色方向。
+ * 本仓 theme.css 的 `.stat .up{color:var(--success-strong)}` / `.stat .down{color:var(--error-strong)}`
+ * 是「up=绿、down=红」，即颜色本身只表示好坏，不表示数值正负。
+ * 平均分/及格率：涨是好事 ⇒ d≥0 用 up(绿)，与数值方向一致。
+ * 预警：减少才是好事 ⇒ d≤0 用 up(绿)，与数值方向相反。
+ * ⚠️ 此处注释曾写成「颜色反向（down 绿 / up 红）」，与 theme.css 实际相反，
+ *    照那句实现会让「预警下降 6 条」显示成红色（读成坏事），已更正。
+ */
+function alertTrendCls(d: number): string {
+  return d <= 0 ? 'up' : 'down';
+}
 function trendOf(card: StatCard): { text: string; cls: string } | null {
   const s = data.value?.summary;
   if (!s) return null;
-  // 无样本时不显示「较上期 ±0分」——分母都不存在，涨跌是假的
+  // 无样本时不显示「本月较上月 ±0分」——分母都不存在，涨跌是假的
   if (noScoreSample.value && (card.key === 'avg' || card.key === 'pass')) return null;
   if (card.key === 'avg') {
     const tc = data.value?.termCompare;
@@ -145,7 +156,10 @@ function trendOf(card: StatCard): { text: string; cls: string } | null {
       const d = Math.round((tc.curAvg - tc.prevAvg) * 10) / 10;
       return { text: `较上学期 ${deltaText(d, '分')}${cnt}`, cls: d >= 0 ? 'up' : 'down' };
     }
-    return { text: `较上期 ${deltaText(s.avgScoreDelta, '分')}`, cls: (s.avgScoreDelta ?? 0) >= 0 ? 'up' : 'down' };
+    // 回落到自然月环比：后端 avgScoreDelta/passRateDelta 恒为「本自然月 − 上一自然月」
+    // （AdminStatsServiceImpl.java:153-158 的 firstOfMonth 起算）。这里若写「较上期」，
+    // 在上一学期无数据（prevCount=0）时会与「较上学期」混淆 ⇒ 明确写成「本月较上月」。
+    return { text: `本月较上月 ${deltaText(s.avgScoreDelta, '分')}`, cls: (s.avgScoreDelta ?? 0) >= 0 ? 'up' : 'down' };
   }
   if (card.key === 'pass') {
     // 选中学期且有上一学期数据 ⇒ 显示学期环比（④）；否则回落到自然月环比
@@ -155,12 +169,21 @@ function trendOf(card: StatCard): { text: string; cls: string } | null {
       const d = Math.round((tc.curPass - tc.prevPass) * 10) / 10;
       return { text: `较上学期 ${deltaText(d, '%')}${cnt}`, cls: d >= 0 ? 'up' : 'down' };
     }
-    return { text: `较上期 ${deltaText(s.passRateDelta, '%')}`, cls: s.passRateDelta >= 0 ? 'up' : 'down' };
+    return { text: `本月较上月 ${deltaText(s.passRateDelta, '%')}`, cls: s.passRateDelta >= 0 ? 'up' : 'down' };
   }
   if (card.key === 'live') return { text: loadedAt.value ? `${loadedAt.value} 拉取` : '当次拉取', cls: 'up' };
-  /* 卡片显示的是「去重学生数」，而 `summary.alertDelta` 的单位后端没声明过（api-docs 无描述；实测 alertCount=9 / alertStudents=4 / alertDelta=-6，
-     「条数差」和「人数差」两种解释都自洽）⇒ 单位确认前不显示这条涨跌：「较上期 −6」挂在 4 人旁边一定会被读成「少 6 人」，那是假话。
-     已派后端（1026-派后端 N5-1）定单位；答复后按「条 / 人」写明再恢复本行。 */
+  /* 预警涨跌：单位已定论为「条」，不再是「条数差 or 人数差都说得通」的悬案。
+     依据①后端源码 AdminStatsServiceImpl.java:176-181：alertDelta = cur_new − prev_new；
+          AdminStatsMapper.xml:306-313：cur_new/prev_new 都是 sum(case ... then 1 else 0) ⇒ 数的是行数（条）。
+     依据②库内实测：2026-10 新增 3 条、2026-09 新增 9 条 ⇒ 3−9 = −6，与接口返回的 alertDelta=−6 一致；
+          若按人数差则是 3−4 = −1，对不上 ⇒ 排除人数解释。
+     文案主体必须写「本月新增」：本卡数字是「4 名待处理学生」，直接挂「−6」会被读成「少了 6 人」。
+     时间窗是自然月（后端 firstOfMonth 起算），与上方「较上学期」不是同一维度，故写明「本月」。 */
+  if (card.key === 'alert') {
+    const d = s.alertDelta;
+    if (d === undefined || d === null) return null;
+    return { text: `本月新增较上月 ${deltaText(d, ' 条')}`, cls: alertTrendCls(d) };
+  }
   return null;
 }
 /** 卡区脚注：百分比要有分母，否则 82.4% 说不出是「多少门课、多少学生」里的 82.4% */
@@ -515,8 +538,11 @@ onMounted(async () => {
       <el-select v-model="filters.deptId" class="f-sel" placeholder="全部院系" clearable filterable title="按任课教师所属院系筛选（sys_dept），不是学生院系；口径 10-26 已与后端确认">
         <el-option v-for="d in depts" :key="d.deptId" :label="d.name" :value="String(d.deptId)" />
       </el-select>
-      <!-- 专业：与智能排课页同维度；course.major 是文本列，按专业名过滤 -->
-      <el-select v-model="filters.major" class="f-sel" placeholder="全部专业" clearable filterable title="按课程所属专业过滤；演示库当前没有课程-专业关联数据，选中后各块为空（不是接口故障）">
+      <!-- 专业：与智能排课页同维度；course.major 是文本列，按专业名过滤
+           10-28 更正：原 title 写「演示库当前没有课程-专业关联数据，选中后各块为空」已失实
+           （10-20 补种 major 后 course.major 已有值：全部学期下「计算机科学与技术」命中 7 门课 / 64 份已批改成绩）。
+           这里只写机制、不写具体门数与份数 —— 数字会随补种与学期筛选漂移，写死一次就等着下次失实。 -->
+      <el-select v-model="filters.major" class="f-sel" placeholder="全部专业" clearable filterable title="按课程的专业（course.major 文本列）过滤；演示库已有课程关联到专业，选中后各块正常出数">
         <el-option v-for="m in majors" :key="m" :label="m" :value="m" />
       </el-select>
       <!-- 课程：需求文档（三级功能清单+原型）的第三维；按 course.course_id 过滤 -->
