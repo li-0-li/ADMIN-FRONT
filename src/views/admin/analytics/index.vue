@@ -438,7 +438,19 @@ const trendPts = computed(() => {
 
 /* ---------- 实验完成率环形 ---------- */
 const RING_C = 314;
-const ringOffset = computed(() => RING_C * (1 - Math.min(100, Math.max(0, data.value?.experimentRate ?? 0)) / 100));
+/**
+ * 接口 experimentRate 可能为 **null**（没有任何可算的样本），也可能为 **0**（后端算出真的是 0）。
+ * 两者是不同事实，绝不能都画成 0%：null「没有数据」，0「有任务但无人提交」。
+ * 2026-10-29 实测：mock 返回 null 时圈里写的是「0%」（原写法 `?? 0` 把 null 吞成 0）。
+ */
+const expRate = computed<number | null>(() => {
+  const v = data.value?.experimentRate;
+  return v === null || v === undefined ? null : Number(v);
+});
+/** null 时 offset 取满圈值 = 不画进度弧（不假装 0%） */
+const ringOffset = computed(() => (expRate.value === null
+  ? RING_C
+  : RING_C * (1 - Math.min(100, Math.max(0, expRate.value)) / 100)));
 
 /* ---------- 预警等级 → badge ---------- */
 /**
@@ -1008,15 +1020,19 @@ onMounted(async () => {
                 :stroke-dasharray="RING_C" :stroke-dashoffset="ringOffset" transform="rotate(-90 60 60)"
               />
               <text x="60" y="66" text-anchor="middle" font-size="20" font-weight="800" fill="#0f172a">
-                {{ data.experimentRate ?? 0 }}%
+                {{ expRate === null ? '—' : `${expRate}%` }}
               </text>
             </svg>
           </div>
           <!-- 后端 experimentRate = published<=0 ? 0 : done/published*100（AdminStatsServiceImpl.java:211-216），
                且出参不带 published 数 ⇒ 前端分不出「没有已发布实验任务」与「有任务但无人提交」，
-               两者都渲染成 0%。不补假数据，改成把这条限制写在环下面。 -->
-          <p v-if="!data.experimentRate" class="small muted" style="text-align: center; margin-top: 4px">
+               两者都渲染成 0%。不补假数据，改成把这条限制写在环下面。
+               2026-10-29 补：接口给 null（无任何样本）时环内显示「—」，只有后端真算出 0 才显示 0%。 -->
+          <p v-if="expRate === 0" class="small muted" style="text-align: center; margin-top: 4px">
             0% 无法区分「本学期没有已发布实验任务」与「有任务但无人提交」
+          </p>
+          <p v-else-if="expRate === null" class="small muted" style="text-align: center; margin-top: 4px">
+            暂无实验任务数据（接口未返回完成率）
           </p>
         </div>
       </div>
