@@ -1709,17 +1709,27 @@ const classListOptions = computed(() => {
 });
 const detailSaving = ref(false);
 
+/** 详情弹窗教师（2026-10-29 锁只读，同新增弹门口径）：教师 = 课程的授课教师（提交三重认证的老师），弹窗内不可改。
+ *  课程池查不到该课程时回退课次自带的教师信息，保证展示不空。
+ *  失效条件：产品将来允许「代课 / 换教师」场景 ⇒ 这里恢复下拉，并同步放开下方 dirty 判定与保存 BO。 */
+const detailTeacher = computed(() => {
+  const c = detailCell.value;
+  if (!c) return null;
+  const fromCourse = courseById.value.get(String(c.courseId));
+  const tid = fromCourse?.teacherId ?? (c.teacherId === undefined || c.teacherId === null ? '' : String(c.teacherId));
+  const tname = fromCourse?.teacherName || c.teacherName || '';
+  return { id: tid, name: tname || (tid ? `教师 #${tid}` : '未指定教师') };
+});
+
 /** 与原值比对，没改就不让点保存（避免无意义写库） */
 const detailDirty = computed(() => {
   const c = detailCell.value;
   if (!c) return false;
   const cur = c.classroomId === undefined || c.classroomId === null ? '' : String(c.classroomId);
-  const curT = c.teacherId === undefined || c.teacherId === null ? '' : String(c.teacherId);
   return (
     editForm.classroomId !== cur ||
     editForm.remark !== (c.note ?? '') ||
-    editForm.clazzName !== (c.clazzName ?? '') ||
-    editForm.teacherId !== curT
+    editForm.clazzName !== (c.clazzName ?? '')
   );
 });
 
@@ -2992,14 +3002,12 @@ watch(
       </div>
       <div class="detail-row">
         <span class="detail-k">教师</span>
-        <el-select
-          v-model="editForm.teacherId"
-          placeholder="未指定教师"
-          filterable
-          style="flex: 1; min-width: 0"
-        >
-          <el-option v-for="o in teacherList" :key="o.value" :label="o.label" :value="o.value" />
-        </el-select>
+        <!-- 2026-10-29 只读化：教师 = 提交三重认证的老师（课程自带），同新增弹门口径，不可改 -->
+        <div v-if="detailTeacher" class="teacher-ro" style="flex: 1; min-width: 0">
+          {{ detailTeacher.name }}
+          <span class="small muted">提交三重认证的老师 · 不可改</span>
+        </div>
+        <div v-else class="small muted" style="flex: 1">未指定教师</div>
       </div>
       <div class="detail-row">
         <span class="detail-k">教室</span>
