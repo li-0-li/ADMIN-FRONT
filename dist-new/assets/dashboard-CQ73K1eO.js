@@ -1,0 +1,1 @@
+import{r as e}from"./request-Ch3vevks.js";function t(){return e({url:`/api/v1/admin/dashboard/summary`,method:`get`})}function n(t={}){return e({url:`/api/v1/admin/courses`,method:`get`,params:{page:1,pageSize:5,...t}})}export{n,t};
