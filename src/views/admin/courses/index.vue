@@ -365,11 +365,12 @@ onMounted(async () => {
         <el-option label="已排课" value="scheduled" />
         <el-option label="未排课" value="unscheduled" />
       </el-select>
-      <el-button type="primary" @click="onSearch">
+      <el-button type="primary" class="tb-btn tb-btn-main" @click="onSearch">
         <ZkIcon name="search" :size="15" style="margin-right: 4px" />搜索
       </el-button>
-      <!-- 与搜索同款式按钮（改前是 text 按钮，无边框、高度与主按钮不一致，视觉上像贴上去的一行字） -->
-      <el-button @click="resetQuery">
+      <!-- 重置：与搜索同高同宽同圆角。Element Plus 会给相邻 el-button 加 margin-left:12px，
+           和 .right 的 gap:10px 叠加后两者间距变成 22px（其它控件只有 10px），已在样式里清零 -->
+      <el-button class="tb-btn tb-btn-reset" @click="resetQuery">
         <ZkIcon name="refresh-cw" :size="15" style="margin-right: 4px" />重置
       </el-button>
     </div>
@@ -583,6 +584,31 @@ onMounted(async () => {
   display: flex;
   gap: 8px;
   margin-top: 10px;
+}
+/* 筛选区按钮组（10-29 业主反馈：搜索与重置间隔过大、大小不一样）
+   1) 间隔：Element Plus 对相邻 el-button 默认 margin-left:12px，与 .right 的 gap:10px
+      叠加成 22px，而其它控件之间只有 10px ⇒ 归零，整行间距统一 10px。
+   2) 大小：两个按钮实测都是 78×32，但默认按钮边框是浅灰（#dcdfe6），
+      衬得它比实心主按钮"窄一圈"。统一 min-width/height，并给重置更实的描边。 */
+.toolbar :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+.toolbar :deep(.tb-btn) {
+  min-width: 78px;
+  height: 32px;
+  padding: 0 15px;
+  border-radius: var(--r-md, 8px);
+  font-size: 14px;
+  box-sizing: border-box;
+}
+.toolbar :deep(.tb-btn-reset) {
+  border-color: var(--border-strong, #cbd5e1);
+  color: var(--ink-700, #3a4256);
+}
+.toolbar :deep(.tb-btn-reset:hover) {
+  border-color: var(--brand-400, #7aa7f8);
+  color: var(--brand-600, #2563eb);
+  background: var(--brand-50, #eff6ff);
 }
 /* 操作列两个文字按钮必须同排。列收窄后（1280 下要腾出排课列的位置）
    默认 white-space:normal 会把「删除」挤到第二行，行高直接翻倍。 */
