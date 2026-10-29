@@ -102,14 +102,17 @@ function sortRows(list: CertReviewItem[]): CertReviewItem[] {
 async function fetchList() {
   loading.value = true;
   try {
-    // 全量拉回（演示库量级小）：搜索态按课程名/教师名过滤；列表态按「需人工审核置顶」排序
+    /**
+     * ★ 2026-10-29 起本页只是「待审队列」：通过的课程移到「课程总览」，驳回的退出队列。
+     * 所以只查 status=pending（后端语义 = status in ('pending','reviewing')），
+     * 一次请求同时得到列表与计数，不再拉全量再前端过滤。
+     * 历史原因留档：改前是「全量 500 条 + 单独查 pending 计数」，通过/驳回后就地改行状态、
+     * 已裁决的行沉底留在列表里——那种做法与"通过后移走"的需求冲突。
+     */
     const kw = keyword.value.trim();
-    const [all, pending] = await Promise.all([
-      listCertifications({ page: 1, pageSize: 500 }),
-      // 顶部「N 门待审核」计数：后端 status=pending 时只取 status in ('pending','reviewing')
-      listCertifications({ status: 'pending', page: 1, pageSize: 1 })
-    ]);
-    let list = all?.list ?? [];
+    const res = await listCertifications({ status: 'pending', page: 1, pageSize: 500 });
+    let list = res?.list ?? [];
+    const allTotal = res?.total ?? list.length;
     if (kw) {
       const k = kw.toLowerCase();
       list = list.filter(
@@ -117,7 +120,7 @@ async function fetchList() {
           (r.courseName ?? '').toLowerCase().includes(k) ||
           (r.teacherName ?? '').toLowerCase().includes(k)
       );
-      filteredNote.value = `按「${kw}」过滤：${list.length} / ${all?.total ?? 0} 条`;
+      filteredNote.value = `按「${kw}」过滤：${list.length} / ${allTotal} 条`;
     } else {
       filteredNote.value = '';
     }
@@ -126,7 +129,7 @@ async function fetchList() {
     // 本地分页：与底部 mini-pager 共用 query.page/pageSize
     const start = (query.page - 1) * query.pageSize;
     rows.value = list.slice(start, start + query.pageSize);
-    pendingTotal.value = pending?.total ?? 0;
+    pendingTotal.value = allTotal;
   } finally {
     loading.value = false;
   }
@@ -204,74 +207,21 @@ async function submitReview(action: 'approve' | 'reject') {
     });
     ElMessage.success(
       action === 'approve'
-        ? `已通过：课程「${row.courseName}」`
-        : `已驳回：课程「${row.courseName}」`
+        ? `已通过：课程「${row.courseName}」已移入「课程总览」`
+        : `已驳回：课程「${row.courseName}」已退出待审队列`
     );
     rejectReason.value = '';
     /**
-     * 就地更新该行状态：不重查列表 → 不重算排序，行位置保持不动；
-     * 点顶部「刷新」按钮才全量重查（排序生效，已裁决课程沉底）。
+     * ★ 裁决后直接从队列里移除（改前是就地改 certStatus 让已裁决行沉底）。
+     * 现在本页只承载待审，留着已裁决的行就与"通过后移走"的需求相矛盾；
+     * 详情面板同步关闭——它展示的对象已经不在列表里了，继续开着会让人以为还能再操作。
      */
     const i = rows.value.findIndex((r) => r.certId === row.certId);
-    if (i >= 0) {
-      const wasPending = !isDecided(rows.value[i].certStatus);
-      rows.value[i] = {
-        ...rows.value[i],
-        certStatus: action === 'approve' ? 'approved' : 'rejected'
-      };
-      if (wasPending) pendingTotal.value = Math.max(0, pendingTotal.value - 1);
-    }
-    await openReview(row);
-  } finally {
-    submitting.value = false;
-  }
-}
-
-/**
- * 重新驳回：针对**已通过**的课程。双重确认——
- *   第 1 步 ElMessageBox.prompt 填驳回原因（必填校验）；
- *   第 2 步 ElMessageBox.confirm 明确告知后果（退回「认证中」、收回已解锁备课）。
- * 后端 C-15 不校验当前状态可直接驳回；reject 分支会把 course.status 从 active
- * 回退为 certifying（10-16 补丁），课程列表 / 教师备课侧数据同步。
- */
-async function reReject() {
-  const row = current.value;
-  if (!row) return;
-  let reason = '';
-  try {
-    const { value } = await ElMessageBox.prompt(
-      '将驳回该课程全部三项认证，教师需修改后重新提审。请输入驳回原因：',
-      '重新驳回',
-      {
-        confirmButtonText: '下一步',
-        cancelButtonText: '取消',
-        inputPlaceholder: '驳回原因（必填）',
-        inputValidator: (v: string) => (v && v.trim().length > 0 ? true : '驳回原因不能为空')
-      }
-    );
-    reason = value.trim();
-  } catch {
-    return; // 用户取消
-  }
-  try {
-    await ElMessageBox.confirm(
-      `最终确认：课程「${row.courseName}」将退回「认证中」，已解锁的备课同步收回。确定执行？`,
-      '最终确认',
-      { type: 'warning', confirmButtonText: '确认驳回', cancelButtonText: '再想想' }
-    );
-  } catch {
-    return; // 用户取消
-  }
-  submitting.value = true;
-  try {
-    await reviewCertification(row.certId, { action: 'reject', rejectReason: reason });
-    ElMessage.success(`已重新驳回：课程「${row.courseName}」已退回「认证中」`);
-    // 就地更新（同 submitReview）：不重查列表，行位置不动；点「刷新」才全量重查
-    const i = rows.value.findIndex((r) => r.certId === row.certId);
-    if (i >= 0) {
-      rows.value[i] = { ...rows.value[i], certStatus: 'rejected' };
-    }
-    await openReview(row);
+    if (i >= 0) rows.value.splice(i, 1);
+    total.value = Math.max(0, total.value - 1);
+    pendingTotal.value = Math.max(0, pendingTotal.value - 1);
+    current.value = null;
+    detail.value = null;
   } finally {
     submitting.value = false;
   }
@@ -284,6 +234,7 @@ onMounted(fetchList);
   <div class="page-head">
     <h1>课程审核</h1>
     <div class="actions">
+      <span class="small muted">本页只列待审课程；通过后自动移入「课程总览」</span>
       <span class="badge" :class="pendingTotal > 0 ? 'badge-error' : 'badge-neutral'">
         {{ pendingTotal }} 门待审核
       </span>
@@ -352,7 +303,9 @@ onMounted(fetchList);
         <tr v-if="!loading && rows.length === 0">
           <td colspan="6">
             <div class="muted small" style="padding: 22px 0; text-align: center">
-              {{ filteredNote ? '无匹配结果，试试其他关键字或清空搜索' : '暂无认证数据' }}
+              <!-- 只查 pending 之后，空表有两种含义必须分开说：
+                   有关键词时是"没匹配到"，没关键词时是"队列真的空了"——后者要告诉人去哪看已通过的 -->
+              {{ filteredNote ? '无匹配结果，试试其他关键字或清空搜索' : '当前没有待审课程；已通过的课程请到「课程总览」查看。' }}
             </div>
           </td>
         </tr>
@@ -443,23 +396,12 @@ onMounted(fetchList);
         </button>
       </div>
     </template>
-    <!-- 已通过 → 可重新驳回（双重确认）；已驳回 → 只读 -->
-    <div v-else-if="activeCertStatus === 'approved'" class="m-card mt16" style="background: var(--warning-soft); border-color: var(--warning-soft)">
-      <div class="row" style="align-items: flex-start">
-        <span class="icon-box"><ZkIcon name="alert-triangle" :size="18" /></span>
-        <div>
-          <div style="font-weight: 600">该课程已通过审核</div>
-          <div class="small" style="color: var(--ink-600); margin-top: 4px">
-            如需撤销，可重新驳回：课程将退回「认证中」，已解锁的备课同步收回。
-          </div>
-        </div>
-        <button class="btn btn-outline" style="margin-left: auto" :disabled="submitting" @click="reReject">
-          重新驳回
-        </button>
-      </div>
-    </div>
+    <!-- 已裁决的课程不再留在本页（通过的移入课程总览、驳回的退出队列）。
+         这段是防御分支：万一旧数据或并发让已裁决行短暂可见，给出去哪继续操作的指引，
+         而不是像改前那样在这里提供「重新驳回」——那个能力已随课程移交给「课程总览」。 -->
     <div v-else class="muted small mt16">
-      该课程已完成审核（{{ certStatusOf(activeCertStatus).label }}），不可重复裁决。
+      该课程已完成审核（{{ certStatusOf(activeCertStatus).label }}），不在待审队列中。
+      <span class="link" @click="$router.push('/admin/courses')">已通过的课程请到「课程总览」查看与撤销</span>。
     </div>
   </div>
 
