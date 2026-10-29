@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "description": "智课平台 · 管理端前端（全新最小工程，Vite + Vue3 + TS）",
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
