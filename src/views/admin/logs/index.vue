@@ -129,7 +129,7 @@
               <td class="content-cell">{{ contentText(r) || '—' }}</td>
               <!-- IP 不做成可点：后端操作日志分支没有 IP 入参，点了只能前端过滤，
                    「共 N 条」会与真实总数对不上，比不能点更误导 -->
-              <td class="small muted" :title="locTitle(r)">{{ r.operIp || '—' }} · {{ locText(r) }}</td>
+              <td class="small muted">{{ r.operIp || '—' }} · {{ locText(r) }}</td>
             </template>
 
             <template v-else>
@@ -151,7 +151,7 @@
                 >{{ r.operIp }}</button>
                 <span v-else>—</span>
               </td>
-              <td class="small muted" :title="locTitle(r)">{{ locText(r) }}</td>
+              <td class="small muted">{{ locText(r) }}</td>
             </template>
 
             <td>
@@ -171,7 +171,7 @@
         <span class="empty-icon err"><ZkIcon name="alert-triangle" :size="22" /></span>
         <p class="empty-main">日志读取失败</p>
         <p class="small muted">{{ loadError }}</p>
-        <p class="small muted">若反复失败，先确认后端 8080 与数据库隧道 3307 是否都在跑，再点下方重试。</p>
+        <p class="small muted">若反复失败，请点下方重试；仍未恢复请联系系统管理员。</p>
         <button class="btn btn-outline" style="margin-top: 10px" @click="load">
           <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />重试
         </button>
@@ -198,19 +198,21 @@
     </div>
   </div>
 
-  <!-- 口径说明：讲清哪些列是真数据、哪些原型列后端没有，避免验收时被当成缺功能。
-       失败态下整段隐藏：此时表格没有行，解释「这些列怎么来的」没有意义，
-       而且原先那句会写成「共 0 条（以上为失败前数据）」——数据已被清空，那句话自相矛盾。 -->
+  <!-- 屏上只留对使用者有用的信息（总条数 + 怎么用），不摆字段口径解释。
+       失败态下整段隐藏：此时表格没有行，而且「共 0 条（以上为失败前数据）」
+       会与上方「日志读取失败」自相矛盾（数据已被清空，没有失败前数据）。
+       下面三条理由保留在注释里，避免以后被当成漏做而「补」回界面：
+       1. 「操作内容」是模块名 + 操作类型 + 请求方式 + 请求地址拼成的，后端不存自然语言描述；
+       2. 「结果」只看 status（0 成功 / 非 0 失败），与 HTTP 状态码无关；
+       3. 登录日志没有角色、设备字段（出参只有账号/IP/归属地/时间/状态），所以不设这两列。 -->
   <p v-if="!loadError" class="caliber-line">
-    <b>口径：</b>
-    {{ tab === 'operation'
-      ? '「操作内容」由模块名 + 操作类型 + 请求方式 + 请求地址拼成（后端不存自然语言描述）；「结果」判据是 status=0，与 HTTP 状态码无关。'
-      : '原型里的「角色」「设备/客户端」两列后端无任何来源（登录日志出参只有账号/IP/归属地/时间/状态），故不展示，不做假列。' }}
-    共 {{ total }} 条。点任意一行可查看该条的全部字段；点操作人 / 模块名（或登录页签的账号、IP）可直接按它筛选。
+    共 {{ total }} 条。点任意一行可查看详情；点操作人、模块名（或登录页签的账号、IP）可直接按它筛选。
   </p>
 
   <!-- 行详情抽屉：对照 CloudTrail 事件详情（给出完整事件记录）与 GitHub 审核日志条目。
-       表格放不下的字段（完整 URL、日志 ID、status 原值）都在这里，不再只靠 title 属性。 -->
+       表格放不下的字段（日志 ID、完整请求地址、耗时等）都在这里，不再只靠 title 属性。
+       不展示后端字段原值（如 status 的数字、归属地的 `XX XX`）：那是开发者视角，
+       使用者只需要「成功 / 失败」和「有没有可用地名」。 -->
   <el-drawer :model-value="!!detail" title="日志详情" size="460px" @close="detail = null">
     <template v-if="detail">
       <dl class="kv">
@@ -244,20 +246,13 @@
         <dd class="mono">{{ detail.operIp || '—' }}</dd>
 
         <dt>归属地</dt>
-        <dd>
-          <template v-if="locText(detail) === '—'">
-            <span class="muted">—</span>
-            <span class="small muted">（后端原始值：{{ detail.operLocation || '空' }}）</span>
-          </template>
-          <template v-else>{{ locText(detail) }}</template>
-        </dd>
+        <dd>{{ locText(detail) }}</dd>
 
         <dt>结果</dt>
         <dd>
           <span class="badge" :class="detail.status === 0 ? 'badge-success' : 'badge-error'">
             {{ detail.status === 0 ? '成功' : '失败' }}
           </span>
-          <span class="small muted">status = {{ detail.status }}（0 为正常，非 0 为异常）</span>
         </dd>
       </dl>
 
@@ -503,18 +498,12 @@ function contentText(r: LogRowVo) {
 /**
  * 归属地显示：库里有一批 `XX XX`（实测登录日志 1095 条里 59 条），是若依 IP 库解析失败时
  * 落库的占位值，不是真实地名。直接显示等于把一坨脏数据摆给用户看（而且很长，会把列撑宽），
- * 所以屏上显示「—」，原始值放到 title 里说明 —— 既不美化数据，也不让人以为是页面没取到。
+ * 所以屏上显示「—」。不再用 title 解释原始值：那是给开发者看的，不是给使用者看的，
+ * 使用者只需要知道「这里没有可用的地名」。（同一原因，抽屉里也不显示原始值。）
  */
 function locText(r: LogRowVo) {
   const v = (r.operLocation || '').trim();
   if (!v || v === 'XX XX') return '—';
-  return v;
-}
-
-function locTitle(r: LogRowVo) {
-  const v = (r.operLocation || '').trim();
-  if (!v) return '后端未返回操作地点';
-  if (v === 'XX XX') return '后端存的原始值是「XX XX」，是 IP 归属地解析失败的占位值，不是真实地名';
   return v;
 }
 
