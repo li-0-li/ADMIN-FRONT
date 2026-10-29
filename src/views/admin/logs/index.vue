@@ -5,7 +5,7 @@
       <button
         class="btn btn-outline"
         :disabled="exporting"
-        title="按当前筛选条件导出 CSV（不是导出全部：先改筛选再导出）"
+        title="按当前筛选条件导出「全部匹配行」，不是只导当前页；单次上限 2000 条，超出时会明确提示只导出了前 2000 条"
         @click="onExport"
       >
         <ZkIcon name="download" :size="16" style="margin-right: 4px" />{{ exporting ? '导出中…' : '导出日志' }}
@@ -155,13 +155,15 @@
     </div>
   </div>
 
-  <!-- 口径说明：讲清哪些列是真数据、哪些原型列后端没有，避免验收时被当成缺功能 -->
-  <p class="caliber-line">
+  <!-- 口径说明：讲清哪些列是真数据、哪些原型列后端没有，避免验收时被当成缺功能。
+       失败态下整段隐藏：此时表格没有行，解释「这些列怎么来的」没有意义，
+       而且原先那句会写成「共 0 条（以上为失败前数据）」——数据已被清空，那句话自相矛盾。 -->
+  <p v-if="!loadError" class="caliber-line">
     <b>口径：</b>
     {{ tab === 'operation'
       ? '「操作内容」由模块名 + 操作类型 + 请求方式 + 请求地址拼成（后端不存自然语言描述）；「结果」判据是 status=0，与 HTTP 状态码无关。'
       : '原型里的「角色」「设备/客户端」两列后端无任何来源（登录日志出参只有账号/IP/归属地/时间/状态），故不展示，不做假列。' }}
-    共 {{ total }} 条{{ loadError ? '（上次读取失败，以上为失败前数据）' : '' }}。
+    共 {{ total }} 条。
   </p>
 </template>
 
@@ -247,6 +249,11 @@ const loading = ref(false);
 const exporting = ref(false);
 /** 与 loading 分开：失败时要把后端/网络的原因显示出来，不能只说「加载失败」 */
 const loadError = ref('');
+/**
+ * 数据新鲜度。日志是「最新在前」，不标时刻的话，用户看着一屏昨天的记录
+ * 分不清是「这段时间真的没有新操作」还是「页面根本没重新查」。
+ */
+const loadedAt = ref('');
 
 /**
  * 并发响应只认最后一次。
@@ -258,10 +265,15 @@ let reqSeq = 0;
 
 const countText = computed(() => {
   if (loading.value) return '正在读取…';
+  /**
+   * 失败时说「暂无记录」是错的：total 被清成 0 只是因为我们放弃了这次读取，
+   * 不代表库里没有记录。上方失败卡已经讲明原因，这里留空，别让两句话互相打架。
+   */
+  if (loadError.value) return '';
   if (!total.value) return '暂无记录';
   const from = (page.value - 1) * pageSize.value + 1;
   const to = Math.min(page.value * pageSize.value, total.value);
-  return `第 ${from}–${to} 条 / 共 ${total.value} 条`;
+  return `第 ${from}–${to} 条 / 共 ${total.value} 条${loadedAt.value ? ` · 截至 ${loadedAt.value}` : ''}`;
 });
 
 function currentQuery() {
@@ -287,6 +299,7 @@ async function load() {
     if (seq !== reqSeq) return;
     rows.value = res?.list ?? [];
     total.value = res?.total ?? 0;
+    loadedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     /**
      * 页码越界自愈：日志是「最新在前」，新日志不断插入会让第 N 页在翻页途中越过末尾，
      * 后端此时返回空 list 但 total 不为 0 —— 不纠正的话用户会停在一个永远空白的页上，
@@ -481,6 +494,16 @@ onMounted(load);
 }
 .tbl-wrap {
   overflow-x: auto;
+}
+/**
+ * 给表格一个下限，让窄屏时由 .tbl-wrap 横向滚动，而不是把列压扁。
+ * 实测（1600/1280/1100/900 四个宽度）：页面本身从不横向溢出（docScrollWidth == clientWidth），
+ * 所以 .tbl-wrap 的 overflow-x:auto 一直没机会生效，表格被一路压缩 ——
+ * 「操作内容」列在 1100px 只剩 131px、900px 只剩 46px，内容变成竖条无法阅读。
+ * 六个固定列合计 672px，给弹性列留 368px ⇒ 1040px。
+ */
+.tbl {
+  min-width: 1040px;
 }
 .mono {
   font-family: var(--font-mono);
