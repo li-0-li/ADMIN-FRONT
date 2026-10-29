@@ -2079,8 +2079,8 @@ async function submitCreate() {
  * 数据模型：schedule 一行 = 一个具体日期的课次（class_time 存日期、无 week_pattern 字段）。
  * ⇒ 「1-18 周、一周两节」= 第一周排好后，把同 weekday/periodNo 的课次按周逐条 POST
  *   （每行一个真实日期），第 2~18 周翻周即可见 —— 不依赖后端任何新字段。
- * 单双周 = 隔周重复：以当前所在周为「第 1 周」——
- *   单周（odd）锚定当前周（第 1、3、5…周），双周（even）锚定下一周（第 2、4、6…周）。
+ * 单双周 = 隔周重复：默认按学期起点锚定——学期第 1、3、5…周 = 单周（odd）、
+ *   第 2、4、6…周 = 双周（even）；学期未配开始日期才回退「锚定当前浏览周」（有对调风险，弹窗有提示）。
  */
 type RepeatMode = 'once' | 'all' | 'odd' | 'even';
 const REPEAT_TEXT: Record<RepeatMode, string> = {
@@ -2097,10 +2097,47 @@ const repeatForm = reactive<{ mode: RepeatMode; times: number; weekly: number; t
   weekly: 1,
   total: 18
 });
-/** 实际重复次数（once=1，其余 clamp 1~25）——总节数满额 = weekly × 此值 */
-const effectiveRepeatTimes = computed(() =>
-  repeatForm.mode === 'once' ? 1 : Math.max(1, Math.min(25, Math.round(repeatForm.times || 1)))
-);
+/* ---------- 学期锚定（2026-10-29 重开单双周后配套） ----------
+ * 隔周奇偶按学期日历算：学期第 1、3、5…周 = 单周，第 2、4、6…周 = 双周。
+ * 学期起止来自基础数据-学期（terms 页面已加载）；起点未配置/日期非法时回退旧行为
+ * （锚定当前浏览周，并在弹窗里给出橙色风险提示）。★ 日期解析容错：后端实返
+ * "2026-08-24 00:00:00"，统一截前 10 位再拼 T，否则带时分秒原串拼 T 得 NaN。 */
+function parseDateOnly(v?: string | null): Date | null {
+  if (!v) return null;
+  const d = new Date(`${String(v).slice(0, 10).replace(/\//g, '-')}T00:00:00`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+const currentTermInfo = computed(() => terms.value.find(t => String(t.termId) === String(currentTermId.value)) ?? null);
+/** 学期第 1 周的周一（学期周中开课也算整第 1 周）；学期没配起点时 = null */
+const termAnchorMonday = computed<Date | null>(() => {
+  const s = parseDateOnly(currentTermInfo.value?.startDate);
+  if (!s) return null;
+  s.setDate(s.getDate() - ((s.getDay() + 6) % 7));
+  return s;
+});
+const termStartDateLabel = computed(() => currentTermInfo.value?.startDate ? String(currentTermInfo.value.startDate).slice(0, 10) : '');
+/** 实际重复次数（once=1，其余 clamp 1~25）——总节数满额 = weekly × 此值。
+ *  ★ 学期锚定的隔周：实际次数 = 学期内的单/双周数（times 只是上限），
+ *    否则默认 18 次会把满额显示成 18 节而实际学期内只有 9 个单周。 */
+const effectiveRepeatTimes = computed(() => {
+  if (repeatForm.mode === 'once') return 1;
+  const t = Math.max(1, Math.min(25, Math.round(repeatForm.times || 1)));
+  const anchor = termAnchorMonday.value;
+  const end = parseDateOnly(currentTermInfo.value?.endDate);
+  if (anchor && end && (repeatForm.mode === 'odd' || repeatForm.mode === 'even')) {
+    const base = new Date(anchor);
+    base.setDate(base.getDate() + (repeatForm.mode === 'even' ? 7 : 0));
+    let n = 0;
+    for (let i = 0; i < t; i++) {
+      const d = new Date(base);
+      d.setDate(d.getDate() + 14 * i);
+      if (d > new Date(end.getTime() + 86399000)) break;
+      n++;
+    }
+    return Math.max(1, n);
+  }
+  return t;
+});
 /** 每周第 2~5 节的时间（第 1 节 = 表单里的 星期/节次）；weekly 减小时多余项自动不渲染/不提交 */
 const extraSlots = reactive(Array.from({ length: 4 }, () => ({ weekday: 1, periodNo: 1 })));
 const extraSlotList = computed(() => extraSlots.slice(0, Math.max(0, repeatForm.weekly - 1)));
@@ -2116,16 +2153,29 @@ function buildRepeatSlots(): Array<{ weekday: number; periodNo: number }> {
   }
   return slots;
 }
+/** 锚定前缀：每周=当前所在周起；隔周=学期起点（未配则回退当前周） */
+const repeatAnchorLabel = computed(() => {
+  if (repeatForm.mode !== 'all' && termAnchorMonday.value) return '按学期起点锚定';
+  return '以当前所在周为第 1 周';
+});
 const repeatHint = computed(() => {
   if (repeatForm.mode === 'all') return `每周同一时间上课，共 ${repeatForm.times} 周（如第 1~18 周）`;
-  if (repeatForm.mode === 'odd') return `第 1、3、5…周上课，共 ${repeatForm.times} 次`;
-  if (repeatForm.mode === 'even') return `第 2、4、6…周上课，共 ${repeatForm.times} 次`;
+  if (repeatForm.mode === 'odd')
+    return `学期第 1、3、5…周上课${termStartDateLabel.value ? `（学期始于 ${termStartDateLabel.value}）` : ''}，共 ${effectiveRepeatTimes.value} 次`;
+  if (repeatForm.mode === 'even')
+    return `学期第 2、4、6…周上课${termStartDateLabel.value ? `（学期始于 ${termStartDateLabel.value}）` : ''}，共 ${effectiveRepeatTimes.value} 次`;
   return '';
 });
 /** 重复计划展开成的上课日期串（YYYY-MM-DD）。once=1 条；odd/even 隔 14 天；all 隔 7 天。
- *  rp = 重复口径，缺省跟随弹窗表单；自动排课必须传固定口径，否则会被弹窗残留的单双周带偏（2026-10-29 修）。 */
+ *  rp = 重复口径，缺省跟随弹窗表单；自动排课必须传固定口径，否则会被弹窗残留的单双周带偏（2026-10-29 修）。
+ *  ★ 隔周锚定学期起点（2026-10-29）：单周=学期第 1、3、5…周、双周=第 2、4、6…周，
+ *    从学期中间哪一周排都不错位，且补全整学期（含已过去的周，业主拍板）；
+ *    学期没配起点才回退锚定当前浏览周。学期锚定时不出学期结束日。 */
 function repeatDates(weekday: number, rp: { mode: RepeatMode; times: number } = repeatForm): string[] {
-  const base = new Date(weekStart.value);
+  const anchor = termAnchorMonday.value;
+  const semEnd = parseDateOnly(currentTermInfo.value?.endDate);
+  const semesterAnchored = !!anchor && (rp.mode === 'odd' || rp.mode === 'even');
+  const base = new Date(semesterAnchored ? anchor! : weekStart.value);
   base.setDate(base.getDate() + (weekday - 1) + (rp.mode === 'even' ? 7 : 0));
   const step = rp.mode === 'odd' || rp.mode === 'even' ? 14 : 7;
   const count = rp.mode === 'once' ? 1 : Math.max(1, Math.min(25, Math.round(rp.times || 1)));
@@ -2133,6 +2183,8 @@ function repeatDates(weekday: number, rp: { mode: RepeatMode; times: number } = 
   for (let i = 0; i < count; i++) {
     const d = new Date(base);
     d.setDate(d.getDate() + step * i);
+    if (semesterAnchored && semEnd && d > new Date(semEnd.getTime() + 86399000)) break;
+    out.push(fmt(d));
     out.push(fmt(d));
   }
   return out;
@@ -2271,12 +2323,15 @@ function cycleParity(e: PoolEntry) {
   const cur = parityOf(e);
   poolParity[e.key] = cur === 'all' ? 'odd' : cur === 'odd' ? 'even' : 'all';
 }
-/** 自动排课弹窗的隔周汇总与锚定警告（存在非每周口径的课才显示） */
+/** 自动排课弹窗的隔周汇总与锚定说明（存在非每周口径的课才显示） */
 const poolParitySummary = computed(() => {
   const odd = poolEntries.value.filter(e => parityOf(e) === 'odd').length;
   const even = poolEntries.value.filter(e => parityOf(e) === 'even').length;
   if (!odd && !even) return '';
-  return `单周 ${odd} 门 · 双周 ${even} 门——隔周以当前浏览周为锚，开始前请先翻到学期第 1 周`;
+  const anchorNote = termAnchorMonday.value
+    ? `隔周按学期起点锚定（学期始于 ${termStartDateLabel.value}，单周=第 1、3、5…周）`
+    : '当前学期未配开始日期，隔周以当前浏览周为锚，开始前请先翻到学期第 1 周';
+  return `单周 ${odd} 门 · 双周 ${even} 门——${anchorNote}`;
 });
 type AutoSlot = { weekday: number; periodNo: number; classroomId?: number; capacity?: number };
 const AUTO_W = {
@@ -2692,7 +2747,7 @@ watch(
           type="button"
           class="chip-parity"
           :class="{ 'is-alt': parityOf(c) !== 'all' }"
-          :title="`自动排课口径：${PARITY_TEXT[parityOf(c)]}${parityOf(c) === 'all' ? '' : '（隔周上，锚定当前浏览周）'}，点击切换`"
+          :title="`自动排课口径：${PARITY_TEXT[parityOf(c)]}${parityOf(c) === 'all' ? '' : termAnchorMonday ? '（按学期起点隔周）' : '（隔周上，锚定当前浏览周）'}，点击切换`"
           @mousedown.stop
           @click.stop="cycleParity(c)"
         >
@@ -3332,15 +3387,20 @@ watch(
           <span v-if="repeatForm.mode !== 'once'" class="small muted">周</span>
         </div>
         <div v-if="repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
-          以当前所在周为第 1 周 · {{ repeatHint }}
+          {{ repeatAnchorLabel }} · {{ repeatHint }}
         </div>
-        <!-- 单双周防错（2026-10-29）：隔周模式锚定的是「当前浏览的周」，从非学期第 1 周保存会让单双整体对调 -->
+        <!-- 单双周锚定说明（2026-10-29）：默认按学期起点算奇偶，从哪周排都不错位；
+             学期未配开始日期才回退「锚定当前浏览周」，此时才有对调风险（橙色提示去补日期） -->
         <div
           v-if="repeatForm.mode === 'odd' || repeatForm.mode === 'even'"
           class="small"
-          style="color: var(--warning, #b45309); width: 100%"
+          :style="{ color: termAnchorMonday ? 'var(--ink-600, #52525b)' : 'var(--warning, #b45309)', width: '100%' }"
         >
-          注意：单周从当前浏览的周起隔周上，双周从下一周起隔周上——保存前请先翻到学期第 1 周，否则整学期的单双会对调
+          {{
+            termAnchorMonday
+              ? `按学期锚定：单周=学期第 1、3、5…周，双周=第 2、4、6…周（学期始于 ${termStartDateLabel}，可在基础数据-学期修改起点）`
+              : '当前学期未配置开始日期，隔周只能锚定当前浏览的周——请先翻到学期第 1 周再保存，或先到基础数据-学期补开始日期'
+          }}
         </div>
       </el-form-item>
       <!-- 总节数（2026-10-20）：满额可改小 —— 不够分时从最后一周往前少排（前满后少） -->
