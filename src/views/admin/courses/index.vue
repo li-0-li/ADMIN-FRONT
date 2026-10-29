@@ -5,6 +5,7 @@ import ZkIcon from '@/components/ZkIcon.vue';
 import { deleteCourse, listCourses } from '@/api/admin/courses';
 import type { AdminCourseVo } from '@/api/admin/courses';
 import { getCertDetail, reviewCertification } from '@/api/admin/certifications';
+import { listSchedules } from '@/api/admin/schedules';
 import { listTerms } from '@/api/admin/basicdata';
 import type { CertDetail } from '@/types/admin';
 
@@ -39,6 +40,63 @@ const STATUS_LABEL: Record<string, string> = { active: '已通过', creating: '�
 const STATUS_BADGE: Record<string, string> = { active: 'badge-success', creating: 'badge-neutral' };
 const statusLabel = (s: string) => STATUS_LABEL[s] ?? s ?? '—';
 const statusBadge = (s: string) => STATUS_BADGE[s] ?? 'badge-neutral';
+
+/* ---------------- 排课情况（2026-10-29 业主新增列）----------------
+ * 课程列表接口（C-12）没有排课字段，只能从课次接口反查：
+ *   GET /api/v1/admin/schedules?startDate&endDate&pageSize 一次拉回课次，按 courseId 聚合计数。
+ * ★ 三个实测要点（10-29，8080）：
+ * 1. 必须走**管理端路径** `/api/v1/admin/schedules`：学生端 `/api/v1/schedules` 按当前登录者过滤，
+ *    管理员调它恒返回 0 条（实测 0，差点误判成"全都没排课"）。
+ * 2. `startDate`/`endDate` 是**必填**（缺了直接 code=422「startDate 与 endDate 不能为空」）。
+ *    "是否排过课"是历史事实、不该受区间限制 ⇒ 给一个足够宽的区间（后端不校验跨度，实测 2000~2100 可拿全量）。
+ * 3. 返回里的 `deleted` 默认已排除软删（实测 313 条全为 0）⇒ 放回待排的课次不会误算成"已排课"。
+ * 一次拉不完（total > 拉回数）时只统计已拉部分，并把列头标注为统计不全，不假装是全量。
+ */
+const scheduleCount = ref<Map<string, number>>(new Map());
+const scheduleStatsLoading = ref(false);
+/** 统计是否成功拿到过。★ 不能只看 Map 是否为空：接口失败时 Map 也是空的，
+ *  若此时把"没有记录"当"0 节"，整页课程会全部误报成「未排课」——所以失败一律显示 — */
+const scheduleStatsReady = ref(false);
+/** 课次总量超过一次拉取上限 ⇒ 计数是部分统计，列头要说明，不能让用户当全量看 */
+const scheduleStatsPartial = ref(false);
+const SCHEDULE_WIDE_START = '2000-01-01';
+const SCHEDULE_WIDE_END = '2100-12-31';
+const SCHEDULE_FETCH_LIMIT = 1000;
+
+async function loadScheduleCounts() {
+  scheduleStatsLoading.value = true;
+  try {
+    const res = await listSchedules({
+      startDate: SCHEDULE_WIDE_START,
+      endDate: SCHEDULE_WIDE_END,
+      page: 1,
+      pageSize: SCHEDULE_FETCH_LIMIT
+    });
+    const list = res?.list ?? [];
+    const m = new Map<string, number>();
+    for (const c of list) {
+      const id = String(c.courseId ?? '');
+      if (!id) continue;
+      m.set(id, (m.get(id) ?? 0) + 1);
+    }
+    scheduleCount.value = m;
+    scheduleStatsPartial.value = (res?.total ?? 0) > list.length;
+    scheduleStatsReady.value = true;
+  } catch {
+    /* 排课情况是附加信息：拉不到就显示 —，不影响课程列表本身（与认证材料同思路） */
+    scheduleCount.value = new Map();
+    scheduleStatsPartial.value = false;
+    scheduleStatsReady.value = false;
+  } finally {
+    scheduleStatsLoading.value = false;
+  }
+}
+
+/** 该课程的节次数；null = 统计未拿到（与"0 节/未排课"必须区分开，否则会误报未排课） */
+function scheduledCount(courseId: string): number | null {
+  if (!scheduleStatsReady.value) return null;
+  return scheduleCount.value.get(String(courseId)) ?? 0;
+}
 
 async function loadTerms() {
   try {
@@ -196,6 +254,8 @@ async function revokeApprove() {
 
 onMounted(async () => {
   void loadTerms();
+  // 排课统计独立于课程列表：并行拉，谁先回都不影响另一个；失败只让该列显示 —
+  void loadScheduleCounts();
   await fetchList();
 });
 </script>
@@ -205,7 +265,7 @@ onMounted(async () => {
     <h1>课程总览</h1>
     <div class="actions">
       <a class="btn btn-outline" href="javascript:void(0)" @click="$router.push('/admin/review')">
-        <ZkIcon name="badge-check" :size="16" />去课程审核
+        <ZkIcon name="badge-check" :size="16" />课程审核
       </a>
     </div>
   </div>
@@ -234,7 +294,10 @@ onMounted(async () => {
       <el-button type="primary" @click="onSearch">
         <ZkIcon name="search" :size="15" style="margin-right: 4px" />搜索
       </el-button>
-      <el-button text @click="resetQuery">重置</el-button>
+      <!-- 与搜索同款式按钮（改前是 text 按钮，无边框、高度与主按钮不一致，视觉上像贴上去的一行字） -->
+      <el-button @click="resetQuery">
+        <ZkIcon name="refresh-cw" :size="15" style="margin-right: 4px" />重置
+      </el-button>
     </div>
   </div>
 
@@ -270,6 +333,18 @@ onMounted(async () => {
           <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
         </template>
       </el-table-column>
+      <!-- 排课情况（10-29 新增）：节次数来自课次接口聚合。
+           三种状态必须可辨：— = 统计没拿到 / 未排课 = 真的 0 节 / N 节 = 已排 -->
+      <el-table-column width="110" align="center">
+        <template #header>
+          <span :title="scheduleStatsPartial ? '课次总数超出单次拉取上限，此处仅统计已拉取部分' : '按全部课次统计，放回待排的课次不计入'">排课情况</span>
+        </template>
+        <template #default="{ row }">
+          <span v-if="scheduledCount(row.courseId) === null" class="muted small">—</span>
+          <span v-else-if="scheduledCount(row.courseId) === 0" class="badge badge-neutral">未排课</span>
+          <span v-else class="badge badge-info">{{ scheduledCount(row.courseId) }} 节</span>
+        </template>
+      </el-table-column>
       <el-table-column label="操作" width="150" align="right">
         <template #default="{ row }">
           <el-button text size="small" @click="openDetail(row)">
@@ -300,10 +375,7 @@ onMounted(async () => {
     <div class="between" style="padding: 12px 16px">
       <span class="small muted">
         <template v-if="loadError">记录数未取到（加载失败）</template>
-        <template v-else>
-          共 {{ total }} 门已通过课程
-          <span class="muted small">（只列审核通过、状态为 active 的课程）</span>
-        </template>
+        <template v-else>共 {{ total }} 门已通过课程</template>
       </span>
       <el-pagination
         v-model:current-page="query.page"
@@ -327,6 +399,14 @@ onMounted(async () => {
         <div class="pf-row">
           <span class="k">状态</span>
           <span class="badge" :class="statusBadge(detailCourse.status)">{{ statusLabel(detailCourse.status) }}</span>
+        </div>
+        <div class="pf-row">
+          <span class="k">排课情况</span>
+          <span>
+            <template v-if="scheduledCount(detailCourse.courseId) === null">—</template>
+            <template v-else-if="scheduledCount(detailCourse.courseId) === 0">未排课</template>
+            <template v-else>已排 {{ scheduledCount(detailCourse.courseId) }} 节</template>
+          </span>
         </div>
       </div>
 
