@@ -38,6 +38,12 @@ const PERIODS = reactive([
  *
  * ★ 映射键是 seq：课次数据的 periodNo（数字）对应接口的 seq；
  *   接口的 periodNo 是 "1-2" 展示串，不是键——按字面用它映射会全部 miss（实测样本可查）。
+ *
+ * ★ 失效条件（2026-10-29 复核补充）：接口只返回 status=1 的启用行（PeriodVo 刻意不返回 status，
+ *   理由见后端 AdminPeriod 注释）。若某行节次被停用：接口返 4 行 ⇒ 网格 4 行，但该 seq 名下的
+ *   历史课次仍在 cellMap 里收集（按课次 weekday+periodNo 建键，与 PERIODS 无关），
+ *   于是这批课次在网格上**没有对应的行可画** —— 表现为「课次不显示」，不是数据被删。
+ *   当前库 class_period 5 行全启用（10-29 实测），不触发；真要停用某节次，须先清理该 seq 的课次。
  */
 const periodsFallback = ref(true);
 const PERIODS_FALLBACK_TIP = '节次时段为本地默认值（节次接口暂不可用），如与教务实际作息不符请以后者为准';
