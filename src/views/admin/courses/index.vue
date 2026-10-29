@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue';
+import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import { deleteCourse, listCourses } from '@/api/admin/courses';
@@ -31,7 +32,14 @@ const rows = ref<AdminCourseVo[]>([]);
 const total = ref(0);
 /** 失败态与空态分开存：接口挂了不能显示成"没有课程"（账号页同款处理） */
 const loadError = ref('');
-const query = reactive({ page: 1, pageSize: 10, keyword: '', semester: '' });
+const router = useRouter();
+/** scheduleState：排课状态筛选（'' 全部 / 'scheduled' 已排课 / 'unscheduled' 未排课）
+ *  见下方 fetchList 的说明：这个条件没法交给后端分页，只能本地筛。 */
+const query = reactive({ page: 1, pageSize: 10, keyword: '', semester: '', scheduleState: '' });
+/** 排课筛选下的补充说明（例如全量没拉完），空串=无话可说 */
+const filterNote = ref('');
+/** 是否存在任一筛选条件：决定空态给「清空筛选」还是「去课程审核」 */
+const hasFilter = computed(() => !!query.keyword.trim() || !!query.semester || !!query.scheduleState);
 
 const terms = ref<{ termId: number; name: string }[]>([]);
 const termOptionsReady = computed(() => terms.value.length > 0);
@@ -90,6 +98,8 @@ async function loadScheduleCounts() {
   } finally {
     scheduleStatsLoading.value = false;
   }
+  // 返回是否拿到：排课状态筛选依赖它，拿不到就不能假装筛过了（否则会筛出空列表冒充"没有未排课的课"）
+  return scheduleStatsReady.value;
 }
 
 /** 该课程的节次数；null = 统计未拿到（与"0 节/未排课"必须区分开，否则会误报未排课） */
@@ -111,16 +121,60 @@ async function loadTerms() {
   }
 }
 
+/**
+ * 列表取数
+ * ----------------------------------------------------------------------------
+ * 两种模式，按「有没有启用排课状态筛选」分流：
+ *  A. 默认（不按排课筛）：服务端分页，与之前一致——数据量变大后这才是正解。
+ *  B. 按排课状态筛：**只能本地筛**。原因是排课节次并不在课程列表接口里，
+ *     而是本页用课次接口聚合出来的 Map（见上方排课情况注释）；服务端分页的 total
+ *     是"全部 active 课程"的 total，拿它当筛选后的总数会直接把分页器画错。
+ *     所以该模式下改为「一次拉回全量 active（受关键词/学期约束）→ 本地过滤 → 本地分页」。
+ *     ⚠️ 失效条件：active 课程数超过 SCHEDULE_FILTER_FETCH_LIMIT 时只能筛到已拉部分，
+ *     此时页脚会明确写出"仅在已拉取的 N 门内筛选"，不假装是全量结果。
+ */
+const SCHEDULE_FILTER_FETCH_LIMIT = 500;
+
 async function fetchList() {
   loading.value = true;
   try {
-    const res = await listCourses({
-      page: query.page,
-      pageSize: query.pageSize,
+    const base = {
       keyword: query.keyword.trim() || undefined,
       semester: query.semester || undefined,
-      status: 'active'
-    });
+      status: 'active' as const
+    };
+    if (query.scheduleState) {
+      // 排课统计是筛选的前提：没拿到就没有"已排/未排"这个事实，不能拿空 Map 当"全都没排课"
+      if (!scheduleStatsReady.value) {
+        await loadScheduleCounts();
+      }
+      if (!scheduleStatsReady.value) {
+        rows.value = [];
+        total.value = 0;
+        filterNote.value = '';
+        loadError.value = '排课情况统计未取到，无法按排课状态筛选。可清空「排课情况」条件，或稍后重试。';
+        return;
+      }
+      const res = await listCourses({ ...base, page: 1, pageSize: SCHEDULE_FILTER_FETCH_LIMIT });
+      const all = res?.list ?? [];
+      const onlyScheduled = query.scheduleState === 'scheduled';
+      const filtered = all.filter((c) => {
+        const n = scheduleCount.value.get(String(c.courseId)) ?? 0;
+        return onlyScheduled ? n > 0 : n === 0;
+      });
+      total.value = filtered.length;
+      const start = (query.page - 1) * query.pageSize;
+      rows.value = filtered.slice(start, start + query.pageSize);
+      const serverTotal = res?.total ?? 0;
+      filterNote.value =
+        serverTotal > all.length
+          ? `排课筛选仅在已拉取的 ${all.length} 门课内进行（共 ${serverTotal} 门，超出单次拉取上限 ${SCHEDULE_FILTER_FETCH_LIMIT}）`
+          : `按排课情况筛选：${onlyScheduled ? '已排课' : '未排课'} ${filtered.length} 门`;
+      loadError.value = '';
+      return;
+    }
+    filterNote.value = '';
+    const res = await listCourses({ ...base, page: query.page, pageSize: query.pageSize });
     rows.value = res?.list ?? [];
     total.value = res?.total ?? 0;
     loadError.value = '';
@@ -128,6 +182,7 @@ async function fetchList() {
     /* 失败必须清列表 + 归零总数，否则会留着上一次筛选的结果冒充本次结果 */
     rows.value = [];
     total.value = 0;
+    filterNote.value = '';
     loadError.value = '课程列表加载失败：没有取到课程数据，可能是网络中断、后端服务未启动或登录状态已过期。';
   } finally {
     loading.value = false;
@@ -142,8 +197,16 @@ function onSearch() {
 function resetQuery() {
   query.keyword = '';
   query.semester = '';
+  query.scheduleState = '';
   query.page = 1;
   fetchList();
+}
+
+/** 跳排课页并只看这门课。
+ *  ★ 排课页（schedule/index.vue:612-624）**已支持** ?course=<courseId> 参数，
+ *  它只在"切专业"时才校验并清空 courseId，本跳转不改专业 ⇒ 不会被清掉。不需要改排课页。 */
+function goSchedule(row: AdminCourseVo) {
+  void router.push({ path: '/admin/schedule', query: { course: String(row.courseId) } });
 }
 
 /* ---------------- 详情抽屉 ---------------- */
@@ -291,6 +354,17 @@ onMounted(async () => {
       >
         <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="t.name" />
       </el-select>
+      <!-- 排课情况筛选（10-29 新增）：与「排课情况」列同源，都基于课次聚合 -->
+      <el-select
+        v-model="query.scheduleState"
+        placeholder="全部排课情况"
+        clearable
+        style="width: 140px"
+        @change="onSearch"
+      >
+        <el-option label="已排课" value="scheduled" />
+        <el-option label="未排课" value="unscheduled" />
+      </el-select>
       <el-button type="primary" @click="onSearch">
         <ZkIcon name="search" :size="15" style="margin-right: 4px" />搜索
       </el-button>
@@ -311,41 +385,46 @@ onMounted(async () => {
       </el-button>
     </div>
     <el-table v-loading="loading" row-key="courseId" :data="rows" style="width: 100%">
-      <el-table-column label="课程代码" width="120" prop="courseCode">
+      <el-table-column label="课程代码" width="100" prop="courseCode">
         <template #default="{ row }">{{ row.courseCode || '—' }}</template>
       </el-table-column>
-      <el-table-column label="课程名称" min-width="200" prop="courseName">
+      <el-table-column label="课程名称" min-width="170" prop="courseName">
         <template #default="{ row }">
           <div style="font-weight: 600; color: var(--ink-900)">{{ row.courseName }}</div>
         </template>
       </el-table-column>
-      <el-table-column label="授课教师" width="130" prop="teacherName">
+      <el-table-column label="授课教师" width="110" prop="teacherName">
         <template #default="{ row }">{{ row.teacherName || '—' }}</template>
       </el-table-column>
-      <el-table-column label="学期" width="140" prop="semester">
+      <el-table-column label="学期" width="110" prop="semester">
         <template #default="{ row }">{{ row.semester || '—' }}</template>
       </el-table-column>
-      <el-table-column label="选课人数" width="100" align="center" prop="studentCount">
+      <el-table-column label="选课人数" width="90" align="center" prop="studentCount">
         <template #default="{ row }">{{ row.studentCount ?? 0 }}</template>
       </el-table-column>
-      <el-table-column label="状态" width="100">
+      <el-table-column label="状态" width="90">
         <template #default="{ row }">
           <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
         </template>
       </el-table-column>
       <!-- 排课情况（10-29 新增）：节次数来自课次接口聚合。
            三种状态必须可辨：— = 统计没拿到 / 未排课 = 真的 0 节 / N 节 = 已排 -->
-      <el-table-column width="110" align="center">
+      <el-table-column width="130" align="center">
         <template #header>
           <span :title="scheduleStatsPartial ? '课次总数超出单次拉取上限，此处仅统计已拉取部分' : '按全部课次统计，放回待排的课次不计入'">排课情况</span>
         </template>
         <template #default="{ row }">
           <span v-if="scheduledCount(row.courseId) === null" class="muted small">—</span>
-          <span v-else-if="scheduledCount(row.courseId) === 0" class="badge badge-neutral">未排课</span>
+          <!-- 未排课给直达入口：这列最常见的用途就是"挑一门没排的课去排"，
+               少了这一步用户还得自己记住课程名再去排课页翻列表 -->
+          <div v-else-if="scheduledCount(row.courseId) === 0" class="sched-cell">
+            <span class="badge badge-neutral">未排课</span>
+            <a class="sched-link" href="javascript:void(0)" @click="goSchedule(row)">去排课</a>
+          </div>
           <span v-else class="badge badge-info">{{ scheduledCount(row.courseId) }} 节</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="150" align="right">
+      <el-table-column label="操作" width="150" align="right" class-name="courses-op">
         <template #default="{ row }">
           <el-button text size="small" @click="openDetail(row)">
             <ZkIcon name="eye" :size="14" style="margin-right: 3px" />查看
@@ -363,10 +442,25 @@ onMounted(async () => {
       <template #empty>
         <div class="empty-block">
           <ZkIcon name="book-open" :size="26" />
-          <div class="empty-title">{{ loadError ? '数据未取到' : '还没有审核通过的课程' }}</div>
-          <div v-if="loadError" class="small muted">原因见上方提示条，可点「重新加载」重试。</div>
-          <div v-else class="small muted">
-            课程在「课程审核」通过后才会出现在这里；当前筛选条件下没有匹配的已通过课程，可点「重置」清空条件。
+          <div class="empty-title">{{ loadError ? '数据未取到' : hasFilter ? '当前筛选条件下没有课程' : '还没有审核通过的课程' }}</div>
+          <div v-if="loadError" class="small muted">原因见上方提示条，也可点下方按钮重试。</div>
+          <div v-else-if="hasFilter" class="small muted">
+            已通过审核的课程可能被关键词/学期/排课情况条件排除了，清空条件即可看到全部。
+          </div>
+          <div v-else class="small muted">课程在「课程审核」通过后才会出现在这里。</div>
+          <!-- 空态给可点的下一步：原来只有一行文字，用户得自己回去找入口/找重置按钮 -->
+          <div class="empty-actions">
+            <el-button v-if="loadError" size="small" @click="fetchList">
+              <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />重新加载
+            </el-button>
+            <template v-else-if="hasFilter">
+              <el-button size="small" @click="resetQuery">
+                <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />清空筛选
+              </el-button>
+            </template>
+            <el-button v-else size="small" type="primary" @click="router.push('/admin/review')">
+              <ZkIcon name="badge-check" :size="14" style="margin-right: 4px" />去课程审核
+            </el-button>
           </div>
         </div>
       </template>
@@ -376,6 +470,8 @@ onMounted(async () => {
       <span class="small muted">
         <template v-if="loadError">记录数未取到（加载失败）</template>
         <template v-else>共 {{ total }} 门已通过课程</template>
+        <!-- 总数口径说明：按排课筛时 total 是本地过滤后的数，与后端 total 不同，必须写明 -->
+        <span v-if="filterNote" class="filter-note">{{ filterNote }}</span>
       </span>
       <!-- layout 必须含 sizes：改前只写 prev/pager/next，`:page-sizes` 虽然配了但选择器压根不渲染，
            用户无法改每页条数（属于"配了参数却没生效"的静默缺陷） -->
@@ -481,6 +577,40 @@ onMounted(async () => {
   font-size: 14px;
   font-weight: 600;
   color: var(--ink-700, #3a4256);
+}
+/* 空态里的下一步按钮：与说明文字留出距离，避免和正文黏在一起 */
+.empty-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+/* 操作列两个文字按钮必须同排。列收窄后（1280 下要腾出排课列的位置）
+   默认 white-space:normal 会把「删除」挤到第二行，行高直接翻倍。 */
+:deep(.courses-op .cell) {
+  white-space: nowrap;
+}
+/* 未排课单元格：徽标 + 直达链接并排 */
+.sched-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+.sched-link {
+  font-size: 12.5px;
+  color: var(--brand-600, #2563eb);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.sched-link:hover {
+  text-decoration: underline;
+}
+/* 页脚的总数口径说明：换行显示，不挤掉右侧分页器 */
+.filter-note {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--ink-400, #9aa3b2);
 }
 .pf-grid {
   display: flex;
