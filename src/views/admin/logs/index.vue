@@ -27,14 +27,23 @@
         clearable
         @keyup.enter="onSearch"
       />
-      <el-input
+      <!-- 模块：原型是下拉。后端没有「日志里出现过的模块」枚举端点，所以候选在首次点开下拉时
+           懒加载一次（拉一批日志去重 title）得到，同时 allow-create 允许直接输入任意值 ——
+           用户不必记住模块全名，也保留原来「输一部分也能模糊匹配」的能力。 -->
+      <el-select
         v-if="tab === 'operation'"
         v-model="moduleName"
         class="f-mod"
         placeholder="模块名"
+        filterable
+        allow-create
+        default-first-option
         clearable
-        @keyup.enter="onSearch"
-      />
+        :loading="moduleOptsLoading"
+        @visible-change="onModuleDropdown"
+      >
+        <el-option v-for="m in moduleOptions" :key="m" :label="m" :value="m" />
+      </el-select>
       <el-select
         v-if="tab === 'operation'"
         v-model="businessType"
@@ -56,7 +65,7 @@
         range-separator="~"
         start-placeholder="开始日期"
         end-placeholder="结束日期"
-        :shortcuts="DATE_SHORTCUTS"
+        :shortcuts="dateShortcuts"
       />
     </div>
     <div class="right">
@@ -83,8 +92,13 @@
         <thead v-else>
           <tr>
             <th style="width: 172px">时间</th>
-            <th style="width: 200px">账号</th>
-            <th style="width: 180px">IP</th>
+            <th style="width: 180px">账号</th>
+            <!-- 角色 / 设备：后端出参当前没有这两个字段（表里有值，VO 没查）。
+                 做成能力探测 —— 一旦某行带了 roleName / browser / os 就显示整列，
+                 现在不显示，后端补齐后自动出现，前端不用再改。 -->
+            <th v-if="loginHasRole" style="width: 120px">角色</th>
+            <th style="width: 170px">IP</th>
+            <th v-if="loginHasDevice" style="width: 190px">设备 / 客户端</th>
             <th>归属地</th>
             <th style="width: 100px">结果</th>
           </tr>
@@ -142,6 +156,7 @@
                 >{{ r.operName }}</button>
                 <span v-else>—</span>
               </td>
+              <td v-if="loginHasRole">{{ r.roleName || '—' }}</td>
               <td>
                 <button
                   v-if="r.operIp"
@@ -151,6 +166,7 @@
                 >{{ r.operIp }}</button>
                 <span v-else>—</span>
               </td>
+              <td v-if="loginHasDevice" class="small muted">{{ deviceText(r) }}</td>
               <td class="small muted">{{ locText(r) }}</td>
             </template>
 
@@ -242,8 +258,18 @@
           <dd>{{ detail.costTime ?? '—' }} ms</dd>
         </template>
 
+        <template v-if="tab === 'login' && loginHasRole">
+          <dt>角色</dt>
+          <dd>{{ detail.roleName || '—' }}</dd>
+        </template>
+
         <dt>IP</dt>
         <dd class="mono">{{ detail.operIp || '—' }}</dd>
+
+        <template v-if="tab === 'login' && loginHasDevice">
+          <dt>设备</dt>
+          <dd>{{ deviceText(detail) }}</dd>
+        </template>
 
         <dt>归属地</dt>
         <dd>{{ locText(detail) }}</dd>
@@ -277,10 +303,11 @@
  *   - 导出是**前端按当前筛选重新拉一次**再生成 CSV，不是后端导出端点
  *     （`/api/v1/admin/export` 是报表导出，不吃这些筛选参数）。
  */
-import { computed, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import { listLogs, listLogsForExport } from '@/api/admin/logs';
+import { listTerms } from '@/api/admin/basicdata';
 import type { LogRowVo, LogTab } from './types';
 
 /**
@@ -312,7 +339,7 @@ const dayStart = (offset: number) => {
   return d;
 };
 
-const DATE_SHORTCUTS = [
+const BASE_SHORTCUTS = [
   { text: '今天', value: () => [dayStart(0), new Date()] },
   { text: '昨天', value: () => [dayStart(-1), dayStart(-1)] },
   {
@@ -344,9 +371,66 @@ const DATE_SHORTCUTS = [
   }
 ];
 
+/**
+ * 当前学期（用于「本学期」快捷，原型里有这一项）。
+ *
+ * 为什么不在前端写死学期起止：学期是学期表里的数据，会换。写死一个 2026-08-24~2027-01-15
+ * 到了下学期就成了错的区间，而且界面上看不出来（用户只会觉得"筛出来的数不对"）。
+ * 所以从 /api/v1/admin/terms 取 isCurrent=1 那条；拿不到就**不显示这一项**——
+ * 少一个快捷方式不影响任何功能，比显示一个错区间安全。
+ */
+const currentTerm = ref<{ name: string; start: string; end: string } | null>(null);
+
+/** 'yyyy-MM-dd' → 本地零点。不能直接 new Date('2026-08-24')：那会按 UTC 解析，东八区会退到前一天 */
+function localDay(s: string): Date {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(y || 1970, (m || 1) - 1, d || 1);
+}
+
+async function loadCurrentTerm() {
+  try {
+    const res = await listTerms({ page: 1, pageSize: 50 });
+    const list = (res?.list ?? []) as Array<{ name?: string; startDate?: string; endDate?: string; isCurrent?: number }>;
+    const cur = list.find(t => t.isCurrent === 1) ?? list[0];
+    if (cur?.startDate && cur?.endDate) {
+      currentTerm.value = {
+        name: cur.name || '本学期',
+        start: cur.startDate.slice(0, 10),
+        end: cur.endDate.slice(0, 10)
+      };
+    }
+  } catch {
+    /* 学期拉不到就少一个快捷项，不弹错、不影响日志列表 */
+    currentTerm.value = null;
+  }
+}
+
+const dateShortcuts = computed(() => {
+  const out = [...BASE_SHORTCUTS];
+  const t = currentTerm.value;
+  if (t) {
+    out.push({
+      text: '本学期',
+      value: () => [localDay(t.start), localDay(t.end)] as [Date, Date]
+    });
+  }
+  return out;
+});
+
 const tab = ref<LogTab>('operation');
 const keyword = ref('');
 const moduleName = ref('');
+/**
+ * 模块下拉的候选。后端没有「模块枚举」端点，所以候选是点开下拉时懒加载一次、
+ * 从返回行里对 title 去重得到的（不进首屏、不打乱主查询节奏）。
+ * allow-create 兜住候选不全的情况：即便某个模块这批没扫到，用户仍可直接输入。
+ */
+const moduleOptions = ref<string[]>([]);
+const moduleOptsLoading = ref(false);
+/** true = 已扫到全集（因为 total ≤ 本次拉取量）；false 时下次展开会重试 */
+let moduleOptsComplete = false;
+/** 与导出一致：一次拉 2000 条做去重。日志当前 800+ 条，一屏 20 条时扫不到全量模块名 */
+const MODULE_SCAN_SIZE = 2000;
 const businessType = ref<number | null>(null);
 const status = ref<number | null>(null);
 /** el-date-picker 的 daterange 在 value-format 下给的是 ['YYYY-MM-DD','YYYY-MM-DD'] 或 null */
@@ -381,6 +465,21 @@ const detail = ref<LogRowVo | null>(null);
  */
 let reqSeq = 0;
 
+/**
+ * 筛选指纹：只含筛选条件，不含页码（翻页不算改筛选）。
+ * 用途是让「改完即生效」不重复请求：重置、切页签、点查询这些**程序化**动作自己会 load，
+ * 由此引发的 watch 回调若发现指纹与「已加载」或「已发出」的一致，就直接跳过。
+ * 不这么做的话，重置一次会连发两个请求（清空引发一次 + onReset 里那次），
+ * 而且两个响应谁后到不确定，容易看到旧口径。
+ */
+function queryKey(): string {
+  const q = currentQuery();
+  return [q.tab, q.keyword, q.module, q.businessType, q.status, q.startTime, q.endTime].join('|');
+}
+let loadedKey = '';
+let pendingKey = '';
+let autoTimer: number | undefined;
+
 const countText = computed(() => {
   if (loading.value) return '正在读取…';
   /**
@@ -410,6 +509,8 @@ function currentQuery() {
 
 async function load() {
   const seq = ++reqSeq;
+  const myKey = queryKey();
+  pendingKey = myKey;
   loading.value = true;
   loadError.value = '';
   try {
@@ -434,7 +535,11 @@ async function load() {
     rows.value = [];
     total.value = 0;
   } finally {
-    if (seq === reqSeq) loading.value = false;
+    if (seq === reqSeq) {
+      loading.value = false;
+      loadedKey = myKey;
+      pendingKey = '';
+    }
   }
 }
 
@@ -452,6 +557,38 @@ function switchTab(t: LogTab) {
   businessType.value = null;
   page.value = 1;
   load();
+}
+
+/**
+ * 模块候选懒加载：只在首次展开下拉时扫一次（不进首屏）。
+ * 扫描失败或候选不全都不弹错 —— allow-create 允许直接输入任意模块名，
+ * 为一个「便利候选」打断用户正在做的筛选动作不值得。
+ */
+async function onModuleDropdown(open: boolean) {
+  if (!open || moduleOptsComplete || moduleOptsLoading.value) return;
+  moduleOptsLoading.value = true;
+  try {
+    const res = await listLogs({
+      tab: 'operation',
+      keyword: '',
+      module: '',
+      businessType: null,
+      status: null,
+      startTime: '',
+      endTime: '',
+      page: 1,
+      pageSize: MODULE_SCAN_SIZE
+    });
+    const list = res?.list ?? [];
+    const names = list.map(r => (r.title || '').trim()).filter(Boolean);
+    moduleOptions.value = [...new Set(names)].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    /** 只有「总数 ≤ 本次拉取量」才算扫全；否则下次展开再补扫（数据在长） */
+    moduleOptsComplete = (res?.total ?? 0) <= list.length;
+  } catch {
+    moduleOptsComplete = false;
+  } finally {
+    moduleOptsLoading.value = false;
+  }
 }
 
 function onSearch() {
@@ -505,6 +642,28 @@ function locText(r: LogRowVo) {
   const v = (r.operLocation || '').trim();
   if (!v || v === 'XX XX') return '—';
   return v;
+}
+
+/**
+ * 登录日志的「角色」「设备 / 客户端」两列 —— 能力探测。
+ *
+ * 现状：后端 `AdminLogRowVo` 没有这三个字段，所以这两列现在不渲染。
+ * 但数据本身是存在的：`sys_logininfor.browser` / `os` 实测有
+ * 「Chrome 155.0.0.0 / Windows >=10」「WeChat 8.0.5 / iOS 15.0」等真实值（另有 139 条为空）。
+ * 判断用 `some` 而不是 `every`：一批记录里只要有一行带值，这一列就值得显示（其余行显示「—」）。
+ * 后端把字段补出来以后，这里会自动生效，前端不需要再改。
+ */
+const loginHasRole = computed(() => tab.value === 'login' && rows.value.some(r => !!r.roleName));
+const loginHasDevice = computed(
+  () => tab.value === 'login' && rows.value.some(r => !!(r.browser || r.os))
+);
+
+/** 「浏览器 / 操作系统」，缺一个就只显示有的那个 */
+function deviceText(r: LogRowVo): string {
+  const b = (r.browser || '').trim();
+  const o = (r.os || '').trim();
+  if (b && o) return `${b} / ${o}`;
+  return b || o || '—';
 }
 
 /* ---------------- 时间显示 ---------------- */
@@ -653,7 +812,35 @@ async function copyDetail() {
   }
 }
 
-onMounted(load);
+/**
+ * 改完即生效（对标 CloudTrail：改筛选立即刷新，不必再点一次查询）。
+ *
+ * 两条约束：
+ *  1. **不能和「查询」「重置」「切页签」打架**：那三处自己会 load，指纹比对后直接跳过，
+ *     否则重置一次会连发两个请求（清空引发一个 + onReset 里一个），谁后到都不确定。
+ *  2. **必须防抖**：文本输入每敲一个字都触发，350ms 合并；日期区间在面板里点选时
+ *     可能连续变更（先设开始再设结束），同样靠防抖压成一次。
+ * 「查询」按钮保留：习惯点按钮的人仍然可用，且它是唯一能立即触发（不等防抖）的入口。
+ */
+watch([keyword, moduleName, businessType, status, dateRange], () => {
+  const k = queryKey();
+  if (k === loadedKey || k === pendingKey) return;
+  if (autoTimer) window.clearTimeout(autoTimer);
+  autoTimer = window.setTimeout(() => {
+    page.value = 1;
+    load();
+  }, 350);
+});
+
+onBeforeUnmount(() => {
+  if (autoTimer) window.clearTimeout(autoTimer);
+});
+
+onMounted(() => {
+  load();
+  /* 与列表并行；拿不到学期只是少一个「本学期」快捷项，不影响主功能 */
+  loadCurrentTerm();
+});
 </script>
 
 <style scoped>

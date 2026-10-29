@@ -39,6 +39,20 @@ export interface LogRowVo {
   operTime: string;
   /** 耗时（毫秒）。登录日志恒为 0 */
   costTime: number | null;
+
+  /**
+   * 以下三个字段**当前后端不返回**，是可选的「能力探测」字段。
+   *
+   * 为什么先声明：`sys_logininfor` 表里 `browser` / `os` 是有真实值的
+   * （实测 Chrome 155.0.0.0 / Windows >=10、WeChat 8.0.5 / iOS 15.0、Edge 155 / Windows >=10，
+   * 另有 139 条为空），只是 `AdminLogRowVo` 没查出来。
+   * 页面按「有就显示该列、没有就不显示」处理 —— 后端把字段补上以后，前端不用再改一行。
+   * 角色同理：表里没有，需要后端 join `sys_user` / `sys_role` 才有。
+   */
+  browser?: string;
+  os?: string;
+  /** 登录账号所属角色名（多角色时由后端拼接，如「教师、管理员」） */
+  roleName?: string;
 }
 
 /** 页签标识：与后端 `AdminLogServiceImpl.java:27` 的 LOG_TYPE_LOGIN 对齐，其余一律走操作日志 */
