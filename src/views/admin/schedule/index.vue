@@ -2281,7 +2281,6 @@ function scoreAutoSlot(
 
 async function runAuto() {
   if (autoRunning.value) return;
-  const entries = poolEntries.value.slice();
   autoRunning.value = true;
   autoReport.value = null;
   const ok: string[] = [];
@@ -2310,80 +2309,113 @@ async function runAuto() {
     }
   }
   const roomCandidates = classroomsAll.value.filter(r => (r.status ?? 'active') !== 'inactive');
+  // 智能顺序（2026-10-29）：可选节位最少的课先排——约束最紧的课先占位，免得被前面的课
+  // 挤到无位可排（贪心只动次序、不动打分结构；打分权重仍在 AUTO_W，调参不进这里）。
+  const entries = poolEntries.value.slice();
+  if (entries.length > 1) {
+    const freeCount = (e: (typeof entries)[number]) => {
+      if (!e.teacherId) return Number.POSITIVE_INFINITY; // 缺教师的反正要跳过，不参与排序
+      const clz = entryClass(e).trim();
+      let n = 0;
+      for (const wd of [1, 2, 3, 4, 5])
+        for (const pn of [1, 2, 3, 4, 5])
+          if (!teacherBusy.has(`${wd}-${pn}-${e.teacherId}`) && !(clz && clazzBusy.has(`${wd}-${pn}-${clz}`))) n++;
+      return n;
+    };
+    entries.sort((a, b) => freeCount(a) - freeCount(b));
+  }
+  /** 单门课「找最优节位 → 逐周落库 → 更新占用/负载表」的全过程，主轮与失败重试轮共用。
+   *  返回：'ok' 排入；'noTeacher' 缺教师跳过（不进重试）；'fail' 找不到可并存空位或整门周次冲突。 */
+  const attempt = async (
+    entry: (typeof entries)[number],
+    pos: string,
+    phase: string,
+    totalCount: number
+  ): Promise<'ok' | 'noTeacher' | 'fail'> => {
+    autoProgress.value = `${phase}正在排「${entry.courseName}」：第 ${pos} 门（已排入 ${ok.length} · 已跳过 ${skip.length}）`;
+    if (!entry.teacherId) {
+      skip.push(`「${entry.courseName}」：课程未指定授课教师，自动排课要求先定教师`);
+      return 'noTeacher';
+    }
+    const need = entry.studentCount ?? 0;
+    const clazz = entryClass(entry).trim();
+    /** 25 个格子全过一遍硬约束后打分取最低（原实现是取第一个空位就 break） */
+    let placed: AutoSlot | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (const wd of [1, 2, 3, 4, 5]) {
+      for (const pn of [1, 2, 3, 4, 5]) {
+        if (teacherBusy.has(`${wd}-${pn}-${entry.teacherId}`)) continue;
+        // 班级维（编号 60 前端配套）：这个班在该节次已有别的课就跳过，别排一次注定被后端拒的
+        if (clazz && clazzBusy.has(`${wd}-${pn}-${clazz}`)) continue;
+        // 教室：该时段空闲且容量最贴（余量最小优先）；没有合适教室就不填教室
+        let best: Classroom | undefined;
+        for (const r of roomCandidates) {
+          if (roomBusy.has(`${wd}-${pn}-${r.classroomId}`)) continue;
+          if ((r.capacity ?? 0) < need) continue;
+          if (!best || (r.capacity ?? 0) < (best.capacity ?? 0)) best = r;
+        }
+        const slot: AutoSlot = { weekday: wd, periodNo: pn, classroomId: best?.classroomId, capacity: best?.capacity };
+        const used = teacherPeriods[`${entry.teacherId}|${wd}`] ?? [];
+        const sc = scoreAutoSlot(slot, {
+          sameClassDay: clazz ? sameClassDay[`${clazz}|${wd}`] ?? 0 : 0,
+          dayLoad: dayLoad[wd] ?? 0,
+          teacherGap: used.length ? Math.min(...used.map(p => Math.abs(p - pn))) : 0,
+          need
+        });
+        if (sc < bestScore) {
+          bestScore = sc;
+          placed = slot;
+        }
+      }
+    }
+    if (!placed) {
+      skip.push(
+        `「${entry.courseName}」${clazz ? `（${clazz}）` : ''}：周一至周五 1~5 节该教师或该班级已被占满，没有可并存的空位`
+      );
+      return 'fail';
+    }
+    const { createdIds, failed, total } = await createBatch(
+      {
+        courseId: entry.courseId,
+        teacherId: entry.teacherId,
+        classroomId: placed.classroomId,
+        weekday: placed.weekday,
+        periodNo: placed.periodNo,
+        targetClass: clazz || undefined
+      },
+      undefined,
+      (done, t) => {
+        autoProgress.value = `${phase}正在排「${entry.courseName}」第 ${done}/${t} 周（共 ${totalCount} 门，已排入 ${ok.length}）`;
+      }
+    );
+    // 占用标记按"已占"处理（保守）：即使个别周冲突，也避免下一门课排进同一格
+    teacherBusy.add(`${placed.weekday}-${placed.periodNo}-${entry.teacherId}`);
+    if (clazz) clazzBusy.add(`${placed.weekday}-${placed.periodNo}-${clazz}`);
+    if (placed.classroomId) roomBusy.add(`${placed.weekday}-${placed.periodNo}-${placed.classroomId}`);
+    // 负载表同步累加：下一门课打分时要看得见这一门，否则又堆回同一格
+    dayLoad[placed.weekday] = (dayLoad[placed.weekday] ?? 0) + 1;
+    (teacherPeriods[`${entry.teacherId}|${placed.weekday}`] ??= []).push(placed.periodNo);
+    if (clazz) sameClassDay[`${clazz}|${placed.weekday}`] = (sameClassDay[`${clazz}|${placed.weekday}`] ?? 0) + 1;
+    const roomName = placed.classroomId ? classroomsAll.value.find(r => r.classroomId === placed.classroomId)?.name ?? '' : '';
+    const where = `周${CN[placed.weekday - 1]} ${PERIODS.find(p => p.seq === placed.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}${clazz ? ' · ' + clazz : ''}`;
+    if (createdIds.length) {
+      ok.push(`「${entry.courseName}」→ ${where}（${createdIds.length}/${total} 周${failed.length ? `，跳过 ${failed.length} 周` : ''}${clazz ? '' : '，未填班级'}）`);
+      pushUndo({ kind: 'batchCreate', scheduleIds: createdIds, label: `自动排课「${entry.courseName}」` });
+      return 'ok';
+    }
+    skip.push(`「${entry.courseName}」：所选时段全部周次冲突（${failed[0] ?? '原因未知'}）`);
+    return 'fail';
+  };
+  /** 主轮排不进的课进这里，末尾统一重试一轮（2026-10-29）。占用表保守按"已占"累计，
+   *  纯空位意义上重试多数仍失败——它是低成本兜底；真正的算法升级是「腾挪回溯」
+   *  （挪走一门已排课给失败课让位），动的是删/建写语义，须业主拍板另做。 */
+  const failures: (typeof entries)[number][] = [];
   try {
     for (const [i, entry] of entries.entries()) {
-      autoProgress.value = `正在排「${entry.courseName}」：第 ${i + 1}/${entries.length} 门（已排入 ${ok.length} · 已跳过 ${skip.length}）`;
-      if (!entry.teacherId) {
-        skip.push(`「${entry.courseName}」：课程未指定授课教师，自动排课要求先定教师`);
-        continue;
-      }
-      const need = entry.studentCount ?? 0;
-      const clazz = entryClass(entry).trim();
-      /** 25 个格子全过一遍硬约束后打分取最低（原实现是取第一个空位就 break） */
-      let placed: AutoSlot | null = null;
-      let bestScore = Number.POSITIVE_INFINITY;
-      for (const wd of [1, 2, 3, 4, 5]) {
-        for (const pn of [1, 2, 3, 4, 5]) {
-          if (teacherBusy.has(`${wd}-${pn}-${entry.teacherId}`)) continue;
-          // 班级维（编号 60 前端配套）：这个班在该节次已有别的课就跳过，别排一次注定被后端拒的
-          if (clazz && clazzBusy.has(`${wd}-${pn}-${clazz}`)) continue;
-          // 教室：该时段空闲且容量最贴（余量最小优先）；没有合适教室就不填教室
-          let best: Classroom | undefined;
-          for (const r of roomCandidates) {
-            if (roomBusy.has(`${wd}-${pn}-${r.classroomId}`)) continue;
-            if ((r.capacity ?? 0) < need) continue;
-            if (!best || (r.capacity ?? 0) < (best.capacity ?? 0)) best = r;
-          }
-          const slot: AutoSlot = { weekday: wd, periodNo: pn, classroomId: best?.classroomId, capacity: best?.capacity };
-          const used = teacherPeriods[`${entry.teacherId}|${wd}`] ?? [];
-          const sc = scoreAutoSlot(slot, {
-            sameClassDay: clazz ? sameClassDay[`${clazz}|${wd}`] ?? 0 : 0,
-            dayLoad: dayLoad[wd] ?? 0,
-            teacherGap: used.length ? Math.min(...used.map(p => Math.abs(p - pn))) : 0,
-            need
-          });
-          if (sc < bestScore) {
-            bestScore = sc;
-            placed = slot;
-          }
-        }
-      }
-      if (!placed) {
-        skip.push(
-          `「${entry.courseName}」${clazz ? `（${clazz}）` : ''}：周一至周五 1~5 节该教师或该班级已被占满，没有可并存的空位`
-        );
-        continue;
-      }
-      const { createdIds, failed, total } = await createBatch(
-        {
-          courseId: entry.courseId,
-          teacherId: entry.teacherId,
-          classroomId: placed.classroomId,
-          weekday: placed.weekday,
-          periodNo: placed.periodNo,
-          targetClass: clazz || undefined
-        },
-        undefined,
-        (done, t) => {
-          autoProgress.value = `正在排「${entry.courseName}」第 ${done}/${t} 周（共 ${entries.length} 门，已排入 ${ok.length}）`;
-        }
-      );
-      // 占用标记按"已占"处理（保守）：即使个别周冲突，也避免下一门课排进同一格
-      teacherBusy.add(`${placed.weekday}-${placed.periodNo}-${entry.teacherId}`);
-      if (clazz) clazzBusy.add(`${placed.weekday}-${placed.periodNo}-${clazz}`);
-      if (placed.classroomId) roomBusy.add(`${placed.weekday}-${placed.periodNo}-${placed.classroomId}`);
-      // 负载表同步累加：下一门课打分时要看得见这一门，否则又堆回同一格
-      dayLoad[placed.weekday] = (dayLoad[placed.weekday] ?? 0) + 1;
-      (teacherPeriods[`${entry.teacherId}|${placed.weekday}`] ??= []).push(placed.periodNo);
-      if (clazz) sameClassDay[`${clazz}|${placed.weekday}`] = (sameClassDay[`${clazz}|${placed.weekday}`] ?? 0) + 1;
-      const roomName = placed.classroomId ? classroomsAll.value.find(r => r.classroomId === placed.classroomId)?.name ?? '' : '';
-      const where = `周${CN[placed.weekday - 1]} ${PERIODS.find(p => p.seq === placed.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}${clazz ? ' · ' + clazz : ''}`;
-      if (createdIds.length) {
-        ok.push(`「${entry.courseName}」→ ${where}（${createdIds.length}/${total} 周${failed.length ? `，跳过 ${failed.length} 周` : ''}${clazz ? '' : '，未填班级'}）`);
-        pushUndo({ kind: 'batchCreate', scheduleIds: createdIds, label: `自动排课「${entry.courseName}」` });
-      } else {
-        skip.push(`「${entry.courseName}」：所选时段全部周次冲突（${failed[0] ?? '原因未知'}）`);
-      }
+      if ((await attempt(entry, `${i + 1}/${entries.length}`, '', entries.length)) === 'fail') failures.push(entry);
+    }
+    if (failures.length) {
+      for (const [i, entry] of failures.entries()) await attempt(entry, `${i + 1}/${failures.length}`, '重试轮·', entries.length);
     }
   } finally {
     autoReport.value = { ok, skip };
