@@ -2257,6 +2257,27 @@ function entryClass(entry: PoolEntry) {
  * 权重集中在这里，日后按业务口径调参只动这张表，不动结构。 */
 /** 自动排课固定展开周数（每周 × 18）：与弹窗表单解耦，避免被残留的单双周模式带偏（2026-10-29 修） */
 const AUTO_WEEKS = 18;
+/* ---------- 每门课的自动排课口径（2026-10-29）：每周 / 单周 / 双周 ----------
+ * 会话级状态，key = PoolEntry.key（lesson-{scheduleId} / course-{courseId}，签刷新后仍在）。
+ * 残留键不清理也无副作用（签没了就查不到）；隔周展开次数 = 学期周数的一半。 */
+type PoolParity = 'all' | 'odd' | 'even';
+const PARITY_TEXT: Record<PoolParity, string> = { all: '每周', odd: '单周', even: '双周' };
+const poolParity = reactive<Record<string, PoolParity>>({});
+function parityOf(e: PoolEntry): PoolParity {
+  return poolParity[e.key] ?? 'all';
+}
+/** 点签上的口径胶囊循环切换：每周 → 单周 → 双周 → 每周 */
+function cycleParity(e: PoolEntry) {
+  const cur = parityOf(e);
+  poolParity[e.key] = cur === 'all' ? 'odd' : cur === 'odd' ? 'even' : 'all';
+}
+/** 自动排课弹窗的隔周汇总与锚定警告（存在非每周口径的课才显示） */
+const poolParitySummary = computed(() => {
+  const odd = poolEntries.value.filter(e => parityOf(e) === 'odd').length;
+  const even = poolEntries.value.filter(e => parityOf(e) === 'even').length;
+  if (!odd && !even) return '';
+  return `单周 ${odd} 门 · 双周 ${even} 门——隔周以当前浏览周为锚，开始前请先翻到学期第 1 周`;
+});
 type AutoSlot = { weekday: number; periodNo: number; classroomId?: number; capacity?: number };
 const AUTO_W = {
   /** 主目标：同一班级同一天已有几节课（每多一节 +100，等于把班级摊到不同天） */
@@ -2347,6 +2368,8 @@ async function runAuto() {
     }
     const need = entry.studentCount ?? 0;
     const clazz = entryClass(entry).trim();
+    // 本课的隔周口径（签上标的，默认每周）；隔周次数 = 学期周数一半（18 周 → 9 次）
+    const parity = parityOf(entry);
     /** 25 个格子全过一遍硬约束后打分取最低（原实现是取第一个空位就 break） */
     let placed: AutoSlot | null = null;
     let bestScore = Number.POSITIVE_INFINITY;
@@ -2391,7 +2414,7 @@ async function runAuto() {
         periodNo: placed.periodNo,
         targetClass: clazz || undefined
       },
-      { repeat: { mode: 'all', times: AUTO_WEEKS } },
+      { repeat: { mode: parity, times: parity === 'all' ? AUTO_WEEKS : Math.ceil(AUTO_WEEKS / 2) } },
       (done, t) => {
         autoProgress.value = `${phase}正在排「${entry.courseName}」第 ${done}/${t} 周（共 ${totalCount} 门，已排入 ${ok.length}）`;
       }
@@ -2407,7 +2430,7 @@ async function runAuto() {
     const roomName = placed.classroomId ? classroomsAll.value.find(r => r.classroomId === placed.classroomId)?.name ?? '' : '';
     const where = `周${CN[placed.weekday - 1]} ${PERIODS.find(p => p.seq === placed.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}${clazz ? ' · ' + clazz : ''}`;
     if (createdIds.length) {
-      ok.push(`「${entry.courseName}」→ ${where}（${createdIds.length}/${total} 周${failed.length ? `，跳过 ${failed.length} 周` : ''}${clazz ? '' : '，未填班级'}）`);
+      ok.push(`「${entry.courseName}」→ ${where}（${createdIds.length}/${total}${parity === 'all' ? ' 周' : ` 次 · ${PARITY_TEXT[parity]}`}${failed.length ? `，跳过 ${failed.length} 周` : ''}${clazz ? '' : '，未填班级'}）`);
       pushUndo({ kind: 'batchCreate', scheduleIds: createdIds, label: `自动排课「${entry.courseName}」` });
       return 'ok';
     }
@@ -2663,6 +2686,18 @@ watch(
         <ZkIcon name="grip-vertical" :size="13" class="grip" />
         <b>{{ c.courseName }}</b>
         <span class="small muted">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
+        <!-- 自动排课口径胶囊（2026-10-29）：每周/单周/双周循环切换，只影响自动排课；
+             .stop 防止误触发签本体的「打开新增表单」点击与拖拽 -->
+        <button
+          type="button"
+          class="chip-parity"
+          :class="{ 'is-alt': parityOf(c) !== 'all' }"
+          :title="`自动排课口径：${PARITY_TEXT[parityOf(c)]}${parityOf(c) === 'all' ? '' : '（隔周上，锚定当前浏览周）'}，点击切换`"
+          @mousedown.stop
+          @click.stop="cycleParity(c)"
+        >
+          {{ PARITY_TEXT[parityOf(c)] }}
+        </button>
       </div>
     </div>
     <div v-else class="pool-empty">
@@ -3348,16 +3383,11 @@ watch(
   <el-dialog v-model="autoVisible" title="自动排课" width="560px" :close-on-click-modal="!autoRunning">
     <template v-if="!autoReport">
       <p class="small" style="margin-top: 0">把「待排课程」池里的课自动排进空位；<b>课表上已有的课一律不动</b>。</p>
-      <div class="detail-row">
-        <span class="detail-k">重复</span>
-        <div style="flex: 1; min-width: 0">
-          <el-select v-model="repeatForm.mode" style="width: 100%">
-            <el-option v-for="(t, m) in REPEAT_TEXT" :key="m" :label="t" :value="m" />
-          </el-select>
-          <div v-if="repeatForm.mode !== 'once'" class="small muted">
-            以当前所在周为第 1 周 · {{ repeatHint }}
-          </div>
-        </div>
+      <!-- 重复口径在待排池每条签上单独标（2026-10-29）：每周/单周/双周点胶囊切换；原弹窗内
+           的「重复」下拉在口径与 runAuto 解耦后已是摆设，换成隔周汇总与锚定警告 -->
+      <div v-if="poolParitySummary" class="detail-row">
+        <span class="detail-k">隔周</span>
+        <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">{{ poolParitySummary }}</div>
       </div>
       <p class="small muted" style="margin: 10px 0 0">在教师空闲时段里挑最优格（同班级分天、五天拉平、同人连着上），教室按容量最贴自动配，排不进的最后统一报告。</p>
       <!-- 班级（2026-10-22 丙）：课程接口不出班级字段，不选就排成"未填班级"的课次（按班级筛选看不到） -->
@@ -4217,6 +4247,27 @@ watch(
 .pool-chip:hover {
   transform: translateY(-1px);
   box-shadow: var(--sh-1);
+}
+/* 自动排课口径胶囊（2026-10-29）：默认淡灰示「每周」，切成隔周后亮品牌色提示这是非默认口径 */
+.chip-parity {
+  margin-left: auto;
+  flex: none;
+  padding: 0 8px;
+  height: 18px;
+  line-height: 16px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--brand-800) 25%, transparent);
+  background: transparent;
+  color: var(--brand-800);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+}
+.chip-parity.is-alt {
+  background: var(--brand-800);
+  border-color: var(--brand-800);
+  color: #fff;
+  font-weight: 600;
 }
 /* ---- 待排课程展开浮层 ---- */
 .panel-tools {
