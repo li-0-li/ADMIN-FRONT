@@ -377,13 +377,16 @@ onMounted(async () => {
         <template v-if="loadError">记录数未取到（加载失败）</template>
         <template v-else>共 {{ total }} 门已通过课程</template>
       </span>
+      <!-- layout 必须含 sizes：改前只写 prev/pager/next，`:page-sizes` 虽然配了但选择器压根不渲染，
+           用户无法改每页条数（属于"配了参数却没生效"的静默缺陷） -->
       <el-pagination
         v-model:current-page="query.page"
         v-model:page-size="query.pageSize"
         :total="total"
         :page-sizes="[10, 20, 50]"
-        layout="prev, pager, next"
+        layout="sizes, prev, pager, next"
         @current-change="fetchList"
+        @size-change="onSearch"
       />
     </div>
   </div>
