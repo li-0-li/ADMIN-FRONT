@@ -2262,6 +2262,9 @@ async function createBatch(
  *   ③ 教室自动匹配：容量 ≥ 选课人数的空闲教室中取「余量最小」的；没有合适教室则不填（可手动补）。
  *   ④ 排不下/无教师的课跳过并进报告，不卡住其他课。
  * 重复口径固定「每周 × AUTO_WEEKS」，不跟随弹窗残留的单双周选择（2026-10-29 解耦，曾共用 repeatForm 有被带偏的隐患）。
+ * ★ 10-29 调研重构（工作汇报/20261029-丙线-自动排课算法调研-对比与改进选项.md）：规划/写库两阶段——
+ *   「生成排课方案」只在内存算（动态饱和度排序 + 腾挪回溯 + 随机重启择优），弹窗先给预览，
+ *   用户点「确认写入课表」才逐门真实写库；失败课先在方案里救一轮，不再「排不进就直接放弃」。
  * ★ 10-22 修①「点了像没反应」：原代码在开跑那一行就把 autoReport 置成空对象 ⇒ 弹窗立刻切到
  *   「报告视图」，进度文案住在 v-if="!autoReport" 分支里全程不显示，用户从头看到的就是
  *   「排课结果：成功 0 门，跳过 0 门」+「知道了」（零写入探针实测：跑动中显示"成功 8 门"，
@@ -2287,6 +2290,7 @@ function openAuto() {
     return;
   }
   autoReport.value = null;
+  autoPlan.value = null;
   autoProgress.value = '';
   autoClass.value = '';
   autoVisible.value = true;
@@ -2363,148 +2367,323 @@ function scoreAutoSlot(
   );
 }
 
-async function runAuto() {
-  if (autoRunning.value) return;
+/* ---------- 规划引擎（2026-10-29 调研后重构）：先规划后写库 + 动态饱和度 + 腾挪回溯 + 随机重启 ----------
+ * 业界对标（详见 工作汇报/20261029-丙线-自动排课算法调研-对比与改进选项.md）：
+ *   P1 动态饱和度：每落位一门就重算剩余课的空位数、最紧的先排（Brelaz 1979；旧版只在开跑时排一次序，会错过紧张度反转）
+ *   P2 规划/写库分离：方案在内存成型 → 弹窗预览 → 用户确认才逐门写库（旧版边找位边 POST，试错要付真实写库代价）
+ *   P3 腾挪回溯：新课无位时挑一门「挪走后双方都有位」的已规划课让位（Nottingham IH2 驱逐重排的单层简化）
+ *   P4 随机重启：同分随机破平跑 N 个方案取罚分最低（文献实证：贪心+随机重启≈弱化版元启发式）
+ * 明确不做 GA/模拟退火/CP-SAT：分钟级耗时+服务端算力，本页十来门课×25 格的规模用不上。
+ * 占用口径保持保守：单双周在占用表里按「整学期已占」处理（隔周共用同一格留待后续单独做）。 */
+
+/** 规划期占用快照：buildAutoCtx 一次打底（课表现状），每次重启 cloneAutoCtx 一份，绝不写回真实课表 */
+type AutoCtx = {
+  teacherBusy: Set<string>;
+  roomBusy: Set<string>;
+  clazzBusy: Set<string>;
+  sameClassDay: Record<string, number>;
+  dayLoad: Record<number, number>;
+  teacherPeriods: Record<string, number[]>;
+};
+
+/** 预览方案里的一门课：slot/clazz/parity 在规划时定死，提交时直接用（避免弹窗班级中途被改导致口径漂移） */
+type PlannedItem = {
+  entry: PoolEntry;
+  clazz: string;
+  parity: PoolParity;
+  slot: AutoSlot;
+  score: number;
+  /** 本课曾为谁让位（自己被腾挪到次优格时记录对方课名，预览里如实展示） */
+  movedFor: string | null;
+  /** 本课排入时挤走了谁（对方已改排次优格） */
+  ejected: string | null;
+};
+
+type AutoPlan = {
+  items: PlannedItem[];
+  failures: Array<{ label: string; reason: string }>;
+  /** 全方案罚分 = 各格得分之和 + 每门失败课重罚；随机重启择优的依据 */
+  penalty: number;
+};
+
+/** 重启次数：规划是纯内存计算（十来门课×25 格），8 次毫秒级完成；再多收益递减 */
+const AUTO_RESTARTS = 8;
+/** 失败重罚：让「少一门失败」的方案无条件胜过「格位打分更优」的方案 */
+const AUTO_FAIL_PENALTY = 1e6;
+
+function buildAutoCtx(): AutoCtx {
+  const ctx: AutoCtx = {
+    teacherBusy: new Set(),
+    roomBusy: new Set(),
+    clazzBusy: new Set(),
+    sameClassDay: {},
+    dayLoad: {},
+    teacherPeriods: {}
+  };
+  for (const c of allCells.value) {
+    if (!c.weekday || !c.periodNo) continue;
+    if (c.teacherId !== undefined && c.teacherId !== null) {
+      ctx.teacherBusy.add(`${c.weekday}-${c.periodNo}-${c.teacherId}`);
+      (ctx.teacherPeriods[`${c.teacherId}|${c.weekday}`] ??= []).push(c.periodNo);
+    }
+    if (c.classroomId !== undefined && c.classroomId !== null) ctx.roomBusy.add(`${c.weekday}-${c.periodNo}-${c.classroomId}`);
+    ctx.dayLoad[c.weekday] = (ctx.dayLoad[c.weekday] ?? 0) + 1;
+    const own = (c.clazzName ?? '').trim();
+    if (own) {
+      ctx.clazzBusy.add(`${c.weekday}-${c.periodNo}-${own}`);
+      ctx.sameClassDay[`${own}|${c.weekday}`] = (ctx.sameClassDay[`${own}|${c.weekday}`] ?? 0) + 1;
+    }
+  }
+  return ctx;
+}
+
+function cloneAutoCtx(c: AutoCtx): AutoCtx {
+  return {
+    teacherBusy: new Set(c.teacherBusy),
+    roomBusy: new Set(c.roomBusy),
+    clazzBusy: new Set(c.clazzBusy),
+    sameClassDay: { ...c.sameClassDay },
+    dayLoad: { ...c.dayLoad },
+    teacherPeriods: Object.fromEntries(Object.entries(c.teacherPeriods).map(([k, v]) => [k, [...v]]))
+  };
+}
+
+/** 把一次落位写进占用/负载表（正常落位与腾挪回溯共用；下一门课打分必须看得见这一门） */
+function ctxPlace(ctx: AutoCtx, teacherId: string | number, clazz: string, slot: AutoSlot) {
+  ctx.teacherBusy.add(`${slot.weekday}-${slot.periodNo}-${teacherId}`);
+  if (clazz) ctx.clazzBusy.add(`${slot.weekday}-${slot.periodNo}-${clazz}`);
+  if (slot.classroomId) ctx.roomBusy.add(`${slot.weekday}-${slot.periodNo}-${slot.classroomId}`);
+  ctx.dayLoad[slot.weekday] = (ctx.dayLoad[slot.weekday] ?? 0) + 1;
+  (ctx.teacherPeriods[`${teacherId}|${slot.weekday}`] ??= []).push(slot.periodNo);
+  if (clazz) ctx.sameClassDay[`${clazz}|${slot.weekday}`] = (ctx.sameClassDay[`${clazz}|${slot.weekday}`] ?? 0) + 1;
+}
+
+/** ctxPlace 的逆操作：腾挪回溯要临时摘掉一门已规划课再试位，试完放回 */
+function ctxUnplace(ctx: AutoCtx, teacherId: string | number, clazz: string, slot: AutoSlot) {
+  ctx.teacherBusy.delete(`${slot.weekday}-${slot.periodNo}-${teacherId}`);
+  if (clazz) ctx.clazzBusy.delete(`${slot.weekday}-${slot.periodNo}-${clazz}`);
+  if (slot.classroomId) ctx.roomBusy.delete(`${slot.weekday}-${slot.periodNo}-${slot.classroomId}`);
+  ctx.dayLoad[slot.weekday] = Math.max(0, (ctx.dayLoad[slot.weekday] ?? 0) - 1);
+  const arr = ctx.teacherPeriods[`${teacherId}|${slot.weekday}`];
+  if (arr) {
+    const i = arr.indexOf(slot.periodNo);
+    if (i >= 0) arr.splice(i, 1);
+  }
+  if (clazz) {
+    const k = `${clazz}|${slot.weekday}`;
+    ctx.sameClassDay[k] = Math.max(0, (ctx.sameClassDay[k] ?? 0) - 1);
+  }
+}
+
+/** 单格评估：过硬约束（教师/班级）→ 配容量最贴的空闲教室 → 按 AUTO_W 打分；违反硬约束返回 null */
+function evalAutoSlot(
+  ctx: AutoCtx,
+  teacherId: string | number,
+  clazz: string,
+  need: number,
+  wd: number,
+  pn: number,
+  roomCandidates: Classroom[]
+): { slot: AutoSlot; score: number } | null {
+  if (ctx.teacherBusy.has(`${wd}-${pn}-${teacherId}`)) return null;
+  if (clazz && ctx.clazzBusy.has(`${wd}-${pn}-${clazz}`)) return null;
+  let best: Classroom | undefined;
+  for (const r of roomCandidates) {
+    if (ctx.roomBusy.has(`${wd}-${pn}-${r.classroomId}`)) continue;
+    if ((r.capacity ?? 0) < need) continue;
+    if (!best || (r.capacity ?? 0) < (best.capacity ?? 0)) best = r;
+  }
+  const slot: AutoSlot = { weekday: wd, periodNo: pn, classroomId: best?.classroomId, capacity: best?.capacity };
+  const used = ctx.teacherPeriods[`${teacherId}|${wd}`] ?? [];
+  const score = scoreAutoSlot(slot, {
+    sameClassDay: clazz ? ctx.sameClassDay[`${clazz}|${wd}`] ?? 0 : 0,
+    dayLoad: ctx.dayLoad[wd] ?? 0,
+    teacherGap: used.length ? Math.min(...used.map(p => Math.abs(p - pn))) : 0,
+    need
+  });
+  return { slot, score };
+}
+
+/** 25 格全扫取最低分；rng 传入时对同分（±1e-9）格随机破平——这是随机重启的唯一随机源 */
+function bestAutoSlot(
+  ctx: AutoCtx,
+  teacherId: string | number,
+  clazz: string,
+  need: number,
+  roomCandidates: Classroom[],
+  rng?: () => number,
+  exclude?: string
+): { slot: AutoSlot; score: number } | null {
+  let bestScore = Number.POSITIVE_INFINITY;
+  const ties: Array<{ slot: AutoSlot; score: number }> = [];
+  for (const wd of [1, 2, 3, 4, 5]) {
+    for (const pn of [1, 2, 3, 4, 5]) {
+      if (exclude && `${wd}-${pn}` === exclude) continue;
+      const r = evalAutoSlot(ctx, teacherId, clazz, need, wd, pn, roomCandidates);
+      if (!r) continue;
+      if (r.score < bestScore - 1e-9) {
+        bestScore = r.score;
+        ties.length = 0;
+        ties.push(r);
+      } else if (r.score <= bestScore + 1e-9) {
+        ties.push(r);
+      }
+    }
+  }
+  if (!ties.length) return null;
+  return rng && ties.length > 1 ? ties[Math.floor(rng() * ties.length)] : ties[0];
+}
+
+/** 饱和度（Brelaz 1979）：教师×班级当前还剩多少可并存格；缺教师的课返回 ∞ 不参与排序（反正要跳过） */
+function freeAutoSlots(ctx: AutoCtx, entry: PoolEntry): number {
+  if (!entry.teacherId) return Number.POSITIVE_INFINITY;
+  const clz = entryClass(entry).trim();
+  let n = 0;
+  for (const wd of [1, 2, 3, 4, 5])
+    for (const pn of [1, 2, 3, 4, 5])
+      if (!ctx.teacherBusy.has(`${wd}-${pn}-${entry.teacherId}`) && !(clz && ctx.clazzBusy.has(`${wd}-${pn}-${clz}`))) n++;
+  return n;
+}
+
+/** 构造一个完整方案（纯内存，不写库）：动态饱和度选课 → 打分选格 → 失败时单层腾挪 → 罚分汇总 */
+function buildPlanOnce(ctxBase: AutoCtx, roomCandidates: Classroom[], rng: () => number): AutoPlan {
+  const ctx = cloneAutoCtx(ctxBase);
+  const remaining = poolEntries.value.slice();
+  const items: PlannedItem[] = [];
+  const failures: AutoPlan['failures'] = [];
+  let penalty = 0;
+  while (remaining.length) {
+    // P1：每次落位后重算剩余课的饱和度，最紧的先占位；同分随机破平（给 P4 提供多样性）
+    let min = Number.POSITIVE_INFINITY;
+    for (const e of remaining) {
+      const f = freeAutoSlots(ctx, e);
+      if (f < min) min = f;
+    }
+    const ties = remaining.filter(e => freeAutoSlots(ctx, e) === min);
+    const entry = ties[Math.floor(rng() * ties.length)];
+    remaining.splice(remaining.indexOf(entry), 1);
+    const label = `「${entry.courseName}」`;
+    if (!entry.teacherId) {
+      failures.push({ label, reason: '课程未指定授课教师，自动排课要求先定教师' });
+      continue;
+    }
+    const clazz = entryClass(entry).trim();
+    const need = entry.studentCount ?? 0;
+    const pick = bestAutoSlot(ctx, entry.teacherId, clazz, need, roomCandidates, rng);
+    if (pick) {
+      ctxPlace(ctx, entry.teacherId, clazz, pick.slot);
+      items.push({ entry, clazz, parity: parityOf(entry), slot: pick.slot, score: pick.score, movedFor: null, ejected: null });
+      penalty += pick.score;
+      continue;
+    }
+    // P3 腾挪回溯（单层）：挑「挪走后本课有位、且自己也有次优格」的已规划课，让位代价最小者成交
+    let deal: {
+      q: PlannedItem;
+      qOldScore: number;
+      qNew: { slot: AutoSlot; score: number };
+      ePick: { slot: AutoSlot; score: number };
+      cost: number;
+    } | null = null;
+    for (const q of items) {
+      ctxUnplace(ctx, q.entry.teacherId!, q.clazz, q.slot);
+      const ePick = bestAutoSlot(ctx, entry.teacherId, clazz, need, roomCandidates);
+      if (ePick) {
+        // Q 自己的次优格不能还是原格（exclude），否则腾挪是空转
+        const qNew = bestAutoSlot(ctx, q.entry.teacherId!, q.clazz, q.entry.studentCount ?? 0, roomCandidates, undefined, `${q.slot.weekday}-${q.slot.periodNo}`);
+        if (qNew) {
+          // 代价主看 Q 让位变差多少；E 的格位打分做次级参照（×1e-3 防止 E 挑了差格）
+          const cost = qNew.score - q.score + ePick.score * 1e-3;
+          if (!deal || cost < deal.cost) deal = { q, qOldScore: q.score, qNew, ePick, cost };
+        }
+      }
+      ctxPlace(ctx, q.entry.teacherId!, q.clazz, q.slot);
+    }
+    if (deal) {
+      ctxUnplace(ctx, deal.q.entry.teacherId!, deal.q.clazz, deal.q.slot);
+      ctxPlace(ctx, deal.q.entry.teacherId!, deal.q.clazz, deal.qNew.slot);
+      ctxPlace(ctx, entry.teacherId, clazz, deal.ePick.slot);
+      deal.q.slot = deal.qNew.slot;
+      deal.q.score = deal.qNew.score;
+      deal.q.movedFor = entry.courseName;
+      items.push({ entry, clazz, parity: parityOf(entry), slot: deal.ePick.slot, score: deal.ePick.score, movedFor: null, ejected: deal.q.entry.courseName });
+      penalty += deal.qNew.score - deal.qOldScore + deal.ePick.score;
+    } else {
+      failures.push({
+        label: `${label}${clazz ? `（${clazz}）` : ''}`,
+        reason: '周一至周五 1~5 节该教师或该班级已被占满，腾挪回溯后仍无位可排'
+      });
+    }
+  }
+  penalty += failures.length * AUTO_FAIL_PENALTY;
+  return { items, failures, penalty };
+}
+
+const autoPlan = ref<AutoPlan | null>(null);
+
+/** 阶段一「生成排课方案」：纯内存规划（毫秒级），产出预览；一条数据都不写（P2） */
+function runAuto() {
+  if (autoRunning.value || !poolEntries.value.length) return;
+  const ctxBase = buildAutoCtx();
+  const roomCandidates = classroomsAll.value.filter(r => (r.status ?? 'active') !== 'inactive');
+  // P4 随机重启：同分随机破平跑 N 个方案取罚分最低
+  let best: AutoPlan | null = null;
+  for (let i = 0; i < AUTO_RESTARTS; i++) {
+    const p = buildPlanOnce(ctxBase, roomCandidates, Math.random);
+    if (!best || p.penalty < best.penalty - 1e-9) best = p;
+  }
+  autoPlan.value = best;
+}
+
+/** 预览单行文案（与最终报告同口径，用户看到什么就写入什么） */
+function planItemText(item: PlannedItem): string {
+  const roomName = item.slot.classroomId ? classroomsAll.value.find(r => r.classroomId === item.slot.classroomId)?.name ?? '' : '';
+  const where = `周${CN[item.slot.weekday - 1]} ${PERIODS.find(p => p.seq === item.slot.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}${item.clazz ? ' · ' + item.clazz : ''}`;
+  const times = item.parity === 'all' ? `${AUTO_WEEKS} 周` : `${Math.ceil(AUTO_WEEKS / 2)} 次 · ${PARITY_TEXT[item.parity]}`;
+  const moved = item.movedFor ? `（为「${item.movedFor}」让位，改排次优格）` : '';
+  return `「${item.entry.courseName}」→ ${where}（${times}${item.clazz ? '' : '，未填班级'}）${moved}`;
+}
+
+/** 阶段二「确认写入课表」：按预览方案逐门真实写库；报告口径与旧版一致，写入失败如实进 skip */
+async function commitAuto() {
+  const plan = autoPlan.value;
+  if (!plan || autoRunning.value) return;
   autoRunning.value = true;
   autoReport.value = null;
   const ok: string[] = [];
   const skip: string[] = [];
-  // 三维占用表（key=weekday-period-维度值）：课表现有 + 本次自动排课新增的都记，防自己撞自己
-  // 教师/班级是硬约束（同节次不能并存）；教室是软约束（没有合适教室就不填）
-  const teacherBusy = new Set<string>();
-  const roomBusy = new Set<string>();
-  const clazzBusy = new Set<string>();
-  // 负载表（打分用）：同班级·同天节数 / 各天总节数 / 教师某天已用的节次，同样以现有课表打底
-  const sameClassDay: Record<string, number> = {};
-  const dayLoad: Record<number, number> = {};
-  const teacherPeriods: Record<string, number[]> = {};
-  for (const c of allCells.value) {
-    if (!c.weekday || !c.periodNo) continue;
-    if (c.teacherId !== undefined && c.teacherId !== null) {
-      teacherBusy.add(`${c.weekday}-${c.periodNo}-${c.teacherId}`);
-      (teacherPeriods[`${c.teacherId}|${c.weekday}`] ??= []).push(c.periodNo);
-    }
-    if (c.classroomId !== undefined && c.classroomId !== null) roomBusy.add(`${c.weekday}-${c.periodNo}-${c.classroomId}`);
-    dayLoad[c.weekday] = (dayLoad[c.weekday] ?? 0) + 1;
-    const own = (c.clazzName ?? '').trim();
-    if (own) {
-      clazzBusy.add(`${c.weekday}-${c.periodNo}-${own}`);
-      sameClassDay[`${own}|${c.weekday}`] = (sameClassDay[`${own}|${c.weekday}`] ?? 0) + 1;
-    }
-  }
-  const roomCandidates = classroomsAll.value.filter(r => (r.status ?? 'active') !== 'inactive');
-  // 智能顺序（2026-10-29）：可选节位最少的课先排——约束最紧的课先占位，免得被前面的课
-  // 挤到无位可排（贪心只动次序、不动打分结构；打分权重仍在 AUTO_W，调参不进这里）。
-  const entries = poolEntries.value.slice();
-  if (entries.length > 1) {
-    const freeCount = (e: (typeof entries)[number]) => {
-      if (!e.teacherId) return Number.POSITIVE_INFINITY; // 缺教师的反正要跳过，不参与排序
-      const clz = entryClass(e).trim();
-      let n = 0;
-      for (const wd of [1, 2, 3, 4, 5])
-        for (const pn of [1, 2, 3, 4, 5])
-          if (!teacherBusy.has(`${wd}-${pn}-${e.teacherId}`) && !(clz && clazzBusy.has(`${wd}-${pn}-${clz}`))) n++;
-      return n;
-    };
-    entries.sort((a, b) => freeCount(a) - freeCount(b));
-  }
-  /** 单门课「找最优节位 → 逐周落库 → 更新占用/负载表」的全过程，主轮与失败重试轮共用。
-   *  返回：'ok' 排入；'noTeacher' 缺教师跳过（不进重试）；'fail' 找不到可并存空位或整门周次冲突。 */
-  const attempt = async (
-    entry: (typeof entries)[number],
-    pos: string,
-    phase: string,
-    totalCount: number
-  ): Promise<'ok' | 'noTeacher' | 'fail'> => {
-    autoProgress.value = `${phase}正在排「${entry.courseName}」：第 ${pos} 门（已排入 ${ok.length} · 已跳过 ${skip.length}）`;
-    if (!entry.teacherId) {
-      skip.push(`「${entry.courseName}」：课程未指定授课教师，自动排课要求先定教师`);
-      return 'noTeacher';
-    }
-    const need = entry.studentCount ?? 0;
-    const clazz = entryClass(entry).trim();
-    // 本课的隔周口径（签上标的，默认每周）；隔周次数 = 学期周数一半（18 周 → 9 次）
-    const parity = parityOf(entry);
-    /** 25 个格子全过一遍硬约束后打分取最低（原实现是取第一个空位就 break） */
-    let placed: AutoSlot | null = null;
-    let bestScore = Number.POSITIVE_INFINITY;
-    for (const wd of [1, 2, 3, 4, 5]) {
-      for (const pn of [1, 2, 3, 4, 5]) {
-        if (teacherBusy.has(`${wd}-${pn}-${entry.teacherId}`)) continue;
-        // 班级维（编号 60 前端配套）：这个班在该节次已有别的课就跳过，别排一次注定被后端拒的
-        if (clazz && clazzBusy.has(`${wd}-${pn}-${clazz}`)) continue;
-        // 教室：该时段空闲且容量最贴（余量最小优先）；没有合适教室就不填教室
-        let best: Classroom | undefined;
-        for (const r of roomCandidates) {
-          if (roomBusy.has(`${wd}-${pn}-${r.classroomId}`)) continue;
-          if ((r.capacity ?? 0) < need) continue;
-          if (!best || (r.capacity ?? 0) < (best.capacity ?? 0)) best = r;
-        }
-        const slot: AutoSlot = { weekday: wd, periodNo: pn, classroomId: best?.classroomId, capacity: best?.capacity };
-        const used = teacherPeriods[`${entry.teacherId}|${wd}`] ?? [];
-        const sc = scoreAutoSlot(slot, {
-          sameClassDay: clazz ? sameClassDay[`${clazz}|${wd}`] ?? 0 : 0,
-          dayLoad: dayLoad[wd] ?? 0,
-          teacherGap: used.length ? Math.min(...used.map(p => Math.abs(p - pn))) : 0,
-          need
-        });
-        if (sc < bestScore) {
-          bestScore = sc;
-          placed = slot;
-        }
-      }
-    }
-    if (!placed) {
-      skip.push(
-        `「${entry.courseName}」${clazz ? `（${clazz}）` : ''}：周一至周五 1~5 节该教师或该班级已被占满，没有可并存的空位`
-      );
-      return 'fail';
-    }
-    const { createdIds, failed, total } = await createBatch(
-      {
-        courseId: entry.courseId,
-        teacherId: entry.teacherId,
-        classroomId: placed.classroomId,
-        weekday: placed.weekday,
-        periodNo: placed.periodNo,
-        targetClass: clazz || undefined
-      },
-      { repeat: { mode: parity, times: parity === 'all' ? AUTO_WEEKS : Math.ceil(AUTO_WEEKS / 2) } },
-      (done, t) => {
-        autoProgress.value = `${phase}正在排「${entry.courseName}」第 ${done}/${t} 周（共 ${totalCount} 门，已排入 ${ok.length}）`;
-      }
-    );
-    // 占用标记按"已占"处理（保守）：即使个别周冲突，也避免下一门课排进同一格
-    teacherBusy.add(`${placed.weekday}-${placed.periodNo}-${entry.teacherId}`);
-    if (clazz) clazzBusy.add(`${placed.weekday}-${placed.periodNo}-${clazz}`);
-    if (placed.classroomId) roomBusy.add(`${placed.weekday}-${placed.periodNo}-${placed.classroomId}`);
-    // 负载表同步累加：下一门课打分时要看得见这一门，否则又堆回同一格
-    dayLoad[placed.weekday] = (dayLoad[placed.weekday] ?? 0) + 1;
-    (teacherPeriods[`${entry.teacherId}|${placed.weekday}`] ??= []).push(placed.periodNo);
-    if (clazz) sameClassDay[`${clazz}|${placed.weekday}`] = (sameClassDay[`${clazz}|${placed.weekday}`] ?? 0) + 1;
-    const roomName = placed.classroomId ? classroomsAll.value.find(r => r.classroomId === placed.classroomId)?.name ?? '' : '';
-    const where = `周${CN[placed.weekday - 1]} ${PERIODS.find(p => p.seq === placed.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}${clazz ? ' · ' + clazz : ''}`;
-    if (createdIds.length) {
-      ok.push(`「${entry.courseName}」→ ${where}（${createdIds.length}/${total}${parity === 'all' ? ' 周' : ` 次 · ${PARITY_TEXT[parity]}`}${failed.length ? `，跳过 ${failed.length} 周` : ''}${clazz ? '' : '，未填班级'}）`);
-      pushUndo({ kind: 'batchCreate', scheduleIds: createdIds, label: `自动排课「${entry.courseName}」` });
-      return 'ok';
-    }
-    skip.push(`「${entry.courseName}」：所选时段全部周次冲突（${failed[0] ?? '原因未知'}）`);
-    return 'fail';
-  };
-  /** 主轮排不进的课进这里，末尾统一重试一轮（2026-10-29）。占用表保守按"已占"累计，
-   *  纯空位意义上重试多数仍失败——它是低成本兜底；真正的算法升级是「腾挪回溯」
-   *  （挪走一门已排课给失败课让位），动的是删/建写语义，须业主拍板另做。 */
-  const failures: (typeof entries)[number][] = [];
   try {
-    for (const [i, entry] of entries.entries()) {
-      if ((await attempt(entry, `${i + 1}/${entries.length}`, '', entries.length)) === 'fail') failures.push(entry);
+    for (const f of plan.failures) skip.push(`${f.label}：${f.reason}`);
+    for (const [i, item] of plan.items.entries()) {
+      autoProgress.value = `正在写入「${item.entry.courseName}」：第 ${i + 1}/${plan.items.length} 门（已写入 ${ok.length}）`;
+      const { createdIds, failed, total } = await createBatch(
+        {
+          courseId: item.entry.courseId,
+          teacherId: item.entry.teacherId!,
+          classroomId: item.slot.classroomId,
+          weekday: item.slot.weekday,
+          periodNo: item.slot.periodNo,
+          targetClass: item.clazz || undefined
+        },
+        { repeat: { mode: item.parity, times: item.parity === 'all' ? AUTO_WEEKS : Math.ceil(AUTO_WEEKS / 2) } },
+        (done, t) => {
+          autoProgress.value = `正在写入「${item.entry.courseName}」第 ${done}/${t} 周（第 ${i + 1}/${plan.items.length} 门）`;
+        }
+      );
+      const roomName = item.slot.classroomId ? classroomsAll.value.find(r => r.classroomId === item.slot.classroomId)?.name ?? '' : '';
+      const where = `周${CN[item.slot.weekday - 1]} ${PERIODS.find(p => p.seq === item.slot.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}${item.clazz ? ' · ' + item.clazz : ''}`;
+      const movedNote = item.movedFor ? `（为「${item.movedFor}」让位后改排）` : '';
+      if (createdIds.length) {
+        ok.push(
+          `「${item.entry.courseName}」→ ${where}（${createdIds.length}/${total}${item.parity === 'all' ? ' 周' : ` 次 · ${PARITY_TEXT[item.parity]}`}${failed.length ? `，跳过 ${failed.length} 周` : ''}${item.clazz ? '' : '，未填班级'}）${movedNote}`
+        );
+        pushUndo({ kind: 'batchCreate', scheduleIds: createdIds, label: `自动排课「${item.entry.courseName}」` });
+      } else {
+        skip.push(`「${item.entry.courseName}」：预览方案写入失败（${failed[0] ?? '原因未知'}）`);
+      }
     }
-    if (failures.length) {
-      for (const [i, entry] of failures.entries()) await attempt(entry, `${i + 1}/${failures.length}`, '重试轮·', entries.length);
-    }
-  } finally {
     autoReport.value = { ok, skip };
+    autoPlan.value = null;
+  } finally {
     autoRunning.value = false;
     autoProgress.value = '';
   }
@@ -3441,7 +3620,7 @@ watch(
 
   <!-- 自动排课（本地实现）：待排池贪心找空位，逐条真落库；结束出报告 -->
   <el-dialog v-model="autoVisible" title="自动排课" width="560px" :close-on-click-modal="!autoRunning">
-    <template v-if="!autoReport">
+    <template v-if="!autoReport && !autoPlan">
       <p class="small" style="margin-top: 0">把「待排课程」池里的课自动排进空位；<b>课表上已有的课一律不动</b>。</p>
       <!-- 重复口径在待排池每条签上单独标（2026-10-29）：每周/单周/双周点胶囊切换；原弹窗内
            的「重复」下拉在口径与 runAuto 解耦后已是摆设，换成隔周汇总与锚定警告 -->
@@ -3464,7 +3643,28 @@ watch(
       </p>
       <p v-else-if="autoRunning" class="small muted" style="margin: 12px 0 0">准备中…</p>
     </template>
-    <template v-else>
+    <!-- 预览视图（2026-10-29 规划/写库分离）：方案成型先过目，确认后才写库 -->
+    <template v-else-if="autoPlan">
+      <p style="margin-top: 0">
+        <b>排课方案预览：可排 {{ autoPlan.items.length }} 门，排不进 {{ autoPlan.failures.length }} 门</b>
+      </p>
+      <p class="small muted" style="margin: 0 0 8px">
+        已按「最紧的课先占位、排不进的尝试腾挪让位、多方案取最优」在本地算好；点「确认写入课表」才真正保存。
+      </p>
+      <ul class="small" style="padding-left: 18px; line-height: 2">
+        <li v-for="(item, i) in autoPlan.items" :key="'plan' + i">{{ planItemText(item) }}</li>
+      </ul>
+      <div v-if="autoPlan.failures.length">
+        <b class="small">排不进：</b>
+        <ul class="small" style="color: var(--error, #d92d20); padding-left: 18px; line-height: 2">
+          <li v-for="(f, i) in autoPlan.failures" :key="'pfail' + i">{{ f.label }}：{{ f.reason }}</li>
+        </ul>
+      </div>
+      <p v-if="autoProgress" class="small" style="margin: 12px 0 0">
+        <ZkIcon name="refresh-cw" :size="13" style="margin-right: 4px" />{{ autoProgress }}
+      </p>
+    </template>
+    <template v-else-if="autoReport">
       <p style="margin-top: 0">
         <b>排课结果：成功 {{ autoReport.ok.length }} 门，跳过 {{ autoReport.skip.length }} 门</b>
       </p>
@@ -3479,12 +3679,17 @@ watch(
       </div>
     </template>
     <template #footer>
-      <span v-if="!autoReport">
-        <el-button :disabled="autoRunning" @click="autoVisible = false">取消</el-button>
-        <el-button type="primary" :loading="autoRunning" @click="runAuto">开始自动排课</el-button>
+      <span v-if="autoReport">
+        <el-button type="primary" @click="autoVisible = false">知道了</el-button>
+      </span>
+      <span v-else-if="autoPlan">
+        <el-button :disabled="autoRunning" @click="autoPlan = null">返回修改</el-button>
+        <el-button :disabled="autoRunning" @click="runAuto">重新规划</el-button>
+        <el-button type="primary" :loading="autoRunning" @click="commitAuto">确认写入课表</el-button>
       </span>
       <span v-else>
-        <el-button type="primary" @click="autoVisible = false">知道了</el-button>
+        <el-button :disabled="autoRunning" @click="autoVisible = false">取消</el-button>
+        <el-button type="primary" @click="runAuto">生成排课方案</el-button>
       </span>
     </template>
   </el-dialog>
