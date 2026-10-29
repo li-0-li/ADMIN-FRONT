@@ -23,7 +23,7 @@
       <el-input
         v-model="keyword"
         class="f-kw"
-        :placeholder="tab === 'operation' ? '操作人（如 T2026003）' : '账号或 IP'"
+        :placeholder="tab === 'operation' ? '操作人' : '账号或 IP'"
         clearable
         @keyup.enter="onSearch"
       />
@@ -31,7 +31,7 @@
         v-if="tab === 'operation'"
         v-model="moduleName"
         class="f-mod"
-        placeholder="模块名（如 智能排课）"
+        placeholder="模块名"
         clearable
         @keyup.enter="onSearch"
       />
