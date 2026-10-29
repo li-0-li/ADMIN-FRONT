@@ -9,6 +9,7 @@ import type { AdminCourseOrderBy, AdminCourseVo } from '@/api/admin/courses';
 import { getCertDetail, reviewCertification } from '@/api/admin/certifications';
 import { listSchedules } from '@/api/admin/schedules';
 import { listTerms } from '@/api/admin/basicdata';
+import { useUserStore } from '@/store/user';
 import type { CertDetail } from '@/types/admin';
 
 /**
@@ -36,6 +37,13 @@ const total = ref(0);
 /** 失败态与空态分开存：接口挂了不能显示成"没有课程"（账号页同款处理） */
 const loadError = ref('');
 const router = useRouter();
+const userStore = useUserStore();
+/**
+ * 导出按钮的显示条件是「真有这个权限」，不是「后端换了包」：
+ * admin:courses:export 目前既没建菜单也没授角色（10-29 实测 /system/menu/list 里无此 perms），
+ * 非超管账号点了必然 403。规范做法是没权限就不显示，而不是摆一个点不动的按钮。
+ */
+const canExport = computed(() => userStore.hasPermi('admin:courses:export'));
 /** scheduleState：排课状态筛选（'' 全部 / 'scheduled' 已排课 / 'unscheduled' 未排课）
  *  见下方 fetchList 的说明：这个条件没法交给后端分页，只能本地筛。 */
 const query = reactive<{
@@ -513,7 +521,7 @@ onMounted(async () => {
       </el-button>
       <!-- 导出（C-12b）：按当前关键词/学期/排序导出。★ 排课情况筛选是前端本地筛，
            后端不认 ⇒ 带该条件时导出的是"该关键词/学期下的全部课程"，提示里会明说 -->
-      <el-button class="tb-btn tb-btn-export" :loading="exporting" @click="onExport">
+      <el-button v-if="canExport" class="tb-btn tb-btn-export" :loading="exporting" @click="onExport">
         <ZkIcon name="file-text" :size="15" style="margin-right: 4px" />导出
       </el-button>
     </div>
@@ -542,7 +550,9 @@ onMounted(async () => {
       <!-- 名称可能很长（如「小程序教师端测试课程1」）：规范要求超长以 … 省略、悬停看全文 -->
       <el-table-column label="课程名称" min-width="170" prop="courseName" show-overflow-tooltip>
         <template #default="{ row }">
-          <div style="font-weight: 600; color: var(--ink-900)">{{ row.courseName }}</div>
+          <!-- 主键列做成可点链接（Ant Design Pro 的标准做法）：点名称直接看详情，
+               比每次往右挪到「查看」快；右上角「查看」保留，两处入口不冲突 -->
+          <a class="course-link" href="javascript:void(0)" @click="openDetail(row)">{{ row.courseName }}</a>
         </template>
       </el-table-column>
       <el-table-column label="授课教师" width="110" prop="teacherName">
@@ -804,6 +814,16 @@ onMounted(async () => {
    默认 white-space:normal 会把「删除」挤到第二行，行高直接翻倍。 */
 :deep(.courses-op .cell) {
   white-space: nowrap;
+}
+/* 主键列（课程名称）做成链接样式：蓝色 + 悬停下划线，表明"可以点进去"，
+   不能只靠加粗——加粗在表格里更像"强调"而不是"可点击" */
+.course-link {
+  font-weight: 600;
+  color: var(--brand-600, #2563eb);
+  text-decoration: none;
+}
+.course-link:hover {
+  text-decoration: underline;
 }
 /* 未排课单元格：徽标 + 直达链接并排 */
 .sched-cell {
