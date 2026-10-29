@@ -29,12 +29,28 @@ const courses = ref<{ courseId: string; name: string }[]>([]);
 const filters = reactive({ termId: '', deptId: '', major: '', courseId: '' });
 /** 预警名单状态：open 待处理 / closed 已处理（闭环切换） */
 const alertStatus = ref<'open' | 'closed'>('open');
+/**
+ * 预警名单分页（前端分页）。
+ * 后端 alerts 是聚合接口里的一次性数组（mapper 里按 200 条截断），**没有 page/pageSize 参数、也不返回 total**
+ * ⇒ 服务端分页做不了，只能在已拿到的这批里翻页。必须分页的原因：待处理 200 条时一屏滚不完，
+ * 且每行一个「标记已处理」按钮，200 个按钮同时挂载既卡又容易点错行。
+ * 每页条数写死 20、不开放 pageSize 切换：200 条上限里可切换的档位只有 10/20/50 三档，多一个下拉只是多一处选错。
+ */
+const ALERT_PAGE_SIZE = 20;
+const alertPage = ref(1);
+/** 下拉字典（学期/院系/专业/课程）加载失败的常驻提示；空串=正常 */
+const pickersError = ref('');
 
 const dimBadge = computed(() => {
   const t = terms.value.find(o => String(o.termId) === filters.termId)?.name ?? '全部学期';
   const d = depts.value.find(o => String(o.deptId) === filters.deptId)?.name ?? '全部院系';
-  const m = majors.value.find(x => x === filters.major) ?? '全部专业';
-  const c = courses.value.find(o => String(o.courseId) === filters.courseId)?.name ?? '全部课程';
+  // 专业：候选值本身就是 filters.major（来源同一份 majors 列表）⇒ 直接取值，不再 find 一遍。
+  // 原写法 `majors.find(x => x === filters.major) ?? '全部专业'` 在字典为空/加载失败时会回落成
+  // 「全部专业」，而聚合接口仍在按该专业过滤 —— 屏上口径与实际口径不一致，且这串字会进 CSV 首行和文件名。
+  const m = filters.major || '全部专业';
+  // 课程：同理，取不到名字时宁可显示 id，也不能说成「全部课程」
+  const c = courses.value.find(o => String(o.courseId) === filters.courseId)?.name
+    ?? (filters.courseId ? `课程 ${filters.courseId}` : '全部课程');
   return `${t} · ${d} · ${m} · ${c}`;
 });
 
@@ -52,16 +68,28 @@ async function loadPickers() {
     // ⚠️ 远端库 major 表曾为空导致下拉无选项，10-20 已按 course.major 去重补种
     majors.value = (mRes?.list ?? []).map(m => m.name || '').filter(Boolean);
     // 课程下拉只列启用中的课程：过滤掉教师端测试遗留的 creating 草稿（111/jljl 之类）
-    courses.value = (cRes?.list ?? [])
+    const rawCourses = cRes?.list ?? [];
+    const pickable = rawCourses
       .filter(c => c.courseId !== undefined && c.status === 'active')
       .map(c => ({ courseId: String(c.courseId), name: (c.courseName as string) || String(c.courseId) }));
+    /* 但「当前已选中的那门课」即便已停用也必须留在列表里：否则下拉回显成裸 id、
+       dimBadge 回落成「全部课程」，而聚合接口仍在按它过滤 —— 屏上口径与实际口径不一致，
+       导出文件名与 CSV 首行也跟着错（与 dept 列表「只增不减」是同一类防御）。 */
+    if (filters.courseId && !pickable.some(o => o.courseId === filters.courseId)) {
+      const cur = rawCourses.find(c => String(c.courseId) === filters.courseId);
+      if (cur) pickable.push({ courseId: String(cur.courseId), name: (cur.courseName as string) || String(cur.courseId) });
+    }
+    courses.value = pickable;
     // 学期默认选中「当前学期」，没有标记就取第一个
     if (!filters.termId) {
       const cur = tRes?.list?.find(t => t.isCurrent === 1) ?? tRes?.list?.[0];
       if (cur?.termId !== undefined) filters.termId = String(cur.termId);
     }
   } catch {
-    /* 已在请求层提示；筛选下拉留空不影响主数据展示 */
+    /* 已在请求层提示（toast 几秒就散）。这里再落一条常驻标记：
+       字典拉不到时 filters.termId 保持为空 ⇒ 实际统计口径是「全部学期」，而用户以为自己看的是当前学期。
+       不写明就是一次静默的口径切换 —— 数字都对，但答的不是同一个问题。 */
+    pickersError.value = '学期/院系/专业/课程下拉加载失败：当前按「全部学期、不限院系/专业/课程」统计，点「刷新」可重试';
   }
 }
 
@@ -135,7 +163,11 @@ function reloadSoon() {
 
 watch(
   [() => filters.termId, () => filters.deptId, () => filters.major, () => filters.courseId, alertStatus],
-  () => reloadSoon()
+  () => {
+    // 筛选或页签一换就是换了一批数据，停在原页码没有意义（且很可能越界到不存在的页）
+    alertPage.value = 1;
+    reloadSoon();
+  }
 );
 
 /* ---------- 统计卡 ---------- */
@@ -443,14 +475,37 @@ const sortedAlerts = computed<AnalyticsAlert[]>(() => {
 });
 /** 名单当前页签里按姓名去重的学生数（用于在同一页签内把「行 / 人」说清） */
 const alertRowStudents = computed(() => new Set(sortedAlerts.value.map(a => String(a.student ?? ''))).size);
+const alertPageCount = computed(() => Math.max(1, Math.ceil(sortedAlerts.value.length / ALERT_PAGE_SIZE)));
+/**
+ * 页码越界自愈：筛选或页签换过之后总数可能从 200 掉到 3，若死守第 10 页就会看到一张空表，
+ * 而且没有任何提示（看起来像「没有预警」）。这里把当前页夹在 [1, 总页数] 内，
+ * 显示的页码与表格数据永远同源 —— 不靠「记得在每次 load 后重置」这种容易漏的约定。
+ */
+const alertSafePage = computed(() => Math.min(Math.max(1, alertPage.value), alertPageCount.value));
+/** 当前页第一条在整份名单里的下标：表格「#」列要显示全局序号，不能每页都从 1 开始 */
+const alertRowOffset = computed(() => (alertSafePage.value - 1) * ALERT_PAGE_SIZE);
+/** 只给表格用。CSV 导出必须走全量 `sortedAlerts.value` —— 导出的是「当前筛选的全部数据」，不是当前页 */
+const pagedAlerts = computed(() =>
+  sortedAlerts.value.slice(alertRowOffset.value, alertRowOffset.value + ALERT_PAGE_SIZE)
+);
+/** el-pagination 只往外抛页码，落库前先夹一次，避免把越界值写回 alertPage */
+function onAlertPageChange(p: number) {
+  alertPage.value = Math.min(Math.max(1, p), alertPageCount.value);
+}
 /** 实测：summary.alertStudents / alertCount / alertDelta 恒为「待处理」口径，切到「已处理」页签时不随表变
  *  （`count(distinct student_id where status='open')`）⇒ 文案必须按页签分开写，否则会把两个集合当成同一集合对照 */
 const alertCardTitle = computed(() => alertStatus.value === 'open'
   ? '待处理口径的去重学生数（后端 summary.alertStudents）：同一学生命中多条预警只计 1 人，所以它小于名单行数'
   : '这张卡始终是「待处理」口径的学生数，不随「已处理」页签变化；下方名单是已处理记录，两个集合不同，不能相减比对');
-const alertCaliberNote = computed(() => alertStatus.value === 'open'
-  ? `本表一行 = 一条待处理预警（现 ${sortedAlerts.value.length} 行，涉及 ${alertRowStudents.value} 名学生）；上方卡片按学生去重，两者不等不是数据错。名单不受 page/pageSize 影响，后端上限 200 条、超出静默截断且无 total。`
-  : `本表一行 = 一条已处理预警（现 ${sortedAlerts.value.length} 行，涉及 ${alertRowStudents.value} 名学生）；上方「预警学生」仍是待处理口径（${data.value?.summary?.alertStudents ?? '—'} 人），与本页签不是同一集合。名单不受 page/pageSize 影响，后端上限 200 条、超出静默截断且无 total。`);
+const alertCaliberNote = computed(() => {
+  /* 分页口径必须写在屏上：后端一次最多返 200 条、超出静默截断且不给 total，
+     所以「共 N 条」只能读成「本次拿到的条数」，不能读成「库里一共这么多」；
+     而翻页是本页在前端对这批数据切片，不是服务端分页（换页不会重新请求）。 */
+  const page = `分页在本页内对已返回的这批数据翻页（换页不重新请求）；后端一次最多返 200 条、超出静默截断且不给 total，故「${sortedAlerts.value.length} 条」是本次拿到的条数，不保证是库里全部。`;
+  return alertStatus.value === 'open'
+    ? `本表一行 = 一条待处理预警（共 ${sortedAlerts.value.length} 条，涉及 ${alertRowStudents.value} 名学生）；上方卡片按学生去重，两者不等不是数据错。${page}`
+    : `本表一行 = 一条已处理预警（共 ${sortedAlerts.value.length} 条，涉及 ${alertRowStudents.value} 名学生）；上方「预警学生」仍是待处理口径（${data.value?.summary?.alertStudents ?? '—'} 人），与本页签不是同一集合。${page}`;
+});
 const alertSortHint = computed(() =>
   alertStatus.value === 'closed' ? '按处理时间最新在前' : '按等级高→低、同级按当前分低→高'
 );
@@ -513,6 +568,8 @@ function buildCsv(): string {
   out.push(csvRow([]));
   out.push(csvRow([`预警名单（${closed ? '已处理' : '待处理'}）`]));
   out.push(csvRow(['学生', '课程', '院系', '类型', '当前分', '等级', closed ? '处理时间' : '状态', closed ? '处理备注' : '']));
+  // ⚠️ 必须用全量 sortedAlerts：表格是分页的（每页 20），这里若跟着改成 pagedAlerts，
+  // 导出的报表就只剩当前页 20 行，而文件名叫「当前筛选报表」—— 交出去是一份看着正常、其实缺行的报表
   for (const x of sortedAlerts.value) out.push(csvRow([x.student, x.course, x.dept, x.type, x.score, levelOf(x.level).label, closed ? x.handledAt ?? '—' : x.status ?? 'open', closed ? x.handleNote ?? '' : '']));
   return out.join('');
 }
@@ -546,6 +603,21 @@ function onExport() {
   ElMessage.success('报表已按当前筛选维度生成');
 }
 
+/**
+ * 手动刷新。本页没有轮询：五个维度打的是同一个全量聚合接口（实测 2~8 秒一次），
+ * 轮询会把后端与库一起压住；但没有轮询就意味着屏上数据只会因「改筛选」而更新 ——
+ * 用户想看最新只能改一次筛选再改回来，或者 F5 整页重载（后者连筛选条件一起丢掉）。
+ * 所以给一个只重拉数据、不动筛选的按钮。
+ * 不重拉下拉字典：学期/院系/专业/课程是基础数据，跟着刷新重建会把用户已选项冲掉
+ * （dept 列表还有「只增不减」的合并逻辑专门防这件事，没必要自己绕回去）。
+ */
+async function onRefresh() {
+  await load();
+  // 无反馈的刷新等于没刷新：遮罩只闪一下，用户分不清「已经拉过了」和「点了没反应」
+  if (loadError.value) ElMessage.error('刷新失败，失败原因已显示在页上');
+  else ElMessage.success(`已刷新 · ${loadedAt.value}`);
+}
+
 onMounted(async () => {
   await Promise.all([load(), loadPickers()]);
 });
@@ -555,6 +627,9 @@ onMounted(async () => {
   <div class="page-head">
     <h1>全校学情统计看板</h1>
     <div class="actions">
+      <button class="btn btn-outline" :disabled="loading" title="按当前筛选维度重新拉一次数据，不清空筛选；下拉字典不重拉" @click="onRefresh">
+        <ZkIcon name="refresh-cw" :size="16" style="margin-right: 4px" />刷新
+      </button>
       <button class="btn btn-outline" title="按上方筛选维度导出本页全部表格数据（CSV）" @click="onExport">
         <ZkIcon name="download" :size="16" style="margin-right: 4px" />导出当前筛选报表
       </button>
@@ -584,6 +659,12 @@ onMounted(async () => {
         <el-option v-for="c in courses" :key="c.courseId" :label="c.name" :value="String(c.courseId)" />
       </el-select>
       <span class="badge badge-info dim-badge">{{ dimBadge }}</span>
+    </div>
+
+    <!-- 字典加载失败：不阻塞主数据（聚合接口照常出数），但必须写明屏上口径已退回「全部学期」，
+         否则用户看到的数字与「当前学期」不是同一口径，而屏上没有任何迹象 -->
+    <div v-if="pickersError" class="gap-warn small">
+      <ZkIcon name="alert-triangle" :size="14" style="vertical-align: -2px; margin-right: 6px" />{{ pickersError }}
     </div>
 
     <template v-if="data">
@@ -962,8 +1043,9 @@ onMounted(async () => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="(a, ai) in sortedAlerts" :key="a.alertId ?? (a.student + a.course)">
-              <td class="muted">{{ ai + 1 }}</td>
+            <tr v-for="(a, ai) in pagedAlerts" :key="a.alertId ?? (a.student + a.course)">
+              <!-- 全局序号：分页后每页都从 1 开始会让人以为换了批数据 -->
+              <td class="muted">{{ alertRowOffset + ai + 1 }}</td>
               <td>{{ a.student || '—' }}</td>
               <td>{{ a.course || '—' }}</td>
               <td>{{ a.dept || '—' }}</td>
@@ -982,11 +1064,28 @@ onMounted(async () => {
           </tbody>
         </table>
         </div>
-        <!-- 空态：待处理无预警是好事（正向文案）；已处理为空是普通无数据 -->
+        <!-- 空态：待处理无预警是好事（正向文案）；已处理为空是普通无数据。
+             ⚠️ 必须紧跟上面的 v-if 块 —— 2026-10-29 教训：分页条曾插在这两者之间，
+             v-else 悄悄改配分页条的 v-if（编译合法、类型检查全绿），
+             结果「已处理」只有一页时表格与「还没有已处理的预警记录」空态同时渲染，
+             被探针读出 rows=3 且 empty=true 才暴露。 -->
         <div v-else class="empty">
           <span class="empty-icon" :class="{ ok: alertStatus === 'open' }"><ZkIcon :name="alertStatus === 'open' ? 'shield-check' : 'badge-check'" :size="22" /></span>
           <p class="empty-main">{{ alertStatus === 'open' ? '当前筛选范围内没有触发预警的学生' : '还没有已处理的预警记录' }}</p>
           <p class="small muted">{{ alertStatus === 'open' ? '低分、成绩退步、连续未提交的学生会自动出现在这里' : '在「待处理」里点击「标记已处理」后，记录会留痕在这里' }}</p>
+        </div>
+        <!-- 分页条：只在前端对已返回的这批切片（后端无 page/pageSize 参数，见 alertPage 注释）。
+             不足一页时不渲染 —— 3 条数据底下挂个「1」既不美观也让人以为还有更多。
+             位置在空态之后：它是名单有数据时的附属控件，不该插进 v-if/v-else 配对中间。 -->
+        <div v-if="sortedAlerts.length && alertPageCount > 1" class="between pager">
+          <span class="small muted">第 {{ alertSafePage }} / {{ alertPageCount }} 页 · 每页 {{ ALERT_PAGE_SIZE }} 条</span>
+          <el-pagination
+            :current-page="alertSafePage"
+            :page-size="ALERT_PAGE_SIZE"
+            :total="sortedAlerts.length"
+            layout="prev, pager, next"
+            @current-change="onAlertPageChange"
+          />
         </div>
         <!-- 编号 51/15 的屏上交代：卡片是「人」，名单是「条」；名单不分页、有 200 条静默截断上限。放在表格之后，与本页其它 .caliber 同位（放表头与表之间会把 card-head 间距顶成 26px） -->
         <div v-if="sortedAlerts.length" class="caliber small muted">{{ alertCaliberNote }}</div>
@@ -1024,6 +1123,21 @@ onMounted(async () => {
   flex-wrap: wrap;
   align-items: center;
   padding: 14px 18px;
+}
+/* 预警名单分页条：与表格同一张卡内，用上边线与表体分开（表格自己带 .tbl-wrap 滚动） */
+.pager {
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+}
+/* 口径退化提示：整宽一条，颜色用 warning 底，不与卡片抢层级 */
+.gap-warn {
+  margin-top: 12px;
+  padding: 9px 14px;
+  border: 1px solid var(--warning);
+  border-radius: 8px;
+  background: #fffbeb;
+  color: #92400e;
+  line-height: 1.6;
 }
 .filter-bar .dim-badge {
   margin-left: auto;
