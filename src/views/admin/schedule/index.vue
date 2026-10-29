@@ -8,21 +8,76 @@ import type { ScheduleCreateBody, ScheduleSwapBody, ScheduleUpdateBody } from '@
 import { deleteCourse } from '@/api/admin/courses';
 import { listClasses, listClassrooms, listMajors, listSchools, listTerms, updateClassroom } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
+import { listPeriods } from '@/api/admin/periods';
 import type { Classroom, CourseBrief, ScheduleCell } from '@/types/admin';
 
 /**
- * 节次表（库表 class_period 无查询接口 ⇒ 前端恒定一份）。
- * 时间由业务方给出：每段 110 分钟，第 5 段为晚课。
- * ⚠️ 与库内 class_period 原值不一致（库里是 08:30/10:25/14:00/15:55/19:00 各 95 分钟），
- *    以业务方口径为准；库表已同步（见工作汇报台账）。
+ * 节次表（★ 已不是常量——主数据源是 GET /api/v1/admin/periods，见 loadPeriods）。
+ * 下面这份是**兜底初值**：接口不可用时（10-26 运行包无此端点、或后端故障）页面照常渲染，
+ * 数据与库内现值一致（10-28 后端线 D1 已把库对齐到 110 分钟口径）；接口可用后兜底永不触发。
+ * 换成 reactive 而不是 ref：本文件 22 处使用点（grid 的 PERIODS.map、节次上下导航的
+ * findIndex/find、文案拼接）全部按普通数组写法消费，reactive 数组不必改任何一行；
+ * 整体替换必须用 splice（reactive 代理不能重新赋值，赋了就丢响应）。
+ * 旧注释留档：时间由业务方给出每段 110 分钟；库里原值 08:30/95 分钟曾与这里不一致，
+ * 10-28 起两边都是 110 口径，且以接口为准后此注释只剩历史意义。
  */
-const PERIODS = [
-  { seq: 1, label: '1-2 节', start: '08:00', end: '09:50', duration: 110 },
-  { seq: 2, label: '3-4 节', start: '10:10', end: '12:00', duration: 110 },
-  { seq: 3, label: '5-6 节', start: '14:30', end: '16:20', duration: 110 },
-  { seq: 4, label: '7-8 节', start: '16:40', end: '18:30', duration: 110 },
+const PERIODS = reactive([
+  { seq: 1, label: '1-2 节', start: '08:00', end: '09:50', duration: 110, evening: false },
+  { seq: 2, label: '3-4 节', start: '10:10', end: '12:00', duration: 110, evening: false },
+  { seq: 3, label: '5-6 节', start: '14:30', end: '16:20', duration: 110, evening: false },
+  { seq: 4, label: '7-8 节', start: '16:40', end: '18:30', duration: 110, evening: false },
   { seq: 5, label: '9-10 节', start: '19:00', end: '20:50', duration: 110, evening: true }
-];
+]);
+
+/* ---------------- 节次配置加载（接口主源 + 兜底回落，施工项 #3）----------------
+ * 为什么要回落而不是报错：/api/v1/admin/periods 是后端 10-28 新增端点，8080 的运行包
+ * （10-26）里还没有 ⇒ 换包前这个请求**必然**拿到 "No static resource"。排课页是演示
+ * 重点页，节次行结构（grid）直接由 PERIODS 驱动，报错方案会让页面在换包前一直不可用；
+ * 兜底值与库内现值一致（后端线 D1 已对齐 110 口径），回落期间演示无感。
+ * 接口可用后回落分支永不触发；届时若库内再调节次时间，前端零改动。
+ *
+ * ★ 映射键是 seq：课次数据的 periodNo（数字）对应接口的 seq；
+ *   接口的 periodNo 是 "1-2" 展示串，不是键——按字面用它映射会全部 miss（实测样本可查）。
+ */
+const periodsFallback = ref(true);
+const PERIODS_FALLBACK_TIP = '节次时段为本地默认值（节次接口暂不可用），如与教务实际作息不符请以后者为准';
+
+/** "HH:mm" 差值分钟数；跨午夜的节次按 0 处理并留给调用方兜底（当前业务不存在跨午夜段） */
+function minutesBetween(start: string, end: string): number {
+  const [sh, sm] = start.split(':').map(Number);
+  const [eh, em] = end.split(':').map(Number);
+  const diff = (eh * 60 + em) - (sh * 60 + sm);
+  return diff > 0 ? diff : 0;
+}
+
+async function loadPeriods() {
+  try {
+    const res = await listPeriods({ page: 1, pageSize: 10 });
+    const rows = (res?.list ?? [])
+      .filter(p => p && p.seq != null && p.startTime && p.endTime)
+      .map(p => {
+        const startHour = Number(String(p.startTime).slice(0, 2));
+        return {
+          seq: Number(p.seq),
+          label: p.periodName,
+          start: p.startTime,
+          end: p.endTime,
+          // 接口没有 duration 字段 ⇒ 由起止时间实算（拖动冲突检查的 durationMin 消费）
+          duration: minutesBetween(p.startTime, p.endTime),
+          // 接口没有 evening 字段 ⇒ 推导：晚课段命名带"晚"（现库口径），或开始时间在 19 点后。
+          // 失效条件：业务把晚课挪到 19 点前开始且改名 ⇒ 需后端补 evening 字段，别再猜。
+          evening: p.periodName.includes('晚') || startHour >= 19
+        };
+      })
+      .sort((a, b) => a.seq - b.seq); // 节次上下导航（findIndex ± 1）依赖数组有序，不能信后端返回序
+    if (!rows.length) throw new Error('节次列表为空');
+    PERIODS.splice(0, PERIODS.length, ...rows);
+    periodsFallback.value = false;
+  } catch {
+    /* 保持兜底初值不动；静默降级 + 顶部提示条说明，不弹 toast（页面照常可用的降级不值得打断） */
+    periodsFallback.value = true;
+  }
+}
 const WEEKDAYS = [
   { v: 1, label: '周一' },
   { v: 2, label: '周二' },
@@ -654,38 +709,30 @@ const grid = computed(() =>
  */
 const poolCourses = ref<CourseBrief[]>([]);
 
+/* ---------- 三重认证门槛（2026-10-29 需求）：只有通过三重认证的课才能排课 ----------
+ * 口径：course.status === 'active'。课程审核（C-15）三项材料全过后，后端把 course.status
+ * 置为 active（见 api/admin/certifications.ts 注释与 schema_v9 的 creating/certifying/active/archived）。
+ * 作用面：待排池（含自动排课，二者同源）、新增课次的课程下拉、网格内存量课次（标灰 + 角标 + 禁拖）。
+ */
+/** courseId -> 课程池记录：认证判定与教师回显共用一张表 */
+const courseById = computed(() => {
+  const m = new Map<string, CourseBrief>();
+  for (const c of poolCourses.value) m.set(String(c.courseId), c);
+  return m;
+});
+/** 该课程是否已通过三重认证。课程池里查不到的课次（历史/脏数据）按未认证处理——宁可多拦，不放未认证的进来。 */
+function certPassed(courseId: string | number | undefined | null): boolean {
+  if (courseId === undefined || courseId === null) return false;
+  return courseById.value.get(String(courseId))?.status === 'active';
+}
+
 /** 本周被「放回待排」的课次（软删行全集）：每条 = 待排池里的一张签 */
 const returnedCells = ref<ScheduleCell[]>([]);
 
 /** 当前学期 id（loadPickers 拉学期列表时记录）：未选学期（=全部学期）时池子按它判定「已排」 */
 const currentTermId = ref('');
 
-/* ---------- 学期周次标注（2026-10-21）：解决"看不出当前是学期第几周、重复锚点排错"的问题 ---------- */
-const currentTermInfo = computed(() => terms.value.find(t => String(t.termId) === String(currentTermId.value)) ?? null);
-/** 当前显示周相对学期的周次（1 起）；学期没配起止日期或日期非法时 = null（不标注）。
- *  ★ 日期解析容错：后端可能返回 "2026-09-07" 也可能 "2026-09-07 00:00:00" —— 统一取前 10 位再拼 T，
- *    否则带时分秒的原串拼 T 后 NaN，周次标签会静默消失。 */
-function parseDateOnly(v?: string | null): Date | null {
-  if (!v) return null;
-  const d = new Date(`${String(v).slice(0, 10).replace(/\//g, '-')}T00:00:00`);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-const weekNo = computed<number | null>(() => {
-  const anchor = parseDateOnly(currentTermInfo.value?.startDate);
-  if (!anchor) return null;
-  // 对齐到学期起始日所在周的周一：学期周中开课也算整第 1 周
-  anchor.setDate(anchor.getDate() - ((anchor.getDay() + 6) % 7));
-  const diff = Math.round((weekStart.value.getTime() - anchor.getTime()) / (7 * 86400000));
-  return diff + 1;
-});
-const weekNoLabel = computed(() => {
-  const n = weekNo.value;
-  if (n === null) return '';
-  if (n < 1) return '开学前';
-  const end = parseDateOnly(currentTermInfo.value?.endDate);
-  if (end && weekStart.value > new Date(end.getTime() + 86399000)) return '假期中';
-  return `第 ${n} 周`;
-});
+/* ---------- 学期周次标注：2026-10-29 需求整体移除（页头胶囊、摘要内联、两处弹窗警告、weekNo 计算） ---------- */
 
 /** 待排池条目：1 条 = 1 节课（放回课次逐条成签）或 1 门本周未排的课程 */
 interface PoolEntry extends CourseBrief {
@@ -729,6 +776,8 @@ const poolEntries = computed<PoolEntry[]>(() => {
     }
   }
   return out.filter(c => {
+    // 三重认证门槛（2026-10-29）：未过认证的课程连签都不出——放回的课次签同拦，防止绕道重排
+    if (!certPassed(c.courseId)) return false;
     if (filters.courseId && String(c.courseId) !== filters.courseId) return false;
     if (filters.teacherId && String(c.teacherId) !== filters.teacherId) return false;
     return true;
@@ -1094,6 +1143,13 @@ function onDragStart(c: CourseBrief, e: DragEvent) {
  *   并由那里给出明确提示。
  */
 function onCellBlockDragStart(cell: ScheduleCell, e: DragEvent) {
+  // 三重认证门槛（2026-10-29）：未认证课次不许移动/互换——preventDefault 让拖拽根本起不来，
+  // 同时弹说明，避免"按不住又不知道为什么"（与 busy 静默拦截的教训同源）。
+  if (!certPassed(cell.courseId)) {
+    e.preventDefault();
+    ElMessage.info(`「${cell.courseName || '该课程'}」未通过三重认证，不能排课操作；请先在「课程审核」里通过认证`);
+    return;
+  }
   draggingCourse.value = null;
   draggingCell.value = cell;
   dragOverKey.value = '';
@@ -1770,6 +1826,20 @@ const teacherList = ref<{ value: string; label: string }[]>([]);
 /** 拖动/点击课程卡进来时，记录来源课程，用于自动预选授课教师 */
 const presetCourseId = ref('');
 
+/** 新增弹窗的课程选项：courseList 过滤出**已通过三重认证**的课（2026-10-29）。
+ *  courseList 本体保持全量——顶部课程筛选框还要用它把存量未认证课次筛出来看。 */
+const certifiedCourseOptions = computed(() => courseList.value.filter(o => certPassed(o.value)));
+
+/** 授课教师只读化（2026-10-29）：教师固定 = 课程接口返回的 teacherId/teacherName
+ *  （即提交三重认证的老师），不提供手选——选了课老师就定了，选不了课就留空拦提交。 */
+watch(
+  () => form.courseId,
+  id => {
+    const hit = id ? courseById.value.get(String(id)) : undefined;
+    form.teacherId = hit?.teacherId ? String(hit.teacherId) : '';
+  }
+);
+
 async function loadPickers() {
   if (!courseList.value.length) {
     try {
@@ -1886,14 +1956,8 @@ async function openCreate(
   form.courseId = preset.courseId ?? '';
 
   // 拖动排课：课程自带授课教师 → 自动预选（教师不在可选列表里则不预选，交由人工选）
+  // 2026-10-29 起教师整体只读：watch(form.courseId) 统一从课程接口回填，这里不再单独处理
   form.teacherId = '';
-  if (form.courseId) {
-    const hit = poolCourses.value.find(x => String(x.courseId) === form.courseId);
-    const tid = hit?.teacherId;
-    if (tid && teacherList.value.some(t => String(t.value) === String(tid))) {
-      form.teacherId = String(tid);
-    }
-  }
 
   const period = PERIODS.find(x => x.seq === periodNo);
   createTitle.value =
@@ -1916,7 +1980,7 @@ async function submitCreate() {
     return;
   }
   if (!form.teacherId) {
-    ElMessage.warning('请选择授课教师');
+    ElMessage.warning(form.courseId ? '该课程没有登记授课教师，请先在课程管理补全' : '请先选择课程（教师随课程自动带出）');
     return;
   }
   if (!form.clazzName.trim()) {
@@ -2389,6 +2453,9 @@ function exportCsv(mode: 'week' | 'teacher' | 'classroom' = 'week') {
 }
 
 onMounted(async () => {
+  // 节次配置不进 await 链：兜底初值已让表格行结构成立，接口晚到只晚一帧重渲染，
+  // 没必要让它拖慢课表与下拉的首屏
+  void loadPeriods();
   await Promise.all([load(), loadPickers()]);
 });
 
@@ -2400,6 +2467,12 @@ watch(
 </script>
 
 <template>
+  <!-- 节次降级提示（施工项 #3）：只在兜底生效时出现；用中性警示色而非红底——
+       页面此时是完全可用的，红底"操作被拒"的既有语义会把人吓去查权限 -->
+  <div v-if="periodsFallback" class="periods-fallback" role="status">
+    <ZkIcon name="info" :size="15" style="flex: none" />
+    <span>{{ PERIODS_FALLBACK_TIP }}</span>
+  </div>
   <div class="page-head">
     <h1>智能排课</h1>
     <div class="actions">
@@ -2571,7 +2644,7 @@ watch(
       <div class="week-center">
         <button class="btn btn-outline" @click="gotoThisWeek">本周</button>
         <div class="sched-week">{{ weekRangeLabel }}</div>
-        <span v-if="weekNoLabel" class="week-no">{{ weekNoLabel }}</span>
+        <!-- 2026-10-29 需求：取消「第 N 周」显示（原 week-no 胶囊已移除） -->
       </div>
       <button class="btn btn-outline" @click="shiftWeek(7)">
         下一周<ZkIcon name="chevron-right" :size="15" style="margin-left: 4px" />
@@ -2579,7 +2652,6 @@ watch(
     </div>
     <!-- 本周摘要条（UI 对标第 5 项）：当前筛选下的课次总量/教师/教室/冲突一眼可见 -->
     <div class="week-stats">
-      <span v-if="weekNoLabel" class="week-no-inline">{{ weekNoLabel }}</span>
       <template v-if="weekStats.total">
         <span>本周共 <b>{{ weekStats.total }}</b> 节课</span>
         <span class="sep">·</span>
@@ -2654,6 +2726,7 @@ watch(
                     : undefined
                 "
               >
+                <!-- 三重认证门槛（2026-10-29）：c-uncertified = 存量未认证课次不藏，标灰保留可见（隐藏会让课次"静默消失"） -->
                 <div
                   v-for="(s, idx) in c.list"
                   :key="s.scheduleId"
@@ -2666,7 +2739,8 @@ watch(
                       'c-peer': hoverCourseId !== null && String(s.courseId) === String(hoverCourseId),
                       'c-join-target': isChoiceHover(c.weekday, row.period.seq, s),
                       'c-swap-target': isSwapOnlyHover(c.weekday, row.period.seq, s),
-                      'c-jump': String(s.scheduleId) === String(jumpTargetId)
+                      'c-jump': String(s.scheduleId) === String(jumpTargetId),
+                      'c-uncertified': !certPassed(s.courseId)
                     }
                   ]"
                   :style="
@@ -2691,6 +2765,8 @@ watch(
                 >
                   <!-- 未发布标识（C-24）：draft 课次学生/教师端不可见，点「发布课表」后才可见 -->
                   <span v-if="s.status === 'draft'" class="draft-tag">未发布</span>
+                  <!-- 三重认证门槛（2026-10-29）：存量未认证课次的角标；该卡不可拖（见 onCellBlockDragStart） -->
+                  <span v-if="!certPassed(s.courseId)" class="uncert-tag" title="该课程未通过三重认证，不能排课/移动/互换">未认证</span>
                   <!-- 悬停反馈：不同教师 ⇒ 放下后可选「并入 / 互换」；同一教师 ⇒ 只能互换 -->
                   <span v-if="isChoiceHover(c.weekday, row.period.seq, s)" class="card-tag">
                     <ZkIcon name="plus" :size="11" />{{ draggingCell ? '可并入 / 可互换' : '也排到这一节' }}
@@ -3079,14 +3155,17 @@ watch(
   <el-dialog v-model="createVisible" :title="createTitle" width="460px" @opened="onCreateOpened">
     <el-form label-width="92px" label-position="right">
       <el-form-item label="课程" required>
-        <el-select v-model="form.courseId" placeholder="请选择课程" filterable style="width: 100%">
-          <el-option v-for="o in courseList" :key="o.value" :label="o.label" :value="o.value" />
+        <el-select v-model="form.courseId" placeholder="请选择课程（仅列已通过三重认证的课）" filterable style="width: 100%">
+          <el-option v-for="o in certifiedCourseOptions" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
       </el-form-item>
       <el-form-item label="授课教师" required>
-        <el-select v-model="form.teacherId" placeholder="请选择教师" filterable style="width: 100%">
-          <el-option v-for="o in teacherList" :key="o.value" :label="o.label" :value="o.value" />
-        </el-select>
+        <!-- 2026-10-29 只读化：教师 = 提交三重认证的老师（课程接口带出），不可手选 -->
+        <div v-if="form.teacherId" class="teacher-ro">
+          {{ courseById.get(String(form.courseId))?.teacherName || ('教师 #' + form.teacherId) }}
+          <span class="small muted">提交三重认证的老师 · 自动带出</span>
+        </div>
+        <div v-else class="small muted">请先选择课程——教师自动取提交三重认证的老师</div>
       </el-form-item>
       <el-form-item label="上课班级" required>
         <el-select
@@ -3167,13 +3246,6 @@ watch(
         <div v-if="repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
           以当前所在周为第 1 周 · {{ repeatHint }}
         </div>
-        <div
-          v-if="repeatForm.mode !== 'once' && weekNo !== null && weekNo > 1"
-          class="small"
-          style="color: var(--warning, #b45309); width: 100%"
-        >
-          注意：当前显示的是<b>学期第 {{ weekNo }} 周</b>，重复展开以「显示周」为重复第 1 周——课程要从学期第 1 周上起的话，请先翻回第 1 周再保存
-        </div>
       </el-form-item>
       <!-- 总节数（2026-10-20）：满额可改小 —— 不够分时从最后一周往前少排（前满后少） -->
       <el-form-item v-if="repeatForm.mode !== 'once'" label="总节数">
@@ -3223,9 +3295,6 @@ watch(
           </el-select>
           <div v-if="repeatForm.mode !== 'once'" class="small muted">
             以当前所在周为第 1 周 · {{ repeatHint }}
-          </div>
-          <div v-if="repeatForm.mode !== 'once' && weekNo !== null && weekNo > 1" class="small" style="color: var(--warning, #b45309)">
-            注意：当前显示的是学期第 {{ weekNo }} 周，自动排课从「显示周」开始展开——要从学期第 1 周起排，请先翻回第 1 周
           </div>
         </div>
       </div>
@@ -3901,6 +3970,43 @@ watch(
   white-space: nowrap;
   z-index: 1;
 }
+/* 三重认证门槛（2026-10-29）：未认证存量课次标灰 + 左下角标；不隐藏（隐藏=课次静默消失） */
+.cblock.c-uncertified {
+  opacity: 0.45;
+  filter: grayscale(0.9);
+  cursor: not-allowed;
+}
+.cblock.c-uncertified.c-jump {
+  opacity: 0.85;
+}
+.uncert-tag {
+  position: absolute;
+  bottom: -1px;
+  left: -1px;
+  padding: 1px 6px;
+  border-radius: 0 8px 0 8px;
+  background: var(--ink-500);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  z-index: 1;
+}
+/* 新增弹窗：授课教师只读展示（2026-10-29） */
+.teacher-ro {
+  width: 100%;
+  padding: 5px 11px;
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: 6px;
+  background: var(--bg-muted, #f9fafb);
+  font-size: 13px;
+  color: var(--ink-800, #1f2937);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  box-sizing: border-box;
+}
 .sched td.cell.drop-ok .c-empty {
   opacity: 1;
   border-color: var(--brand-600);
@@ -4244,23 +4350,7 @@ watch(
   font-weight: 600;
 }
 
-/* 学期周次标注：翻周条日期旁的胶囊 + 摘要条内联 */
-.week-no {
-  display: inline-flex;
-  align-items: center;
-  height: 24px;
-  padding: 0 10px;
-  border-radius: 12px;
-  background: var(--brand-100);
-  color: var(--brand-800);
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-.week-no-inline {
-  color: var(--brand-800);
-  font-weight: 600;
-}
+/* 学期周次标注 CSS：2026-10-29 随「取消第几周显示」一并移除 */
 
 /* ---------- 键盘可达（2026-10-22 第一档）：可见焦点环 ----------
  * outline 不占布局，不改叠牌几何；取深品牌色，与冲突红、可放置虚线区分得开 */
@@ -4371,6 +4461,23 @@ watch(
   .cblock .who {
     font-size: 10px;
   }
+}
+
+/* 节次降级提示条（施工项 #3）：淡黄底信息条，页面可用状态下的降级说明，非错误。
+   放 scoped：类名本页独占，但不给全局样式表添条目是本文件既有惯例（4470 行后的
+   全局块只放 popper 覆写这类"必须穿透 scoped"的东西） */
+.periods-fallback {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 16px 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--warn-200, #f5e3b3);
+  border-radius: 8px;
+  background: var(--warn-50, #fdf8ec);
+  color: var(--warn-700, #8a6116);
+  font-size: 12.5px;
+  line-height: 1.6;
 }
 </style>
 
