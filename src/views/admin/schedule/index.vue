@@ -3005,7 +3005,6 @@ watch(
         <!-- 2026-10-29 只读化：教师 = 提交三重认证的老师（课程自带），同新增弹门口径，不可改 -->
         <div v-if="detailTeacher" class="teacher-ro" style="flex: 1; min-width: 0">
           {{ detailTeacher.name }}
-          <span class="small muted">提交三重认证的老师 · 不可改</span>
         </div>
         <div v-else class="small muted" style="flex: 1">未指定教师</div>
       </div>
@@ -3177,9 +3176,9 @@ watch(
         <!-- 2026-10-29 只读化：教师 = 提交三重认证的老师（课程接口带出），不可手选 -->
         <div v-if="form.teacherId" class="teacher-ro">
           {{ courseById.get(String(form.courseId))?.teacherName || ('教师 #' + form.teacherId) }}
-          <span class="small muted">提交三重认证的老师 · 自动带出</span>
+          <span class="small muted">自动带出</span>
         </div>
-        <div v-else class="small muted">请先选择课程——教师自动取提交三重认证的老师</div>
+        <div v-else class="small muted">请先选择课程——教师自动带出</div>
       </el-form-item>
       <el-form-item label="上课班级" required>
         <el-select
