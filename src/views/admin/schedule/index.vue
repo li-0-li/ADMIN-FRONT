@@ -2184,7 +2184,9 @@ function repeatDates(weekday: number, rp: { mode: RepeatMode; times: number } = 
     const d = new Date(base);
     d.setDate(d.getDate() + step * i);
     if (semesterAnchored && semEnd && d > new Date(semEnd.getTime() + 86399000)) break;
-    out.push(fmt(d));
+    // ★ 每个日期只 push 一次。6329cab 曾误写成连 push 两次 ⇒ 每门课多出一倍「必自我冲突」的
+    //   尝试：串行时表现为速度减半 + 报告里「跳过 18 周」；并发下相邻重复日期会同时通过
+    //   冲突检查，真的写出重复课次（10-29 16:22 实测 5 门课全部双份）。
     out.push(fmt(d));
   }
   return out;
@@ -2192,7 +2194,7 @@ function repeatDates(weekday: number, rp: { mode: RepeatMode; times: number } = 
 
 /**
  * 按当前重复口径批量创建课次（手动排课与自动排课共用）。
- * 每条一次真实 POST；某条冲突只跳过并记录，不打断其余。
+ * 每条一次真实 POST，6 路并发执行（2026-10-29 提速，见函数内注释）；某条冲突只跳过并记录，不打断其余。
  * slots = 本次的全部「节位」（手动排课每周节数>1 时传多组；自动排课省略 = 单节位）。
  * capTotal = 总节数截断（手动排课传 repeatForm.total）：全部节位按日期升序展开后
  *   只保留最早的 capTotal 条 —— 缺的节从最后一周往前扣（前满后少）。
@@ -2222,17 +2224,32 @@ async function createBatch(
   }
   plans.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   const cap = opts?.capTotal;
-  const final = cap !== undefined && plans.length > Math.max(1, cap) ? plans.slice(0, Math.max(1, cap)) : plans;
-  const createdIds: Array<string | number> = [];
-  const failed: string[] = [];
-  for (let i = 0; i < final.length; i++) {
+  let final = cap !== undefined && plans.length > Math.max(1, cap) ? plans.slice(0, Math.max(1, cap)) : plans;
+  // 并发防重保险：同一「日期×节位」只发一次。就算上游再产出重复日期，也不会因并发竞态
+  // 双双通过冲突检查写出两行（10-29 实测教训：重复日期 + 6 路并发 = 真重复落库）。
+  const seen = new Set<string>();
+  final = final.filter(pl => {
+    const k = `${pl.date}|${pl.periodNo}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  /* 并发写入（2026-10-29 提速）：原来一条一条 await，一门课 18 周 = 18 次串行往返，
+   * 实测单条 1.0~1.6s ⇒ 一门课 20~30s、20 门课 10 分钟（业主实测就是这个数）。
+   * 实测后端**不串行化**：6 条并发总耗时 721ms，反而比单条 1054ms 还短。
+   * 取 6 的理由：同一门课的各周落在不同日期，冲突检查互不干扰；再高会挤占连接池
+   * （页面上还有列表轮询在跑），6 是实测稳定值。结果按日期下标归集，报告顺序不变。 */
+  const results = new Array<{ id?: string | number; fail?: string }>(final.length);
+  let doneCount = 0;
+  let cursor = 0;
+  const runOne = async (i: number) => {
     const pl = final[i];
     const period = PERIODS.find(p => p.seq === pl.periodNo);
     if (!period) {
-      failed.push(`${pl.date}：节次不合法`);
-      continue;
+      results[i] = { fail: `${pl.date}：节次不合法` };
+      onProgress?.(++doneCount, final.length);
+      return;
     }
-    onProgress?.(i + 1, final.length);
     try {
       const res = await createSchedule({
         ...base,
@@ -2242,15 +2259,34 @@ async function createBatch(
         durationMin: period.duration
       });
       if (res?.conflict) {
-        failed.push(
-          `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：${res.conflictMsg || '该时段教师、教室或班级已被占用'}`
-        );
+        results[i] = {
+          fail: `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：${res.conflictMsg || '该时段教师、教室或班级已被占用'}`
+        };
       } else if (res.scheduleId) {
-        createdIds.push(res.scheduleId);
+        results[i] = { id: res.scheduleId };
+      } else {
+        results[i] = { fail: `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：保存失败（响应无课次 id）` };
       }
     } catch {
-      failed.push(`${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：保存失败`);
+      results[i] = { fail: `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：保存失败` };
     }
+    onProgress?.(++doneCount, final.length);
+  };
+  // 6 路工作池：cursor 是唯一分发点，Promise 串行取号、响应乱序但结果按下标归位
+  const worker = async () => {
+    while (cursor < final.length) {
+      const i = cursor++;
+      await runOne(i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, final.length) }, worker));
+  // 并发完成顺序不可依赖 ⇒ 按日期下标归集，createdIds / failed 顺序与旧版串行一致
+  const createdIds: Array<string | number> = [];
+  const failed: string[] = [];
+  for (const r of results) {
+    if (!r) continue;
+    if (r.id !== undefined) createdIds.push(r.id);
+    if (r.fail) failed.push(r.fail);
   }
   return { createdIds, failed, total: final.length };
 }
