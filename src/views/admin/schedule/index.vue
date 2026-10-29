@@ -2122,12 +2122,13 @@ const repeatHint = computed(() => {
   if (repeatForm.mode === 'even') return `第 2、4、6…周上课，共 ${repeatForm.times} 次`;
   return '';
 });
-/** 重复计划展开成的上课日期串（YYYY-MM-DD）。once=1 条；odd/even 隔 14 天；all 隔 7 天 */
-function repeatDates(weekday: number): string[] {
+/** 重复计划展开成的上课日期串（YYYY-MM-DD）。once=1 条；odd/even 隔 14 天；all 隔 7 天。
+ *  rp = 重复口径，缺省跟随弹窗表单；自动排课必须传固定口径，否则会被弹窗残留的单双周带偏（2026-10-29 修）。 */
+function repeatDates(weekday: number, rp: { mode: RepeatMode; times: number } = repeatForm): string[] {
   const base = new Date(weekStart.value);
-  base.setDate(base.getDate() + (weekday - 1) + (repeatForm.mode === 'even' ? 7 : 0));
-  const step = repeatForm.mode === 'odd' || repeatForm.mode === 'even' ? 14 : 7;
-  const count = repeatForm.mode === 'once' ? 1 : Math.max(1, Math.min(25, Math.round(repeatForm.times || 1)));
+  base.setDate(base.getDate() + (weekday - 1) + (rp.mode === 'even' ? 7 : 0));
+  const step = rp.mode === 'odd' || rp.mode === 'even' ? 14 : 7;
+  const count = rp.mode === 'once' ? 1 : Math.max(1, Math.min(25, Math.round(rp.times || 1)));
   const out: string[] = [];
   for (let i = 0; i < count; i++) {
     const d = new Date(base);
@@ -2153,14 +2154,19 @@ async function createBatch(
     periodNo: number;
     targetClass?: string;
   },
-  opts?: { slots?: Array<{ weekday: number; periodNo: number }>; capTotal?: number },
+  opts?: {
+    slots?: Array<{ weekday: number; periodNo: number }>;
+    capTotal?: number;
+    /** 重复口径覆盖：自动排课传固定「每周 × AUTO_WEEKS」，不跟随弹窗残留的单双周选择（2026-10-29） */
+    repeat?: { mode: RepeatMode; times: number };
+  },
   onProgress?: (done: number, total: number) => void
 ) {
   const slots = opts?.slots?.length ? opts.slots : [{ weekday: base.weekday, periodNo: base.periodNo }];
   type Plan = { date: string; weekday: number; periodNo: number };
   const plans: Plan[] = [];
   for (const s of slots) {
-    for (const d of repeatDates(s.weekday)) plans.push({ date: d, weekday: s.weekday, periodNo: s.periodNo });
+    for (const d of repeatDates(s.weekday, opts?.repeat)) plans.push({ date: d, weekday: s.weekday, periodNo: s.periodNo });
   }
   plans.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   const cap = opts?.capTotal;
@@ -2203,7 +2209,7 @@ async function createBatch(
  *   ② 找位：在该教师空闲的格子里，对 5×5=25 个候选全部打分（见下方 AUTO_W）取最低分，不是取第一个空位。
  *   ③ 教室自动匹配：容量 ≥ 选课人数的空闲教室中取「余量最小」的；没有合适教室则不填（可手动补）。
  *   ④ 排不下/无教师的课跳过并进报告，不卡住其他课。
- * 重复口径与手动排课共用 repeatForm（默认「每周 × 18 周」）。
+ * 重复口径固定「每周 × AUTO_WEEKS」，不跟随弹窗残留的单双周选择（2026-10-29 解耦，曾共用 repeatForm 有被带偏的隐患）。
  * ★ 10-22 修①「点了像没反应」：原代码在开跑那一行就把 autoReport 置成空对象 ⇒ 弹窗立刻切到
  *   「报告视图」，进度文案住在 v-if="!autoReport" 分支里全程不显示，用户从头看到的就是
  *   「排课结果：成功 0 门，跳过 0 门」+「知道了」（零写入探针实测：跑动中显示"成功 8 门"，
@@ -2249,6 +2255,8 @@ function entryClass(entry: PoolEntry) {
  * 8 门课会全堆进周一 2~5 节 + 周二 1~5 节，看着"排上了但没排开"。
  * 现规则：把 5×5=25 个格子全部过一遍硬约束，再按下面的权重打分取最低分。
  * 权重集中在这里，日后按业务口径调参只动这张表，不动结构。 */
+/** 自动排课固定展开周数（每周 × 18）：与弹窗表单解耦，避免被残留的单双周模式带偏（2026-10-29 修） */
+const AUTO_WEEKS = 18;
 type AutoSlot = { weekday: number; periodNo: number; classroomId?: number; capacity?: number };
 const AUTO_W = {
   /** 主目标：同一班级同一天已有几节课（每多一节 +100，等于把班级摊到不同天） */
@@ -2383,7 +2391,7 @@ async function runAuto() {
         periodNo: placed.periodNo,
         targetClass: clazz || undefined
       },
-      undefined,
+      { repeat: { mode: 'all', times: AUTO_WEEKS } },
       (done, t) => {
         autoProgress.value = `${phase}正在排「${entry.courseName}」第 ${done}/${t} 周（共 ${totalCount} 门，已排入 ${ok.length}）`;
       }
@@ -3290,6 +3298,14 @@ watch(
         </div>
         <div v-if="repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
           以当前所在周为第 1 周 · {{ repeatHint }}
+        </div>
+        <!-- 单双周防错（2026-10-29）：隔周模式锚定的是「当前浏览的周」，从非学期第 1 周保存会让单双整体对调 -->
+        <div
+          v-if="repeatForm.mode === 'odd' || repeatForm.mode === 'even'"
+          class="small"
+          style="color: var(--warning, #b45309); width: 100%"
+        >
+          注意：单周从当前浏览的周起隔周上，双周从下一周起隔周上——保存前请先翻到学期第 1 周，否则整学期的单双会对调
         </div>
       </el-form-item>
       <!-- 总节数（2026-10-20）：满额可改小 —— 不够分时从最后一周往前少排（前满后少） -->
