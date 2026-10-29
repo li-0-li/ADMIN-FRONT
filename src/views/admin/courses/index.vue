@@ -294,6 +294,240 @@ function goSchedule(row: AdminCourseVo) {
   void router.push({ path: '/admin/schedule', query: { course: String(row.courseId) } });
 }
 
+/* ================= 列设置（A-1）=================
+ * 依据 Ant Design Pro / 通用数据表规范：次要列可以藏，**主键列（课程名称）不能藏**——
+ * 藏掉标识列以后用户没法确认这一行是谁。选择存 localStorage，下次进来还是这套列。
+ */
+interface ColumnDef {
+  key: string;
+  label: string;
+  locked?: boolean;
+}
+const COLUMN_DEFS: ColumnDef[] = [
+  { key: 'courseCode', label: '课程代码' },
+  { key: 'courseName', label: '课程名称', locked: true },
+  { key: 'teacherName', label: '授课教师' },
+  { key: 'semester', label: '学期' },
+  { key: 'studentCount', label: '选课人数' },
+  { key: 'status', label: '状态' },
+  { key: 'scheduleCount', label: '排课情况' }
+];
+const COLUMN_STORAGE_KEY = 'zk_courses_columns';
+const columnVisible = reactive<Record<string, boolean>>({});
+COLUMN_DEFS.forEach((c) => { columnVisible[c.key] = true; });
+const visibleColumnCount = computed(() => COLUMN_DEFS.filter((c) => columnVisible[c.key]).length);
+
+function loadColumnPrefs() {
+  try {
+    const raw = localStorage.getItem(COLUMN_STORAGE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw) as Record<string, boolean>;
+    for (const c of COLUMN_DEFS) {
+      // locked 列一律强制可见：旧版本存过"名称隐藏"也要纠正回来
+      if (c.locked) { columnVisible[c.key] = true; continue; }
+      if (typeof saved[c.key] === 'boolean') columnVisible[c.key] = saved[c.key];
+    }
+  } catch {
+    /* 存储内容坏了就当没存过，不影响使用 */
+  }
+}
+function saveColumnPrefs() {
+  try {
+    localStorage.setItem(COLUMN_STORAGE_KEY, JSON.stringify(columnVisible));
+  } catch {
+    /* 隐私模式等写不进去：忽略，只影响"下次还记得" */
+  }
+}
+loadColumnPrefs();
+
+/* ================= 筛选条件 chips（A-2）=================
+ * 筛完只剩几条时，用户最容易怀疑"数据是不是丢了"。把已生效条件摆成可逐个删除的 chip，
+ * 一眼就知道"为什么少"。这是通用数据表规范里最常被提的一条。
+ */
+type FilterKey = 'keyword' | 'semester' | 'scheduleState';
+interface FilterChip {
+  key: FilterKey;
+  label: string;
+  text: string;
+}
+const SCHEDULE_STATE_TEXT: Record<string, string> = { scheduled: '已排课', unscheduled: '未排课' };
+const activeFilterChips = computed<FilterChip[]>(() => {
+  const chips: FilterChip[] = [];
+  if (query.keyword.trim()) chips.push({ key: 'keyword', label: '关键词', text: query.keyword.trim() });
+  if (query.semester) chips.push({ key: 'semester', label: '学期', text: query.semester });
+  if (query.scheduleState) {
+    chips.push({ key: 'scheduleState', label: '排课情况', text: SCHEDULE_STATE_TEXT[query.scheduleState] ?? query.scheduleState });
+  }
+  return chips;
+});
+
+/** 逐项去掉某个条件（不用整页重置，其它条件保留） */
+function removeFilter(key: FilterKey) {
+  query[key] = '';
+  query.page = 1;
+  fetchList();
+}
+
+/* ================= 骨架屏（A-3）=================
+ * 只在"首次加载、还一条都没有"时显示：之后刷新要保留旧数据（v-loading 盖一层就够了），
+ * 否则每点一次搜索整张表闪成骨架，比转圈更晃眼。
+ */
+const showSkeleton = computed(() => loading.value && rows.value.length === 0 && !loadError.value);
+/** 骨架条的宽度比例，大致对应真实列宽（code/name/teacher/semester/status） */
+const SKELETON_WIDTHS = ['9%', '24%', '13%', '11%', '10%'];
+
+/* ================= 筛选视图（B-1）=================
+ * 把"关键词 + 学期 + 排课情况 + 排序"存成一个命名视图，下次一键回到这个组合。
+ * 存 localStorage：本项目没有"用户偏好"后端接口，不做跨设备同步（也不该假装做了）。
+ */
+interface FilterView {
+  id: string;
+  name: string;
+  keyword: string;
+  semester: string;
+  scheduleState: string;
+  orderBy: string;
+  orderDir: string;
+}
+const VIEW_STORAGE_KEY = 'zk_courses_views';
+const ORDER_BY_WHITELIST: AdminCourseOrderBy[] = ['semester', 'studentCount', 'scheduleCount'];
+const savedViews = ref<FilterView[]>([]);
+
+function loadViews() {
+  try {
+    const raw = localStorage.getItem(VIEW_STORAGE_KEY);
+    if (!raw) return;
+    const arr = JSON.parse(raw) as FilterView[];
+    savedViews.value = Array.isArray(arr) ? arr.filter((v) => v && v.id && v.name) : [];
+  } catch {
+    savedViews.value = [];
+  }
+}
+function persistViews() {
+  try {
+    localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(savedViews.value));
+  } catch {
+    /* 忽略 */
+  }
+}
+loadViews();
+
+async function saveCurrentView() {
+  if (!activeFilterChips.value.length) {
+    ElMessage.info('当前没有筛选条件，先设好条件再保存');
+    return;
+  }
+  let name = '';
+  try {
+    const { value } = await ElMessageBox.prompt('给这个筛选组合起个名字，下次一键回到这套条件', '保存筛选视图', {
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
+      inputPlaceholder: '例如：本学期未排课',
+      inputValidator: (v: string) => (v && v.trim() ? true : '名字不能为空')
+    });
+    name = value.trim();
+  } catch {
+    return; // 用户取消
+  }
+  const exist = savedViews.value.find((v) => v.name === name);
+  const payload: FilterView = {
+    id: exist?.id ?? String(Date.now()),
+    name,
+    keyword: query.keyword,
+    semester: query.semester,
+    scheduleState: query.scheduleState,
+    orderBy: query.orderBy,
+    orderDir: query.orderDir
+  };
+  // 同名覆盖而不是堆一堆同名视图
+  savedViews.value = exist ? savedViews.value.map((v) => (v.id === exist.id ? payload : v)) : [...savedViews.value, payload];
+  persistViews();
+  ElMessage.success(`已保存视图「${name}」`);
+}
+
+function applyView(v: FilterView) {
+  query.keyword = v.keyword ?? '';
+  query.semester = v.semester ?? '';
+  query.scheduleState = v.scheduleState ?? '';
+  // 白名单校验：视图是本地存的，可能来自旧版本或被手改，非法排序字段不能直接发给后端
+  query.orderBy = ORDER_BY_WHITELIST.includes(v.orderBy as AdminCourseOrderBy) ? (v.orderBy as AdminCourseOrderBy) : '';
+  query.orderDir = v.orderDir === 'asc' || v.orderDir === 'desc' ? v.orderDir : '';
+  query.page = 1;
+  fetchList();
+}
+
+async function deleteView(v: FilterView) {
+  try {
+    await ElMessageBox.confirm(`删除视图「${v.name}」？（只删这个保存的筛选组合，不动课程数据）`, '删除视图', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消'
+    });
+  } catch {
+    return;
+  }
+  savedViews.value = savedViews.value.filter((x) => x.id !== v.id);
+  persistViews();
+}
+
+/* ================= 批量操作（B-2）=================
+ * 规范要求：勾选后才出现批量栏、要显示已选数量，并且**必须说明哪些不可能处理**。
+ * 本页的现实约束：后端 C-23 对"名下还有课次"的课程直接拒绝删除 ⇒
+ * 勾中这类课程要提前说清，而不是等用户点了批量删除再逐条报错。
+ */
+const canRemove = computed(() => userStore.hasPermi('admin:courses:remove'));
+const selectedRows = ref<AdminCourseVo[]>([]);
+const batchDeleting = ref(false);
+const selectedWithSchedule = computed(() => selectedRows.value.filter((r) => (scheduledCount(r) ?? 0) > 0));
+const selectedDeletable = computed(() => selectedRows.value.filter((r) => (scheduledCount(r) ?? 0) === 0));
+
+function onSelectionChange(sel: AdminCourseVo[]) {
+  selectedRows.value = sel;
+}
+function clearSelection() {
+  tableRef.value?.clearSelection();
+  selectedRows.value = [];
+}
+
+async function batchDelete() {
+  const blocked = selectedWithSchedule.value.length;
+  const targets = selectedDeletable.value;
+  if (!targets.length) {
+    ElMessage.warning(blocked ? `选中的 ${blocked} 门课程都还有课次，需先到排课页移除课表后才能删除` : '请先勾选要删除的课程');
+    return;
+  }
+  const tip = blocked
+    ? `将删除 ${targets.length} 门；另有 ${blocked} 门因"仍有课次"会被跳过（需先去排课页移除）。删除为软删，可追溯。`
+    : `将删除 ${targets.length} 门课程（软删，可追溯）。`;
+  try {
+    await ElMessageBox.confirm(tip, '批量删除', { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' });
+  } catch {
+    return;
+  }
+  batchDeleting.value = true;
+  let ok = 0;
+  const failures: string[] = [];
+  // 后端只有单条删除接口，逐条发但**逐条收集结果**：一次失败不影响其余
+  for (const row of targets) {
+    try {
+      await deleteCourse(row.courseId);
+      ok += 1;
+    } catch (e) {
+      failures.push(`${row.courseName}：${(e as Error)?.message ?? '删除失败'}`);
+    }
+  }
+  batchDeleting.value = false;
+  clearSelection();
+  await fetchList();
+  if (!serverHasScheduleCount.value) void loadScheduleCounts();
+  if (failures.length) {
+    // 部分失败必须说清是哪几门、为什么——只报"删除失败"等于没说
+    ElMessage.warning(`成功 ${ok} 门，失败 ${failures.length} 门：${failures.slice(0, 3).join('；')}${failures.length > 3 ? ' 等' : ''}`);
+  } else {
+    ElMessage.success(`已删除 ${ok} 门课程`);
+  }
+}
+
 /* ---------------- 导出（C-12b）----------------
  * 按**当前筛选条件**导出（与列表同口径），但注意：排课状态是前端本地筛出来的，
  * 后端不认这个条件 ⇒ 带排课筛选时导出的仍是"该关键词/学期下的全部课程"。
@@ -479,6 +713,47 @@ onMounted(async () => {
       >
         <ZkIcon v-if="!loading" name="refresh-cw" :size="15" />
       </el-button>
+      <!-- 列设置：次要列可藏、主键列锁定；选择存 localStorage -->
+      <el-popover placement="bottom-start" :width="200" trigger="click">
+        <template #reference>
+          <el-button class="tb-icon" title="列设置（选择要显示的列）">
+            <ZkIcon name="list-checks" :size="15" />
+          </el-button>
+        </template>
+        <div class="col-set">
+          <div class="col-set-title">显示列（{{ visibleColumnCount }}/{{ COLUMN_DEFS.length }}）</div>
+          <label v-for="c in COLUMN_DEFS" :key="c.key" class="col-set-item">
+            <el-checkbox
+              v-model="columnVisible[c.key]"
+              :disabled="c.locked"
+              @change="saveColumnPrefs"
+            />
+            <span>{{ c.label }}</span>
+            <span v-if="c.locked" class="col-set-lock">必显</span>
+          </label>
+        </div>
+      </el-popover>
+      <!-- 筛选视图：把当前条件组合存下来，下次一键回到 -->
+      <el-popover placement="bottom-start" :width="260" trigger="click">
+        <template #reference>
+          <el-button class="tb-icon" title="筛选视图（保存 / 应用筛选组合）">
+            <ZkIcon name="book-open" :size="15" />
+          </el-button>
+        </template>
+        <div class="view-set">
+          <div class="col-set-title">筛选视图</div>
+          <div v-if="!savedViews.length" class="small muted" style="padding: 6px 0">
+            还没有保存的视图。设好筛选条件后点下面按钮存下来。
+          </div>
+          <div v-for="v in savedViews" :key="v.id" class="view-row">
+            <a class="view-name" href="javascript:void(0)" @click="applyView(v)">{{ v.name }}</a>
+            <a class="view-del" href="javascript:void(0)" title="删除该视图" @click="deleteView(v)">删除</a>
+          </div>
+          <el-button size="small" style="margin-top: 8px; width: 100%" @click="saveCurrentView">
+            保存当前筛选为视图
+          </el-button>
+        </div>
+      </el-popover>
     </div>
     <div class="right" style="gap: 10px">
       <el-input
@@ -527,6 +802,16 @@ onMounted(async () => {
     </div>
   </div>
 
+  <!-- 已生效的筛选条件：可逐个移除。少了这一行，用户看到"只剩 3 条"会怀疑数据丢了 -->
+  <div v-if="activeFilterChips.length" class="filter-chips">
+    <span class="chips-label">已筛选</span>
+    <span v-for="c in activeFilterChips" :key="c.key" class="chip">
+      {{ c.label }}：{{ c.text }}
+      <a class="chip-x" href="javascript:void(0)" title="移除该条件" @click="removeFilter(c.key)">×</a>
+    </span>
+    <a class="chips-clear" href="javascript:void(0)" @click="resetQuery">清空全部</a>
+  </div>
+
   <div class="card">
     <!-- 失败态与空态分开画，理由同账号页：空表这一种视觉不能同时承载"没数据"和"没取到" -->
     <div v-if="loadError" class="load-fail" role="alert">
@@ -536,117 +821,157 @@ onMounted(async () => {
         <ZkIcon v-if="!loading" name="refresh-cw" :size="14" style="margin-right: 4px" />重新加载
       </el-button>
     </div>
-    <el-table
-      ref="tableRef"
-      v-loading="loading"
-      row-key="courseId"
-      :data="rows"
-      style="width: 100%"
-      @sort-change="onSortChange"
-    >
-      <el-table-column label="课程代码" width="100" prop="courseCode">
-        <template #default="{ row }">{{ row.courseCode || '—' }}</template>
-      </el-table-column>
-      <!-- 名称可能很长（如「小程序教师端测试课程1」）：规范要求超长以 … 省略、悬停看全文 -->
-      <el-table-column label="课程名称" min-width="170" prop="courseName" show-overflow-tooltip>
-        <template #default="{ row }">
-          <!-- 主键列做成可点链接（Ant Design Pro 的标准做法）：点名称直接看详情，
-               比每次往右挪到「查看」快；右上角「查看」保留，两处入口不冲突 -->
-          <a class="course-link" href="javascript:void(0)" @click="openDetail(row)">{{ row.courseName }}</a>
-        </template>
-      </el-table-column>
-      <el-table-column label="授课教师" width="110" prop="teacherName">
-        <template #default="{ row }">{{ row.teacherName || '—' }}</template>
-      </el-table-column>
-      <el-table-column
-        label="学期"
-        width="110"
-        prop="semester"
-        :sortable="canServerSort ? 'custom' : false"
+    <!-- 骨架屏覆盖层与表格同容器：首次加载时表格已挂载但数据为空，
+         用骨架盖住比整块空白更稳（不会在数据回来时整体跳一下） -->
+    <div class="tbl-wrap">
+      <el-table
+        ref="tableRef"
+        v-loading="loading && !showSkeleton"
+        row-key="courseId"
+        :data="rows"
+        max-height="calc(100vh - 320px)"
+        style="width: 100%"
+        @sort-change="onSortChange"
+        @selection-change="onSelectionChange"
       >
-        <template #default="{ row }">{{ row.semester || '—' }}</template>
-      </el-table-column>
-      <el-table-column
-        label="选课人数"
-        width="90"
-        align="center"
-        prop="studentCount"
-        :sortable="canServerSort ? 'custom' : false"
-      >
-        <template #default="{ row }">{{ row.studentCount ?? 0 }}</template>
-      </el-table-column>
-      <el-table-column label="状态" width="90">
-        <template #default="{ row }">
-          <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
-        </template>
-      </el-table-column>
-      <!-- 排课情况（10-29 新增）：节次数来自课次接口聚合。
-           三种状态必须可辨：— = 统计没拿到 / 未排课 = 真的 0 节 / N 节 = 已排 -->
-      <el-table-column
-        width="130"
-        align="center"
-        prop="scheduleCount"
-        :sortable="canServerSort ? 'custom' : false"
-      >
-        <template #header>
-          <span :title="scheduleHeaderTitle">排课情况</span>
-        </template>
-        <template #default="{ row }">
-          <span v-if="scheduledCount(row) === null" class="muted small">—</span>
-          <!-- 未排课给直达入口：这列最常见的用途就是"挑一门没排的课去排"， -->
-          <div v-else-if="scheduledCount(row) === 0" class="sched-cell">
-            <span class="badge badge-neutral">未排课</span>
-            <a class="sched-link" href="javascript:void(0)" @click="goSchedule(row)">去排课</a>
-          </div>
-          <!-- 已排课也能点进去看课表：原来只有未排课能跳，想看已排的反而没入口 -->
-          <a v-else class="sched-link" href="javascript:void(0)" @click="goSchedule(row)">
-            <span class="badge badge-info">{{ scheduledCount(row) }} 节</span>
-          </a>
-        </template>
-      </el-table-column>
-      <!-- 操作列冻结：规范要求"数据列无法一屏展示时操作列默认冻结"，
-           否则窗口一窄就只剩半截「查看」（10-29 实测过 1280 下被裁） -->
-      <el-table-column label="操作" width="150" align="right" fixed="right" class-name="courses-op">
-        <template #default="{ row }">
-          <el-button text size="small" @click="openDetail(row)">
-            <ZkIcon name="eye" :size="14" style="margin-right: 3px" />查看
-          </el-button>
-          <el-button
-            text
-            size="small"
-            style="color: var(--error)"
-            :loading="deleting === row.courseId"
-            @click="doDelete(row)"
-          >删除</el-button>
-        </template>
-      </el-table-column>
-      <!-- 空态说明"为什么空 + 去哪看"：本页只列已通过课程，用户最容易误以为课程丢了 -->
-      <template #empty>
-        <div class="empty-block">
-          <ZkIcon name="book-open" :size="26" />
-          <div class="empty-title">{{ loadError ? '数据未取到' : hasFilter ? '当前筛选条件下没有课程' : '还没有审核通过的课程' }}</div>
-          <div v-if="loadError" class="small muted">原因见上方提示条，也可点下方按钮重试。</div>
-          <div v-else-if="hasFilter" class="small muted">
-            已通过审核的课程可能被关键词/学期/排课情况条件排除了，清空条件即可看到全部。
-          </div>
-          <div v-else class="small muted">课程在「课程审核」通过后才会出现在这里。</div>
-          <!-- 空态给可点的下一步：原来只有一行文字，用户得自己回去找入口/找重置按钮 -->
-          <div class="empty-actions">
-            <el-button v-if="loadError" size="small" @click="fetchList">
-              <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />重新加载
+        <!-- 勾选列只对"能删"的人显示：没权限却摆勾选框，用户会以为能批量操作 -->
+        <el-table-column v-if="canRemove" type="selection" width="44" fixed="left" />
+        <el-table-column v-if="columnVisible.courseCode" label="课程代码" width="100" prop="courseCode" fixed="left">
+          <template #default="{ row }">{{ row.courseCode || '—' }}</template>
+        </el-table-column>
+        <!-- 名称可能很长（如「小程序教师端测试课程1」）：规范要求超长以 … 省略、悬停看全文 -->
+        <el-table-column v-if="columnVisible.courseName" label="课程名称" min-width="170" prop="courseName" show-overflow-tooltip>
+          <template #default="{ row }">
+            <!-- 主键列做成可点链接（Ant Design Pro 的标准做法）：点名称直接看详情，
+                 比每次往右挪到「查看」快；右上角「查看」保留，两处入口不冲突 -->
+            <a class="course-link" href="javascript:void(0)" @click="openDetail(row)">{{ row.courseName }}</a>
+          </template>
+        </el-table-column>
+        <el-table-column v-if="columnVisible.teacherName" label="授课教师" width="110" prop="teacherName">
+          <template #default="{ row }">{{ row.teacherName || '—' }}</template>
+        </el-table-column>
+        <el-table-column
+          v-if="columnVisible.semester"
+          label="学期"
+          width="110"
+          prop="semester"
+          :sortable="canServerSort ? 'custom' : false"
+        >
+          <template #default="{ row }">{{ row.semester || '—' }}</template>
+        </el-table-column>
+        <el-table-column
+          v-if="columnVisible.studentCount"
+          label="选课人数"
+          width="90"
+          align="center"
+          prop="studentCount"
+          :sortable="canServerSort ? 'custom' : false"
+        >
+          <template #default="{ row }">{{ row.studentCount ?? 0 }}</template>
+        </el-table-column>
+        <el-table-column v-if="columnVisible.status" label="状态" width="90">
+          <template #default="{ row }">
+            <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
+          </template>
+        </el-table-column>
+        <!-- 排课情况：三种状态必须可辨：— = 统计没拿到 / 未排课 = 真的 0 节 / N 节 = 已排 -->
+        <el-table-column
+          v-if="columnVisible.scheduleCount"
+          width="130"
+          align="center"
+          prop="scheduleCount"
+          :sortable="canServerSort ? 'custom' : false"
+        >
+          <template #header>
+            <span :title="scheduleHeaderTitle">排课情况</span>
+          </template>
+          <template #default="{ row }">
+            <span v-if="scheduledCount(row) === null" class="muted small">—</span>
+            <!-- 未排课给直达入口：这列最常见的用途就是"挑一门没排的课去排" -->
+            <div v-else-if="scheduledCount(row) === 0" class="sched-cell">
+              <span class="badge badge-neutral">未排课</span>
+              <a class="sched-link" href="javascript:void(0)" @click="goSchedule(row)">去排课</a>
+            </div>
+            <!-- 已排课也能点进去看课表：原来只有未排课能跳，想看已排的反而没入口 -->
+            <a v-else class="sched-link" href="javascript:void(0)" @click="goSchedule(row)">
+              <span class="badge badge-info">{{ scheduledCount(row) }} 节</span>
+            </a>
+          </template>
+        </el-table-column>
+        <!-- 操作列冻结：规范要求"数据列无法一屏展示时操作列默认冻结"，
+             否则窗口一窄就只剩半截「查看」（10-29 实测过 1280 下被裁） -->
+        <el-table-column label="操作" width="150" align="right" fixed="right" class-name="courses-op">
+          <template #default="{ row }">
+            <el-button text size="small" @click="openDetail(row)">
+              <ZkIcon name="eye" :size="14" style="margin-right: 3px" />查看
             </el-button>
-            <template v-else-if="hasFilter">
-              <el-button size="small" @click="resetQuery">
-                <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />清空筛选
+            <el-button
+              v-if="canRemove"
+              text
+              size="small"
+              style="color: var(--error)"
+              :loading="deleting === row.courseId"
+              @click="doDelete(row)"
+            >删除</el-button>
+          </template>
+        </el-table-column>
+        <!-- 空态说明"为什么空 + 去哪看"：本页只列已通过课程，用户最容易误以为课程丢了 -->
+        <template #empty>
+          <div class="empty-block">
+            <ZkIcon name="book-open" :size="26" />
+            <div class="empty-title">{{ loadError ? '数据未取到' : hasFilter ? '当前筛选条件下没有课程' : '还没有审核通过的课程' }}</div>
+            <div v-if="loadError" class="small muted">原因见上方提示条，也可点下方按钮重试。</div>
+            <div v-else-if="hasFilter" class="small muted">
+              已通过审核的课程可能被关键词/学期/排课情况条件排除了，清空条件即可看到全部。
+            </div>
+            <div v-else class="small muted">课程在「课程审核」通过后才会出现在这里。</div>
+            <div class="empty-actions">
+              <el-button v-if="loadError" size="small" @click="fetchList">
+                <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />重新加载
               </el-button>
-            </template>
-            <el-button v-else size="small" type="primary" @click="router.push('/admin/review')">
-              <ZkIcon name="badge-check" :size="14" style="margin-right: 4px" />去课程审核
-            </el-button>
+              <template v-else-if="hasFilter">
+                <el-button size="small" @click="resetQuery">
+                  <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />清空筛选
+                </el-button>
+              </template>
+              <el-button v-else size="small" type="primary" @click="router.push('/admin/review')">
+                <ZkIcon name="badge-check" :size="14" style="margin-right: 4px" />去课程审核
+              </el-button>
+            </div>
           </div>
+        </template>
+      </el-table>
+
+      <!-- 首次加载骨架：行数/列宽按真实列比例摆，数据回来时位置基本不跳 -->
+      <div v-if="showSkeleton" class="tbl-skeleton" aria-hidden="true">
+        <div class="sk-head">
+          <span v-for="(w, i) in SKELETON_WIDTHS" :key="'h' + i" class="sk-cell" :style="{ width: w }"></span>
         </div>
-      </template>
-    </el-table>
+        <div v-for="r in 6" :key="'r' + r" class="sk-row">
+          <span v-for="(w, i) in SKELETON_WIDTHS" :key="'c' + i" class="sk-cell" :style="{ width: w }"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 批量操作栏：勾选后才出现。规范要求必须显示"已选数量"和"哪些不可能处理"，
+         否则用户会以为点了就该全删掉，结果发现少了几条却不知道为什么 -->
+    <div v-if="canRemove && selectedRows.length" class="batch-bar">
+      <span class="batch-count">已选 <b>{{ selectedRows.length }}</b> 门</span>
+      <span v-if="selectedWithSchedule.length" class="batch-warn">
+        其中 {{ selectedWithSchedule.length }} 门仍有课次，删除会被跳过（需先到排课页移除）
+      </span>
+      <span v-else class="batch-ok">均可删除</span>
+      <div class="batch-actions">
+        <el-button size="small" @click="clearSelection">取消选择</el-button>
+        <el-button
+          size="small"
+          type="danger"
+          :loading="batchDeleting"
+          :disabled="!selectedDeletable.length"
+          @click="batchDelete"
+        >删除所选（{{ selectedDeletable.length }}）</el-button>
+      </div>
+    </div>
 
     <div class="between" style="padding: 12px 16px">
       <span class="small muted">
@@ -847,6 +1172,180 @@ onMounted(async () => {
   margin-top: 2px;
   font-size: 11.5px;
   color: var(--ink-400, #9aa3b2);
+}
+/* ---------- 筛选条件 chips ---------- */
+.filter-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -6px 0 12px;
+  padding: 0 2px;
+}
+.chips-label {
+  font-size: 12px;
+  color: var(--ink-400, #9aa3b2);
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--brand-200, #d6e4ff);
+  border-radius: 999px;
+  background: var(--brand-50, #eff6ff);
+  color: var(--brand-700, #1d4ed8);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.chip-x {
+  color: var(--brand-600, #2563eb);
+  text-decoration: none;
+  font-size: 13px;
+  line-height: 1;
+}
+.chip-x:hover {
+  color: var(--error, #dc2626);
+}
+.chips-clear {
+  font-size: 12px;
+  color: var(--ink-500, #64748b);
+  text-decoration: none;
+}
+.chips-clear:hover {
+  color: var(--brand-600, #2563eb);
+  text-decoration: underline;
+}
+/* ---------- 列设置 / 筛选视图 弹层 ---------- */
+.col-set-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-700, #3a4256);
+  margin-bottom: 8px;
+}
+.col-set-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 13px;
+  color: var(--ink-700, #3a4256);
+  cursor: pointer;
+}
+.col-set-lock {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--ink-300, #b8c0cf);
+}
+.view-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px dashed var(--border, #eef1f6);
+}
+.view-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--brand-600, #2563eb);
+  text-decoration: none;
+}
+.view-name:hover {
+  text-decoration: underline;
+}
+.view-del {
+  font-size: 12px;
+  color: var(--ink-400, #9aa3b2);
+  text-decoration: none;
+}
+.view-del:hover {
+  color: var(--error, #dc2626);
+}
+/* ---------- 骨架屏 ---------- */
+.tbl-wrap {
+  position: relative;
+}
+.tbl-skeleton {
+  position: absolute;
+  inset: 0;
+  padding: 0 16px;
+  background: #fff;
+  z-index: 3;
+}
+.sk-head,
+.sk-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.sk-head {
+  height: 40px;
+  border-bottom: 1px solid var(--border, #eef1f6);
+}
+.sk-row {
+  height: 48px;
+  border-bottom: 1px solid var(--border, #eef1f6);
+}
+.sk-cell {
+  height: 10px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #eef1f6 25%, #f6f8fb 37%, #eef1f6 63%);
+  background-size: 400% 100%;
+  animation: sk-shimmer 1.4s ease infinite;
+}
+@keyframes sk-shimmer {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sk-cell { animation: none; }
+}
+/* ---------- 批量操作栏 ----------
+ * 用 fixed 悬浮而不是 sticky：sticky 仍占文档流，会把表格撑高、
+ * 看起来像"表格里多了一行"（10-29 第一版就是这个问题）。
+ * 左偏移 +100px 是因为左侧导航固定 200px，纯 50% 会偏左。 */
+.batch-bar {
+  position: fixed;
+  left: calc(50% + 100px);
+  transform: translateX(-50%);
+  bottom: 24px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(880px, calc(100vw - 280px));
+  padding: 10px 14px;
+  border: 1px solid var(--brand-200, #d6e4ff);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
+  font-size: 13px;
+}
+.batch-count b {
+  color: var(--brand-600, #2563eb);
+}
+/* fixed 定位时宽度由内容 shrink-to-fit，flex 子项会被压窄：
+ * "已选 1 门"被折成两行就是这里没锁 nowrap 导致的 */
+.batch-count,
+.batch-warn,
+.batch-ok {
+  white-space: nowrap;
+}
+.batch-warn {
+  color: var(--warn-700, #8a6116);
+}
+.batch-ok {
+  color: var(--success-700, #15803d);
+}
+.batch-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  flex: none;
 }
 .pf-grid {
   display: flex;
