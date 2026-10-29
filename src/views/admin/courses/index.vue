@@ -471,15 +471,23 @@ async function deleteView(v: FilterView) {
 }
 
 /* ================= 批量操作（B-2）=================
- * 规范要求：勾选后才出现批量栏、要显示已选数量，并且**必须说明哪些不可能处理**。
- * 本页的现实约束：后端 C-23 对"名下还有课次"的课程直接拒绝删除 ⇒
- * 勾中这类课程要提前说清，而不是等用户点了批量删除再逐条报错。
+ * 规范要求：勾选后才出现批量栏、要显示已选数量，并且**必须说明后果**。
+ * ★ 这里曾写错一次（10-29）：原以为后端 C-23 会拒绝删除"名下还有课次"的课程，
+ *   于是把这类课程算成"不可删"、按钮直接禁用——而 AdminCourseServiceImpl.deleteCourse
+ *   的真实语义是「软删主记录 + 级联软删名下课次」（2026-10-16 起就是这样，10-26 运行包同样），
+ *   根本不拒绝。结果演示库 6 门课全都有课次 ⇒ 批量删除永远禁用、功能等于不存在。
+ *   现在按真实语义：**全部可删**，但必须提前说清"课次会一起删掉"——
+ *   课次是教师端课表的来源，静默级联删除才是真正需要警示的地方。
  */
 const canRemove = computed(() => userStore.hasPermi('admin:courses:remove'));
 const selectedRows = ref<AdminCourseVo[]>([]);
 const batchDeleting = ref(false);
+/** 勾选里含课次的课程（用于警示"这些课次会被一并移除"，不是"不能删"） */
 const selectedWithSchedule = computed(() => selectedRows.value.filter((r) => (scheduledCount(r) ?? 0) > 0));
-const selectedDeletable = computed(() => selectedRows.value.filter((r) => (scheduledCount(r) ?? 0) === 0));
+/** 勾选课程的课次总数；统计未取到时按 0 计，文案会退化为"课次（如有）一并移除" */
+const selectedLessonTotal = computed(() =>
+  selectedRows.value.reduce((sum, r) => sum + (scheduledCount(r) ?? 0), 0)
+);
 
 function onSelectionChange(sel: AdminCourseVo[]) {
   selectedRows.value = sel;
@@ -490,15 +498,18 @@ function clearSelection() {
 }
 
 async function batchDelete() {
-  const blocked = selectedWithSchedule.value.length;
-  const targets = selectedDeletable.value;
+  const targets = selectedRows.value;
   if (!targets.length) {
-    ElMessage.warning(blocked ? `选中的 ${blocked} 门课程都还有课次，需先到排课页移除课表后才能删除` : '请先勾选要删除的课程');
+    ElMessage.warning('请先勾选要删除的课程');
     return;
   }
-  const tip = blocked
-    ? `将删除 ${targets.length} 门；另有 ${blocked} 门因"仍有课次"会被跳过（需先去排课页移除）。删除为软删，可追溯。`
-    : `将删除 ${targets.length} 门课程（软删，可追溯）。`;
+  // 后端不拒删、会级联软删课次 ⇒ 目标是全部勾选项，但确认框必须把课次说清楚
+  const withSched = selectedWithSchedule.value.length;
+  const lessons = selectedLessonTotal.value;
+  const schedTip = withSched
+    ? `；其中 ${withSched} 门名下共 ${lessons} 节课次会一并移除（教师端课表将同步消失）`
+    : '（名下均无课次）';
+  const tip = `将删除 ${targets.length} 门课程${schedTip}。删除为软删，可追溯。确定执行？`;
   try {
     await ElMessageBox.confirm(tip, '批量删除', { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' });
   } catch {
@@ -600,14 +611,23 @@ async function openDetail(row: AdminCourseVo) {
 }
 
 /* ---------------- 删除课程（C-23）----------------
- * 后端语义：软删主记录 + 级联软删课次；但**课程名下还有课次时会拒绝**（要先去排课移除）。
- * 所以失败文案不能写死"删除失败"——把后端给的原因透出来，用户才知道先去排课页处理。
+ * 后端语义（AdminCourseServiceImpl.deleteCourse，2026-10-16 起）：软删主记录，
+ * 若名下有课次则**级联软删课次**（scheduleMapper.deleteByCourse），不拒绝。
+ * ⇒ 确认框必须提前告知"课次会一起删"，这是不可忽略的连带影响：
+ *   课次是教师端课表/学生端课表的来源，删课等于把这门课从所有课表里抹掉。
  */
 const deleting = ref<string>('');
 
 async function doDelete(row: AdminCourseVo) {
+  const n = scheduledCount(row);
+  const lessonTip =
+    n === null
+      ? '该课程名下的课次（如有）会一并移除'
+      : n > 0
+        ? `该课程名下 ${n} 节课次会一并移除（教师端课表同步消失）`
+        : '该课程名下暂无课次';
   const ok = await ElMessageBox.confirm(
-    `确定删除课程「${row.courseName}」（${row.courseCode}）吗？删除后该课程与其课次记录将不再出现在管理端。若课程名下仍有课次，系统会拒绝删除，需先到「智能排课」移除课次。`,
+    `确定删除课程「${row.courseName}」（${row.courseCode}）吗？${lessonTip}。删除为软删（可追溯），课程与课次记录将不再出现在管理端。`,
     '删除课程',
     { type: 'warning', confirmButtonText: '确定删除' }
   ).catch(() => false);
@@ -953,23 +973,19 @@ onMounted(async () => {
       </div>
     </div>
 
-    <!-- 批量操作栏：勾选后才出现。规范要求必须显示"已选数量"和"哪些不可能处理"，
-         否则用户会以为点了就该全删掉，结果发现少了几条却不知道为什么 -->
+    <!-- 批量操作栏：勾选后才出现。规范要求显示"已选数量"和"哪些有额外影响"。
+         ★ 这里说的是"课次会被一并移除"，不是"不能删"——后端是级联软删，不拒删。 -->
     <div v-if="canRemove && selectedRows.length" class="batch-bar">
       <span class="batch-count">已选 <b>{{ selectedRows.length }}</b> 门</span>
       <span v-if="selectedWithSchedule.length" class="batch-warn">
-        其中 {{ selectedWithSchedule.length }} 门仍有课次，删除会被跳过（需先到排课页移除）
+        其中 {{ selectedWithSchedule.length }} 门仍有 {{ selectedLessonTotal }} 节课次，删除会一并移除
       </span>
-      <span v-else class="batch-ok">均可删除</span>
+      <span v-else class="batch-ok">名下均无课次</span>
       <div class="batch-actions">
         <el-button size="small" @click="clearSelection">取消选择</el-button>
-        <el-button
-          size="small"
-          type="danger"
-          :loading="batchDeleting"
-          :disabled="!selectedDeletable.length"
-          @click="batchDelete"
-        >删除所选（{{ selectedDeletable.length }}）</el-button>
+        <el-button size="small" type="danger" :loading="batchDeleting" @click="batchDelete">
+          删除所选（{{ selectedRows.length }}）
+        </el-button>
       </div>
     </div>
 
@@ -1096,6 +1112,19 @@ onMounted(async () => {
       叠加成 22px，而其它控件之间只有 10px ⇒ 归零，整行间距统一 10px。
    2) 大小：两个按钮实测都是 78×32，但默认按钮边框是浅灰（#dcdfe6），
       衬得它比实心主按钮"窄一圈"。统一 min-width/height，并给重置更实的描边。 */
+/* 窄视口工具栏换行（2026-10-29 实测补）
+ * 本页筛选项比其它页多（3 个控件 + 搜索/重置/导出 + 左侧 3 个图标按钮），
+ * 1080 视口下这一行放不下 ⇒「重置/导出」被挤到视口外、整页出现横向滚动条
+ * （同视口下 dashboard/accounts/review/schedule/logs/monitor 六个页面均正常）。
+ * 允许换行，代价是窄屏下工具栏变两行。 */
+.toolbar {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+.toolbar .right {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
 .toolbar :deep(.el-button + .el-button) {
   margin-left: 0;
 }
