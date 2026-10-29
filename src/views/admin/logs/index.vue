@@ -91,23 +91,66 @@
         </thead>
 
         <tbody v-if="rows.length">
-          <tr v-for="r in rows" :key="tab + '-' + r.operId">
-            <td class="mono small">{{ r.operTime || '—' }}</td>
-            <td>{{ r.operName || '—' }}</td>
+          <!-- 整行可点开详情（同 CloudTrail 点事件名看详情）：不额外占一列，也不破坏两个页签
+               各自的列数。单元格里的筛选按钮用 .stop 阻止冒泡，否则点它会连带打开抽屉。 -->
+          <tr
+            v-for="r in rows"
+            :key="tab + '-' + r.operId"
+            class="log-row"
+            title="点击查看这条日志的全部字段"
+            @click="detail = r"
+          >
+            <td class="mono small">
+              <div class="t-rel">{{ relTime(r.operTime) }}</div>
+              <div class="t-abs" :title="r.operTime">{{ absTime(r.operTime) }}</div>
+            </td>
 
             <template v-if="tab === 'operation'">
-              <td><span class="badge badge-info">{{ r.title || '—' }}</span></td>
-              <!-- 「操作内容」不是后端字段：后端只存 title / businessType / requestMethod / operUrl，
-                   原型里「修改账号状态：张同学 → 停用」那种自然语言描述库里没有。这里用三项真实字段拼出，
-                   并保留完整 url 在 title 属性里（表格放不下）。 -->
-              <td class="content-cell" :title="fullContent(r)">
-                {{ contentText(r) || '—' }}
+              <td>
+                <button
+                  v-if="r.operName"
+                  class="val-link"
+                  title="只看这个操作人的记录"
+                  @click.stop="filterBy('operName', r.operName)"
+                >{{ r.operName }}</button>
+                <span v-else>—</span>
               </td>
+              <td>
+                <button
+                  v-if="r.title"
+                  class="badge badge-info val-badge"
+                  title="只看这个模块的记录"
+                  @click.stop="filterBy('title', r.title)"
+                >{{ r.title }}</button>
+                <span v-else>—</span>
+              </td>
+              <!-- 「操作内容」不是后端字段：后端只存 title / businessType / requestMethod / operUrl，
+                   原型里「修改账号状态：张同学 → 停用」那种自然语言描述库里没有。这里用三项真实字段拼出。 -->
+              <td class="content-cell">{{ contentText(r) || '—' }}</td>
+              <!-- IP 不做成可点：后端操作日志分支没有 IP 入参，点了只能前端过滤，
+                   「共 N 条」会与真实总数对不上，比不能点更误导 -->
               <td class="small muted" :title="locTitle(r)">{{ r.operIp || '—' }} · {{ locText(r) }}</td>
             </template>
 
             <template v-else>
-              <td class="mono small">{{ r.operIp || '—' }}</td>
+              <td>
+                <button
+                  v-if="r.operName"
+                  class="val-link mono"
+                  title="只看这个账号的记录"
+                  @click.stop="filterBy('keyword', r.operName)"
+                >{{ r.operName }}</button>
+                <span v-else>—</span>
+              </td>
+              <td>
+                <button
+                  v-if="r.operIp"
+                  class="val-link mono"
+                  title="只看这个 IP 的记录"
+                  @click.stop="filterBy('keyword', r.operIp)"
+                >{{ r.operIp }}</button>
+                <span v-else>—</span>
+              </td>
               <td class="small muted" :title="locTitle(r)">{{ locText(r) }}</td>
             </template>
 
@@ -163,8 +206,68 @@
     {{ tab === 'operation'
       ? '「操作内容」由模块名 + 操作类型 + 请求方式 + 请求地址拼成（后端不存自然语言描述）；「结果」判据是 status=0，与 HTTP 状态码无关。'
       : '原型里的「角色」「设备/客户端」两列后端无任何来源（登录日志出参只有账号/IP/归属地/时间/状态），故不展示，不做假列。' }}
-    共 {{ total }} 条。
+    共 {{ total }} 条。点任意一行可查看该条的全部字段；点操作人 / 模块名（或登录页签的账号、IP）可直接按它筛选。
   </p>
+
+  <!-- 行详情抽屉：对照 CloudTrail 事件详情（给出完整事件记录）与 GitHub 审核日志条目。
+       表格放不下的字段（完整 URL、日志 ID、status 原值）都在这里，不再只靠 title 属性。 -->
+  <el-drawer :model-value="!!detail" title="日志详情" size="460px" @close="detail = null">
+    <template v-if="detail">
+      <dl class="kv">
+        <dt>时间</dt>
+        <dd class="mono">{{ detail.operTime || '—' }}</dd>
+
+        <dt>日志 ID</dt>
+        <dd class="mono">{{ detail.operId || '—' }}</dd>
+
+        <dt>{{ tab === 'operation' ? '操作人' : '账号' }}</dt>
+        <dd>{{ detail.operName || '—' }}</dd>
+
+        <template v-if="tab === 'operation'">
+          <dt>模块</dt>
+          <dd>{{ detail.title || '—' }}</dd>
+
+          <dt>操作类型</dt>
+          <dd>{{ btLabel(detail.businessType) || '—' }}</dd>
+
+          <dt>请求方式</dt>
+          <dd>{{ detail.requestMethod || '—' }}</dd>
+
+          <dt>请求地址</dt>
+          <dd class="mono break">{{ detail.operUrl || '—' }}</dd>
+
+          <dt>耗时</dt>
+          <dd>{{ detail.costTime ?? '—' }} ms</dd>
+        </template>
+
+        <dt>IP</dt>
+        <dd class="mono">{{ detail.operIp || '—' }}</dd>
+
+        <dt>归属地</dt>
+        <dd>
+          <template v-if="locText(detail) === '—'">
+            <span class="muted">—</span>
+            <span class="small muted">（后端原始值：{{ detail.operLocation || '空' }}）</span>
+          </template>
+          <template v-else>{{ locText(detail) }}</template>
+        </dd>
+
+        <dt>结果</dt>
+        <dd>
+          <span class="badge" :class="detail.status === 0 ? 'badge-success' : 'badge-error'">
+            {{ detail.status === 0 ? '成功' : '失败' }}
+          </span>
+          <span class="small muted">status = {{ detail.status }}（0 为正常，非 0 为异常）</span>
+        </dd>
+      </dl>
+
+      <div class="drawer-actions">
+        <button class="btn btn-outline" @click="copyDetail">
+          <ZkIcon name="file-text" :size="14" style="margin-right: 4px" />复制为 JSON
+        </button>
+      </div>
+    </template>
+  </el-drawer>
 </template>
 
 <script setup lang="ts">
@@ -202,7 +305,21 @@ const BUSINESS_TYPES = [
   { value: 9, label: '清空数据' }
 ];
 
+/**
+ * 时间快捷选项。原先只有「最近 7/30/90 天」，排查当天事故时最常用的是「今天」——
+ * 选 7 天等于把 6 天的无关记录也拉进来。CloudTrail 的预设粒度更细
+ * （30 分钟 / 1 小时 / 12 小时 / 1 天），这里是教务场景，按天取更贴切。
+ */
+const dayStart = (offset: number) => {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + offset);
+  return d;
+};
+
 const DATE_SHORTCUTS = [
+  { text: '今天', value: () => [dayStart(0), new Date()] },
+  { text: '昨天', value: () => [dayStart(-1), dayStart(-1)] },
   {
     text: '最近 7 天',
     value: () => {
@@ -254,6 +371,12 @@ const loadError = ref('');
  * 分不清是「这段时间真的没有新操作」还是「页面根本没重新查」。
  */
 const loadedAt = ref('');
+/**
+ * 行详情抽屉。参照 GitHub 审核日志与 AWS CloudTrail 事件历史：两者都不把关键信息塞进
+ * 单元格的 title 属性，而是点开看完整记录（CloudTrail 甚至给出 JSON 载荷）。
+ * 我们只有 11 个字段，抽屉够用；用 title 属性时触屏设备根本看不到，长 URL 也读不全。
+ */
+const detail = ref<LogRowVo | null>(null);
 
 /**
  * 并发响应只认最后一次。
@@ -395,6 +518,60 @@ function locTitle(r: LogRowVo) {
   return v;
 }
 
+/* ---------------- 时间显示 ---------------- */
+
+/**
+ * 相对时间。日志页的通行做法是「多久以前」与「精确时刻」**并置**（Datadog / Sentry /
+ * CloudTrail 都如此）：排查时先用相对时间定位范围，写事故记录时再抄精确时刻。
+ * 只给绝对时间要心算，只给相对时间又没法写进报告。
+ */
+function relTime(t: string) {
+  if (!t) return '—';
+  /** 后端给 `yyyy-MM-dd HH:mm:ss`。空格分隔的写法 Safari 解析为 Invalid Date，必须换成 T */
+  const ms = Date.parse(t.replace(' ', 'T'));
+  if (Number.isNaN(ms)) return t;
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return '刚刚';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)} 天前`;
+  /** 超过一周只说「几天前」没有意义，退化成日期 */
+  return t.slice(5, 10);
+}
+
+/** 精确时刻：一周内只补时分秒（日期已由相对时间表达），超过一周给完整日期时间 */
+function absTime(t: string) {
+  if (!t) return '';
+  const ms = Date.parse(t.replace(' ', 'T'));
+  if (Number.isNaN(ms)) return '';
+  return Date.now() - ms < 7 * 86_400_000 ? t.slice(11) : t;
+}
+
+/* ---------------- 点单元格直接筛选 ---------------- */
+
+/**
+ * 参照 CloudTrail「按属性筛选」和 GitHub 的 actor / action 限定符：最快的排查路径是从
+ * 当前这一行钻进去，而不是回到上面重新手打一遍。
+ *
+ * ⚠️ 只能点后端真支持的参数，不能为了「看起来能点」做前端过滤：
+ *   - 操作日志分支只认 title / operName / businessType / status / 时间窗，**没有 IP 参数**
+ *     （`AdminAuditLogMapper.xml:33-52`）⇒ 操作人的 IP 不做成可点，否则筛完「共 N 条」
+ *     是这一页的 N，与真实总数对不上，比不能点更误导。
+ *   - 登录日志的 keyword 同时 like user_name 与 ipaddr（`:72-75`）⇒ 账号和 IP 都可点。
+ */
+function filterBy(kind: 'operName' | 'title' | 'keyword', value: string) {
+  if (!value) return;
+  keyword.value = '';
+  moduleName.value = '';
+  businessType.value = null;
+  if (kind === 'operName') keyword.value = value;
+  else if (kind === 'title') moduleName.value = value;
+  else keyword.value = value;
+  /** 保留结果与时间窗：从「失败」里点某个人，语义是「这个人的失败记录」 */
+  page.value = 1;
+  load();
+}
+
 /* ---------------- 导出 ---------------- */
 
 /** CSV 公式注入防护：单元格以 = + - @ 或制表/回车开头时 Excel 会当公式执行，前置单引号阻断 */
@@ -470,6 +647,23 @@ async function onExport() {
   }
 }
 
+/**
+ * 复制为 JSON（对齐 CloudTrail 详情页给「事件记录」载荷的做法）。
+ * 只复制**后端真实返回的字段**，不额外塞页面推导出来的东西（如相对时间），
+ * 否则黏到工单里的东西和接口出参对不上，别人复核时会以为后端多了字段。
+ * clipboard API 只在 https / localhost 可用，失败要明说，不能静默。
+ */
+async function copyDetail() {
+  if (!detail.value) return;
+  const json = JSON.stringify(detail.value, null, 2);
+  try {
+    await navigator.clipboard.writeText(json);
+    ElMessage.success('已复制这条日志的 JSON');
+  } catch {
+    ElMessage.warning('浏览器不允许写剪贴板（需 https 或 localhost），可在抽屉里手动选中复制');
+  }
+}
+
 onMounted(load);
 </script>
 
@@ -512,6 +706,66 @@ onMounted(load);
 .content-cell {
   color: var(--ink-700);
   word-break: break-all;
+}
+/* 整行可点开详情 ⇒ 必须给出可点的视觉信号，否则没人会去点 */
+.log-row {
+  cursor: pointer;
+}
+.log-row:hover {
+  background: var(--bg-subtle);
+}
+.t-rel {
+  font-weight: 500;
+  color: var(--ink-700);
+}
+.t-abs {
+  font-size: 11px;
+  color: var(--ink-500);
+  margin-top: 2px;
+}
+/* 单元格内的「点一下就按它筛」按钮：视觉上要像值本身，不能像按钮 */
+.val-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--brand-700);
+  cursor: pointer;
+  text-align: left;
+}
+.val-link:hover {
+  text-decoration: underline;
+}
+.val-badge {
+  border: none;
+  cursor: pointer;
+  font: inherit;
+}
+.val-badge:hover {
+  filter: brightness(0.96);
+}
+/* 详情抽屉的键值表 */
+.kv {
+  display: grid;
+  grid-template-columns: 84px 1fr;
+  gap: 10px 14px;
+  margin: 0;
+  font-size: 13px;
+  align-items: baseline;
+}
+.kv dt {
+  color: var(--ink-500);
+  font-size: 12px;
+}
+.kv dd {
+  margin: 0;
+  color: var(--ink-700);
+  word-break: break-all;
+}
+.drawer-actions {
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
 }
 .cost {
   margin-left: 6px;
