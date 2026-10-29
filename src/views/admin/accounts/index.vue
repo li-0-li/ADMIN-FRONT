@@ -309,15 +309,23 @@ const ADMIN_LOCK_TIP = '超级管理员受保护，不可操作（改密请用�
  * 当前用户是否超管 = permissions 含 *:*:*（若依 userId==1 硬编码的唯一标记）。
  */
 const userStore = useUserStore();
-const isSuperAdmin = computed(() => userStore.permissions.includes('*:*:*'));
+/** 是否超管。走 store 的 hasPermi（口径集中在 store/user.ts 一处），
+ *  与手写 permissions.includes('*:*:*') 语义等价——这样 hasPermi 在本页有真实调用点，
+ *  后端日后调整超管判定时只改 store 一个文件。 */
+const isSuperAdmin = computed(() => userStore.hasPermi('*:*:*'));
 /** 行是否为管理员角色账号 */
 const isAdminRow = (row: AdminUserVo) => (row.roleKeys ?? []).includes('admin');
 const ADMIN_EDIT_TIP = '只有超级管理员可以添加或编辑管理员账号';
 const ADMIN_RESET_TIP = '只有超级管理员可以重置管理员密码（改自己的密码请用右上角「修改密码」）';
-/** 行操作锁：超管保护 或 非超管管理其他管理员 */
+/** 行操作锁：超管保护 或 非超管管理管理员角色账号。
+ *  ★ 不豁免"自己"：10-19 版曾放过自己行（当时设想平台管理员可以改自己的资料），
+ *  但后端护栏后来收紧为无例外——2026-10-29 用幂等请求实测（对自身 update 与 toggleStatus
+ *  分别回「只有超级管理员可以编辑/停用或启用管理员账号」），前端放开只是让用户点了必 403。
+ *  平台管理员改自己资料的正确路径=右上角「修改密码」；昵称等资料需超管代改（产品口径如需
+ *  放开"自己改自己资料"，应改后端护栏并在两端同时放开，不能前端单边先放）。 */
 function opLockTip(row: AdminUserVo): string | null {
   if (row.userId === SUPER_ADMIN_ID) return ADMIN_LOCK_TIP;
-  if (!isSuperAdmin.value && isAdminRow(row) && row.username !== userStore.username) return ADMIN_EDIT_TIP;
+  if (!isSuperAdmin.value && isAdminRow(row)) return ADMIN_EDIT_TIP;
   return null;
 }
 /** 重置密码专用锁（用户拍板 10-19 16:00）：非超管对管理员角色的行一律不可重置，含自己的行（自己改密走右上角「修改密码」） */
