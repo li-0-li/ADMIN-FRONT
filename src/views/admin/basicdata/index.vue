@@ -189,6 +189,11 @@ function openEdit(row: Record<string, unknown>) {
   formMode.value = 'edit';
   Object.keys(form).forEach(k => delete form[k]);
   Object.assign(form, JSON.parse(JSON.stringify(row)));
+  // 日期字段归一化到 YYYY-MM-DD：后端实返 "2026-08-24 00:00:00"，与 el-date-picker 的
+  // value-format 不一致，不截的话回显解析不稳、原样保存还会把时分秒带回后端
+  currentFields.value.forEach(f => {
+    if (f.type === 'date' && typeof form[f.prop] === 'string') form[f.prop] = (form[f.prop] as string).slice(0, 10);
+  });
   formVisible.value = true;
 }
 
