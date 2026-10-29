@@ -2,9 +2,10 @@
 import { computed, onMounted, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
+import type { TableInstance } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
-import { deleteCourse, listCourses } from '@/api/admin/courses';
-import type { AdminCourseVo } from '@/api/admin/courses';
+import { deleteCourse, exportCourses, listCourses } from '@/api/admin/courses';
+import type { AdminCourseOrderBy, AdminCourseVo } from '@/api/admin/courses';
 import { getCertDetail, reviewCertification } from '@/api/admin/certifications';
 import { listSchedules } from '@/api/admin/schedules';
 import { listTerms } from '@/api/admin/basicdata';
@@ -28,6 +29,8 @@ import type { CertDetail } from '@/types/admin';
  */
 
 const loading = ref(false);
+/** 只为 clearSort 服务：清筛选时要同时熄灭表头排序箭头 */
+const tableRef = ref<TableInstance>();
 const rows = ref<AdminCourseVo[]>([]);
 const total = ref(0);
 /** 失败态与空态分开存：接口挂了不能显示成"没有课程"（账号页同款处理） */
@@ -35,7 +38,15 @@ const loadError = ref('');
 const router = useRouter();
 /** scheduleState：排课状态筛选（'' 全部 / 'scheduled' 已排课 / 'unscheduled' 未排课）
  *  见下方 fetchList 的说明：这个条件没法交给后端分页，只能本地筛。 */
-const query = reactive({ page: 1, pageSize: 10, keyword: '', semester: '', scheduleState: '' });
+const query = reactive<{
+  page: number;
+  pageSize: number;
+  keyword: string;
+  semester: string;
+  scheduleState: string;
+  orderBy: AdminCourseOrderBy | '';
+  orderDir: 'asc' | 'desc' | '';
+}>({ page: 1, pageSize: 10, keyword: '', semester: '', scheduleState: '', orderBy: '', orderDir: '' });
 /** 排课筛选下的补充说明（例如全量没拉完），空串=无话可说 */
 const filterNote = ref('');
 /** 是否存在任一筛选条件：决定空态给「清空筛选」还是「去课程审核」 */
@@ -71,6 +82,19 @@ const SCHEDULE_WIDE_START = '2000-01-01';
 const SCHEDULE_WIDE_END = '2100-12-31';
 const SCHEDULE_FETCH_LIMIT = 1000;
 
+/* ---------------- 后端能力探测（2026-10-29）----------------
+ * 后端 5edbfbb 给课程列表补了 scheduleCount 字段、orderBy/orderDir 排序、POST /export 导出，
+ * 但**运行包（8080 的 10-26 包）还没有**：实测无 scheduleCount 字段、asc/desc 顺序完全一致、
+ * POST /export 返回 code:500「Request method 'POST' is not supported」。
+ * 所以这里用「列表首行有没有 scheduleCount 这个 key」当版本探针——一次列表请求即可判断，
+ * 不用额外打探测请求，也不会误判（旧包是**没有这个 key**，不是值为 null）：
+ *   新包 → 课次数直接用字段（零请求零聚合）、表头可服务端排序、导出可用
+ *   旧包 → 回退到课次接口聚合、排序表头禁用（否则点了没反应更像 bug）、导出按钮明确提示不可用
+ */
+const serverHasScheduleCount = ref(false);
+/** 排序与导出同属 5edbfbb 这一批，一次探测同时决定三者 */
+const canServerSort = computed(() => serverHasScheduleCount.value);
+
 async function loadScheduleCounts() {
   scheduleStatsLoading.value = true;
   try {
@@ -102,11 +126,24 @@ async function loadScheduleCounts() {
   return scheduleStatsReady.value;
 }
 
-/** 该课程的节次数；null = 统计未拿到（与"0 节/未排课"必须区分开，否则会误报未排课） */
-function scheduledCount(courseId: string): number | null {
+/** 该课程的节次数；null = 数字还没拿到（与"0 节/未排课"必须区分开，否则会误报未排课）
+ *  ★ 优先用后端字段（新包）：一行就带着课次数，既不用拉 1000 条课次，也不会因拉取上限漏数；
+ *    旧包没有这个 key，才回退到本页聚合的 Map。判断用 typeof，0 是合法值。 */
+function scheduledCount(row: AdminCourseVo): number | null {
+  if (typeof row.scheduleCount === 'number') return row.scheduleCount;
   if (!scheduleStatsReady.value) return null;
-  return scheduleCount.value.get(String(courseId)) ?? 0;
+  return scheduleCount.value.get(String(row.courseId)) ?? 0;
 }
+
+/** 「排课情况」列头悬浮说明：把"数据来源 + 能否排序"一次讲清，避免用户点了表头没反应却不知道为什么 */
+const scheduleHeaderTitle = computed(() => {
+  const base = scheduleStatsPartial.value
+    ? '课次总数超出单次拉取上限，此处仅统计已拉取部分'
+    : '按全部课次统计，放回待排的课次不计入';
+  return canServerSort.value
+    ? `${base}；点表头可按课次数排序`
+    : `${base}；当前运行包不支持服务端排序，换包后可按课次数排序`;
+});
 
 async function loadTerms() {
   try {
@@ -141,14 +178,17 @@ async function fetchList() {
     const base = {
       keyword: query.keyword.trim() || undefined,
       semester: query.semester || undefined,
-      status: 'active' as const
+      status: 'active' as const,
+      // 排序：白名单外的值后端会静默回退 courseId desc，所以这里只在有值时才传
+      orderBy: query.orderBy || undefined,
+      orderDir: query.orderDir || undefined
     };
     if (query.scheduleState) {
-      // 排课统计是筛选的前提：没拿到就没有"已排/未排"这个事实，不能拿空 Map 当"全都没排课"
-      if (!scheduleStatsReady.value) {
+      // 排课筛选的前提是"知道每门课的节次数"：新包行里直接带 scheduleCount，旧包才需要先聚合
+      if (!serverHasScheduleCount.value && !scheduleStatsReady.value) {
         await loadScheduleCounts();
       }
-      if (!scheduleStatsReady.value) {
+      if (!serverHasScheduleCount.value && !scheduleStatsReady.value) {
         rows.value = [];
         total.value = 0;
         filterNote.value = '';
@@ -157,11 +197,12 @@ async function fetchList() {
       }
       const res = await listCourses({ ...base, page: 1, pageSize: SCHEDULE_FILTER_FETCH_LIMIT });
       const all = res?.list ?? [];
+      detectCapabilities(all);
       const onlyScheduled = query.scheduleState === 'scheduled';
-      const filtered = all.filter((c) => {
-        const n = scheduleCount.value.get(String(c.courseId)) ?? 0;
-        return onlyScheduled ? n > 0 : n === 0;
-      });
+      // 逐行判断：有新字段用字段（0 是合法的"未排课"），没有才查聚合 Map
+      const countOf = (c: AdminCourseVo) =>
+        typeof c.scheduleCount === 'number' ? c.scheduleCount : scheduleCount.value.get(String(c.courseId)) ?? 0;
+      const filtered = all.filter((c) => (onlyScheduled ? countOf(c) > 0 : countOf(c) === 0));
       total.value = filtered.length;
       const start = (query.page - 1) * query.pageSize;
       rows.value = filtered.slice(start, start + query.pageSize);
@@ -177,6 +218,7 @@ async function fetchList() {
     const res = await listCourses({ ...base, page: query.page, pageSize: query.pageSize });
     rows.value = res?.list ?? [];
     total.value = res?.total ?? 0;
+    detectCapabilities(rows.value);
     loadError.value = '';
   } catch {
     /* 失败必须清列表 + 归零总数，否则会留着上一次筛选的结果冒充本次结果 */
@@ -189,6 +231,30 @@ async function fetchList() {
   }
 }
 
+/**
+ * 版本探针：用"首行有没有 scheduleCount 这个 key"判断后端是不是 5edbfbb 之后的新包。
+ * ★ 空列表不更新结论（没法判断），保留上一次结果 —— 否则筛选到空页会把能力误判成"旧包"，
+ *   排序表头突然变灰、导出按钮突然不可用，看着像故障。
+ */
+function detectCapabilities(list: AdminCourseVo[]) {
+  if (!list.length) return;
+  serverHasScheduleCount.value = 'scheduleCount' in list[0];
+}
+
+/** 表头排序（服务端）：element 的 sort-change 给 { prop, order: 'ascending'|'descending'|null } */
+function onSortChange({ prop, order }: { prop: string; order: string | null }) {
+  if (!canServerSort.value) return;
+  if (!order || !prop) {
+    query.orderBy = '';
+    query.orderDir = '';
+  } else {
+    query.orderBy = prop as AdminCourseOrderBy;
+    query.orderDir = order === 'ascending' ? 'asc' : 'desc';
+  }
+  query.page = 1;
+  fetchList();
+}
+
 function onSearch() {
   query.page = 1;
   fetchList();
@@ -198,8 +264,19 @@ function resetQuery() {
   query.keyword = '';
   query.semester = '';
   query.scheduleState = '';
+  query.orderBy = '';
+  query.orderDir = '';
   query.page = 1;
+  // 表头的排序箭头是 el-table 自己的状态，清 query 不会让它熄灭 —— 不调这个，
+  // 会出现"箭头还亮着但数据已按默认序"的错位显示
+  tableRef.value?.clearSort();
   fetchList();
+}
+
+/** 刷新：保留当前筛选与排序，重拉列表（新包不必再拉课次；旧包顺带刷新聚合） */
+async function refreshAll() {
+  await fetchList();
+  if (!serverHasScheduleCount.value) void loadScheduleCounts();
 }
 
 /** 跳排课页并只看这门课。
@@ -207,6 +284,54 @@ function resetQuery() {
  *  它只在"切专业"时才校验并清空 courseId，本跳转不改专业 ⇒ 不会被清掉。不需要改排课页。 */
 function goSchedule(row: AdminCourseVo) {
   void router.push({ path: '/admin/schedule', query: { course: String(row.courseId) } });
+}
+
+/* ---------------- 导出（C-12b）----------------
+ * 按**当前筛选条件**导出（与列表同口径），但注意：排课状态是前端本地筛出来的，
+ * 后端不认这个条件 ⇒ 带排课筛选时导出的仍是"该关键词/学期下的全部课程"。
+ * 这一点必须明说，否则用户会以为导出的就是屏幕上看到的那些行。
+ */
+const exporting = ref(false);
+
+async function onExport() {
+  if (!serverHasScheduleCount.value) {
+    // 旧包没有这个端点：实测 POST 会返回 code:500「Request method 'POST' is not supported」，
+    // 与其让用户看到这句后端原话，不如直接说明原因
+    ElMessage.warning('当前运行包不支持课程导出，需后端换包后可用');
+    return;
+  }
+  exporting.value = true;
+  try {
+    const blob = await exportCourses({
+      keyword: query.keyword.trim() || undefined,
+      semester: query.semester || undefined,
+      status: 'active',
+      orderBy: query.orderBy || undefined,
+      orderDir: query.orderDir || undefined
+    });
+    const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    saveBlob(blob, `课程清单-${stamp}.xlsx`);
+    ElMessage.success(
+      query.scheduleState
+        ? '已导出：含当前关键词/学期条件下的全部课程（排课情况筛选不参与导出）'
+        : '已导出当前筛选结果'
+    );
+  } catch {
+    /* requestBlob 内部已经弹过具体原因（无权限/下载失败），这里不再重复提示 */
+  } finally {
+    exporting.value = false;
+  }
+}
+
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 /* ---------------- 详情抽屉 ---------------- */
@@ -317,9 +442,10 @@ async function revokeApprove() {
 
 onMounted(async () => {
   void loadTerms();
-  // 排课统计独立于课程列表：并行拉，谁先回都不影响另一个；失败只让该列显示 —
-  void loadScheduleCounts();
+  // 先拿列表：首行的 scheduleCount 决定要不要再拉课次聚合。
+  // 新包（有字段）省掉一次 pageSize=1000 的课次请求；旧包才需要自算。
   await fetchList();
+  if (!serverHasScheduleCount.value) void loadScheduleCounts();
 });
 </script>
 
@@ -334,6 +460,18 @@ onMounted(async () => {
   </div>
 
   <div class="toolbar">
+    <!-- 列表级操作（刷新）：只重拉数据，不动当前筛选与排序。
+         放在工具栏左侧，避免和右侧筛选条件混成一片 -->
+    <div class="left">
+      <el-button
+        class="tb-icon"
+        :loading="loading"
+        title="刷新列表（保留当前筛选与排序）"
+        @click="refreshAll"
+      >
+        <ZkIcon v-if="!loading" name="refresh-cw" :size="15" />
+      </el-button>
+    </div>
     <div class="right" style="gap: 10px">
       <el-input
         v-model="query.keyword"
@@ -373,6 +511,11 @@ onMounted(async () => {
       <el-button class="tb-btn tb-btn-reset" @click="resetQuery">
         <ZkIcon name="refresh-cw" :size="15" style="margin-right: 4px" />重置
       </el-button>
+      <!-- 导出（C-12b）：按当前关键词/学期/排序导出。★ 排课情况筛选是前端本地筛，
+           后端不认 ⇒ 带该条件时导出的是"该关键词/学期下的全部课程"，提示里会明说 -->
+      <el-button class="tb-btn tb-btn-export" :loading="exporting" @click="onExport">
+        <ZkIcon name="file-text" :size="15" style="margin-right: 4px" />导出
+      </el-button>
     </div>
   </div>
 
@@ -385,11 +528,19 @@ onMounted(async () => {
         <ZkIcon v-if="!loading" name="refresh-cw" :size="14" style="margin-right: 4px" />重新加载
       </el-button>
     </div>
-    <el-table v-loading="loading" row-key="courseId" :data="rows" style="width: 100%">
+    <el-table
+      ref="tableRef"
+      v-loading="loading"
+      row-key="courseId"
+      :data="rows"
+      style="width: 100%"
+      @sort-change="onSortChange"
+    >
       <el-table-column label="课程代码" width="100" prop="courseCode">
         <template #default="{ row }">{{ row.courseCode || '—' }}</template>
       </el-table-column>
-      <el-table-column label="课程名称" min-width="170" prop="courseName">
+      <!-- 名称可能很长（如「小程序教师端测试课程1」）：规范要求超长以 … 省略、悬停看全文 -->
+      <el-table-column label="课程名称" min-width="170" prop="courseName" show-overflow-tooltip>
         <template #default="{ row }">
           <div style="font-weight: 600; color: var(--ink-900)">{{ row.courseName }}</div>
         </template>
@@ -397,10 +548,21 @@ onMounted(async () => {
       <el-table-column label="授课教师" width="110" prop="teacherName">
         <template #default="{ row }">{{ row.teacherName || '—' }}</template>
       </el-table-column>
-      <el-table-column label="学期" width="110" prop="semester">
+      <el-table-column
+        label="学期"
+        width="110"
+        prop="semester"
+        :sortable="canServerSort ? 'custom' : false"
+      >
         <template #default="{ row }">{{ row.semester || '—' }}</template>
       </el-table-column>
-      <el-table-column label="选课人数" width="90" align="center" prop="studentCount">
+      <el-table-column
+        label="选课人数"
+        width="90"
+        align="center"
+        prop="studentCount"
+        :sortable="canServerSort ? 'custom' : false"
+      >
         <template #default="{ row }">{{ row.studentCount ?? 0 }}</template>
       </el-table-column>
       <el-table-column label="状态" width="90">
@@ -410,22 +572,31 @@ onMounted(async () => {
       </el-table-column>
       <!-- 排课情况（10-29 新增）：节次数来自课次接口聚合。
            三种状态必须可辨：— = 统计没拿到 / 未排课 = 真的 0 节 / N 节 = 已排 -->
-      <el-table-column width="130" align="center">
+      <el-table-column
+        width="130"
+        align="center"
+        prop="scheduleCount"
+        :sortable="canServerSort ? 'custom' : false"
+      >
         <template #header>
-          <span :title="scheduleStatsPartial ? '课次总数超出单次拉取上限，此处仅统计已拉取部分' : '按全部课次统计，放回待排的课次不计入'">排课情况</span>
+          <span :title="scheduleHeaderTitle">排课情况</span>
         </template>
         <template #default="{ row }">
-          <span v-if="scheduledCount(row.courseId) === null" class="muted small">—</span>
-          <!-- 未排课给直达入口：这列最常见的用途就是"挑一门没排的课去排"，
-               少了这一步用户还得自己记住课程名再去排课页翻列表 -->
-          <div v-else-if="scheduledCount(row.courseId) === 0" class="sched-cell">
+          <span v-if="scheduledCount(row) === null" class="muted small">—</span>
+          <!-- 未排课给直达入口：这列最常见的用途就是"挑一门没排的课去排"， -->
+          <div v-else-if="scheduledCount(row) === 0" class="sched-cell">
             <span class="badge badge-neutral">未排课</span>
             <a class="sched-link" href="javascript:void(0)" @click="goSchedule(row)">去排课</a>
           </div>
-          <span v-else class="badge badge-info">{{ scheduledCount(row.courseId) }} 节</span>
+          <!-- 已排课也能点进去看课表：原来只有未排课能跳，想看已排的反而没入口 -->
+          <a v-else class="sched-link" href="javascript:void(0)" @click="goSchedule(row)">
+            <span class="badge badge-info">{{ scheduledCount(row) }} 节</span>
+          </a>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="150" align="right" class-name="courses-op">
+      <!-- 操作列冻结：规范要求"数据列无法一屏展示时操作列默认冻结"，
+           否则窗口一窄就只剩半截「查看」（10-29 实测过 1280 下被裁） -->
+      <el-table-column label="操作" width="150" align="right" fixed="right" class-name="courses-op">
         <template #default="{ row }">
           <el-button text size="small" @click="openDetail(row)">
             <ZkIcon name="eye" :size="14" style="margin-right: 3px" />查看
@@ -503,9 +674,9 @@ onMounted(async () => {
         <div class="pf-row">
           <span class="k">排课情况</span>
           <span>
-            <template v-if="scheduledCount(detailCourse.courseId) === null">—</template>
-            <template v-else-if="scheduledCount(detailCourse.courseId) === 0">未排课</template>
-            <template v-else>已排 {{ scheduledCount(detailCourse.courseId) }} 节</template>
+            <template v-if="scheduledCount(detailCourse) === null">—</template>
+            <template v-else-if="scheduledCount(detailCourse) === 0">未排课</template>
+            <template v-else>已排 {{ scheduledCount(detailCourse) }} 节</template>
           </span>
         </div>
       </div>
@@ -606,6 +777,25 @@ onMounted(async () => {
   color: var(--ink-700, #3a4256);
 }
 .toolbar :deep(.tb-btn-reset:hover) {
+  border-color: var(--brand-400, #7aa7f8);
+  color: var(--brand-600, #2563eb);
+  background: var(--brand-50, #eff6ff);
+}
+/* 导出：与重置同为次级按钮，仅图标换成文件图标；不做成主色，避免和「搜索」抢注意力 */
+.toolbar .left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.toolbar :deep(.tb-icon) {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: var(--r-md, 8px);
+  border-color: var(--border-strong, #cbd5e1);
+  color: var(--ink-600, #475569);
+}
+.toolbar :deep(.tb-icon:hover) {
   border-color: var(--brand-400, #7aa7f8);
   color: var(--brand-600, #2563eb);
   background: var(--brand-50, #eff6ff);
