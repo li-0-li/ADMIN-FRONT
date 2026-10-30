@@ -389,11 +389,16 @@ function probeSub(p: ProbeInfo | undefined, upSuffix = ''): string {
 }
 
 /**
- * 服务健康度 6 卡，**卡位与原型逐一对齐**（API 网关 / AI 服务 / MySQL / 文件存储 / 消息队列 / 直播投屏）。
- * 其中 3 项后端无探活端点 ⇒ unknown（灰点 + 「无监控端点」），不拿「正常」兜底。
+ * 服务健康度卡。
+ * 卡位来源：原型 6 卡（API 网关 / AI 服务 / MySQL / 文件存储 / 消息队列 / 直播投屏）
+ * + 2026-10-30 业主批准新增的 **Redis** 卡（探活数据一直有——`status.redis` 与 db 同构，
+ * 只因原型没画这卡位才一直显示不了；插在 MySQL 之后，同为「有真探活」的基础设施）。
+ * 其中 AI 服务 / 文件存储 / 消息队列 / 直播投屏 4 项后端无探活端点 ⇒ unknown（灰点），
+ * 不拿「正常」兜底。
  */
 const healthCards = computed<HealthCard[]>(() => {
   const db = status.value?.db;
+  const redis = status.value?.redis;
   return [
     {
       key: 'api',
@@ -404,6 +409,12 @@ const healthCards = computed<HealthCard[]>(() => {
     },
     { key: 'ai', name: 'AI 服务', state: 'unknown', sub: '无监控端点' },
     { key: 'db', name: 'MySQL', state: probeState(db), sub: probeSub(db) },
+    {
+      key: 'redis',
+      name: 'Redis',
+      state: probeState(redis),
+      sub: probeSub(redis, ' · 读写探针')
+    },
     { key: 'oss', name: '文件存储', state: 'unknown', sub: '无监控端点' },
     { key: 'mq', name: '消息队列', state: 'unknown', sub: '无监控端点' },
     { key: 'live', name: '直播/投屏', state: 'unknown', sub: '无监控端点' }
