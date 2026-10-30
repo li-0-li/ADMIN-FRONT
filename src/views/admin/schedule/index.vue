@@ -1248,6 +1248,36 @@ function classBusyAt(cell: ScheduleCell, weekday: number, periodNo: number) {
   );
 }
 
+/**
+ * 该教师在这一「周X 第N节」是否已有别的课（2026-10-30 B 项）。
+ * 拖到空白格时教师冲突后端必拒，前端提前标 no：悬停就有红标，省一次注定失败的写请求。
+ */
+function teacherBusyAt(cell: ScheduleCell, weekday: number, periodNo: number) {
+  if (cell.teacherId === undefined || cell.teacherId === null) return false;
+  return filtered.value.some(
+    c =>
+      c.scheduleId !== cell.scheduleId &&
+      c.weekday === weekday &&
+      c.periodNo === periodNo &&
+      String(c.teacherId) === String(cell.teacherId)
+  );
+}
+
+/**
+ * 该教室在这一格是否已被别的课占用（2026-10-30 B 项）。
+ * 移动课次会**沿用原教室**（doMove 不传 classroomId），所以教室冲突同样会挡下这次移动。
+ */
+function roomBusyAt(cell: ScheduleCell, weekday: number, periodNo: number) {
+  if (cell.classroomId === undefined || cell.classroomId === null) return false;
+  return filtered.value.some(
+    c =>
+      c.scheduleId !== cell.scheduleId &&
+      c.weekday === weekday &&
+      c.periodNo === periodNo &&
+      String(c.classroomId) === String(cell.classroomId)
+  );
+}
+
 function dropMode(weekday: number, periodNo: number): DropMode {
   if (!draggingCourse.value && !draggingCell.value) return '';
   if (dragOverKey.value !== keyOf(weekday, periodNo)) return '';
@@ -1259,6 +1289,11 @@ function dropMode(weekday: number, periodNo: number): DropMode {
     if (hovered && isSameTeacher(draggingCell.value, hovered)) return 'swaponly';
     // 该班级在此节次已另有课 ⇒ 并入和互换都放不进（互换是把同班级的两节对调，落点还是同一格）
     if (classBusyAt(draggingCell.value, weekday, periodNo)) return 'no';
+    // 拖到**空白格**：教师/教室冲突后端必拒 ⇒ 悬停阶段就标 no（2026-10-30 B 项，省一次注定失败的写请求）
+    if (!hovered) {
+      if (teacherBusyAt(draggingCell.value, weekday, periodNo)) return 'no';
+      if (roomBusyAt(draggingCell.value, weekday, periodNo)) return 'no';
+    }
   }
   return 'ok';
 }
@@ -1399,7 +1434,19 @@ async function handleDrop(weekday: number, periodNo: number, targetCardId: strin
       openChoice(movingCell, target);
       return;
     }
-    // ①-4 落到格子空白处 ⇒ 直接改到该时间，该节次原有的课次留在原地
+    // ①-4 落到格子空白处 ⇒ 先本地判教师/教室冲突（后端必拒），给出具体原因再拦下（2026-10-30 B 项）
+    if (teacherBusyAt(movingCell, weekday, periodNo)) {
+      ElMessage.warning(
+        `「${movingCell.teacherName || '该教师'}」在周${CN[weekday - 1]}这一节已有别的课，同一教师不能同时上两门，这次拖动没生效`
+      );
+      return;
+    }
+    if (roomBusyAt(movingCell, weekday, periodNo)) {
+      ElMessage.warning(
+        `「${movingCell.roomName || '原教室'}」在周${CN[weekday - 1]}这一节已被占用（移动沿用原教室），这次拖动没生效`
+      );
+      return;
+    }
     await doMove(movingCell, weekday, periodNo);
     return;
   }
@@ -1423,9 +1470,82 @@ type UndoAction =
   | { kind: 'batchCreate'; scheduleIds: Array<string | number>; label: string };
 const MAX_UNDO = 30;
 const historyStack = ref<UndoAction[]>([]);
+
+/**
+ * 撤销栈持久化（2026-10-30 E 项）。
+ * 原来栈只活在本页内存：刷新一次「刚才拖错的几步」就没了，而真实调课节奏恰恰是
+ * 「拖几下 → 刷新/切周看效果 → 回来想撤回」。落 localStorage，带**学期 + 时间戳**做失效校验：
+ * 换学期、或超过 24 小时的记录一律丢弃（期间课次可能已被别人改过，按旧 id 撤回会撤错行）。
+ * 存储本身失败（隐私模式 / 配额满）只影响下次能否恢复，不影响本次会话的撤回。
+ */
+const UNDO_STORE_KEY = 'zk_schedule_undo';
+const UNDO_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function currentUndoScope() {
+  return String(filters.termId || currentTermId.value || '');
+}
+
+function persistUndo() {
+  try {
+    localStorage.setItem(
+      UNDO_STORE_KEY,
+      JSON.stringify({ termId: currentUndoScope(), savedAt: Date.now(), stack: historyStack.value })
+    );
+  } catch {
+    /* 配额满 / 隐私模式：持久化是增强项，失败不影响本次会话撤回 */
+  }
+}
+
+/** 逐条校验结构：localStorage 可能被手改或来自旧版本，字段不全的条目必须丢掉（否则撤回时会抛错） */
+function isUndoEntry(a: unknown): a is UndoAction {
+  if (!a || typeof a !== 'object') return false;
+  const e = a as Record<string, unknown>;
+  if (typeof e.label !== 'string') return false;
+  switch (e.kind) {
+    case 'move':
+    case 'edit':
+      return e.scheduleId !== undefined && e.scheduleId !== null && !!e.prev;
+    case 'swap':
+      return e.fromScheduleId !== undefined && e.toScheduleId !== undefined;
+    case 'putback':
+      return !!e.restore;
+    case 'create':
+      return e.scheduleId !== undefined && e.scheduleId !== null;
+    case 'batchCreate':
+      return Array.isArray(e.scheduleIds);
+    default:
+      return false;
+  }
+}
+
+/** 进页面时恢复上次未撤回的记录；失效则直接清掉，不留脏数据 */
+function restoreUndo() {
+  try {
+    const raw = localStorage.getItem(UNDO_STORE_KEY);
+    if (!raw) return;
+    const obj = JSON.parse(raw) as { termId?: string; savedAt?: number; stack?: unknown[] };
+    const fresh = typeof obj.savedAt === 'number' && Date.now() - obj.savedAt < UNDO_MAX_AGE_MS;
+    const sameScope = String(obj.termId ?? '') === currentUndoScope();
+    if (!fresh || !sameScope || !Array.isArray(obj.stack)) {
+      localStorage.removeItem(UNDO_STORE_KEY);
+      return;
+    }
+    const valid = obj.stack.filter(isUndoEntry).slice(-MAX_UNDO);
+    if (!valid.length) {
+      localStorage.removeItem(UNDO_STORE_KEY);
+      return;
+    }
+    historyStack.value = valid;
+    ElMessage.info(`已恢复 ${valid.length} 步未撤回的调整记录（24 小时内有效），撤回按钮可回退`);
+  } catch {
+    localStorage.removeItem(UNDO_STORE_KEY);
+  }
+}
+
 function pushUndo(a: UndoAction) {
   historyStack.value.push(a);
   if (historyStack.value.length > MAX_UNDO) historyStack.value.shift();
+  persistUndo();
 }
 /** 撤回按钮 tooltip：显示将被撤回的那步是什么 */
 const undoLabel = computed(() => historyStack.value[historyStack.value.length - 1]?.label ?? '');
@@ -1472,6 +1592,7 @@ async function undoLast() {
     return; // 视图未变，不用回读；记录留在栈里可重试
   }
   historyStack.value.pop();
+  persistUndo();
   if (r.state === 'partial') ElMessage.warning(`撤回完成 ${r.total - r.failed}/${r.total} 条，失败的条目可稍后重试`);
   else ElMessage.success(`已撤回：${entry.label}`);
   busy.value = false;
@@ -1497,6 +1618,7 @@ async function undoToStep(depth: number) {
     }
     if (r.state === 'partial') partialNote = `批量步里有 ${r.failed}/${r.total} 条没删掉`;
     historyStack.value.pop();
+    persistUndo();
     done++;
   }
   busy.value = false;
@@ -2338,7 +2460,7 @@ async function createBatch(
 const autoVisible = ref(false);
 const autoRunning = ref(false);
 const autoProgress = ref('');
-const autoReport = ref<{ ok: string[]; skip: string[] } | null>(null);
+const autoReport = ref<{ ok: string[]; skip: string[]; noRoom: number } | null>(null);
 /** 本次自动排课统一写入的班级（放回签优先用各自原课次的班级） */
 const autoClass = ref('');
 /**
@@ -2657,14 +2779,20 @@ function slotFreedom(ctx: AutoCtx, entry: PoolEntry) {
  * 返回 null = 其实有空位（调用方不该走到失败分支）。
  */
 function noSlotReason(ctx: AutoCtx, entry: PoolEntry): string | null {
-  if (!entry.teacherId) return '课程未指定授课教师，自动排课要求先定教师';
+  if (!entry.teacherId) {
+    return '课程未指定授课教师，自动排课要求先定教师；可让该课程的授课教师先完成三重认证，或在签上拖拽手动指定';
+  }
   const f = slotFreedom(ctx, entry);
   if (f.common > 0) return null;
   const who = entry.teacherName || String(entry.teacherId);
-  if (f.freeTeacher === 0) return `教师「${who}」本周 25 个格已排满，排不到任何时间`;
+  if (f.freeTeacher === 0) {
+    return `教师「${who}」本周 25 个格已排满，排不到任何时间；可换一位该课程教师，或先把这位老师的部分课次放回待排`;
+  }
   const clz = entryClass(entry).trim();
-  if (clz && f.freeClazz === 0) return `班级「${clz}」本周 25 个格已排满，换教师也排不进`;
-  return `教师还剩 ${f.freeTeacher} 格、班级还剩 ${f.freeClazz} 格，但没有共同的空档（要错开其中一方才有位）`;
+  if (clz && f.freeClazz === 0) {
+    return `班级「${clz}」本周 25 个格已排满，换教师也排不进；可先放回该班级的几节课，或换班级`;
+  }
+  return `教师还剩 ${f.freeTeacher} 格、班级还剩 ${f.freeClazz} 格，但没有共同的空档；把其中一方的一节课挪开就能腾出位置`;
 }
 
 /** 饱和度（Brelaz 1979）：教师×班级当前还剩多少可并存格；缺教师的课返回 ∞ 不参与排序（反正要跳过） */
@@ -2798,7 +2926,8 @@ function runAuto() {
 /** 预览单行文案（与最终报告同口径，用户看到什么就写入什么） */
 function planItemText(item: PlannedItem): string {
   const roomName = item.slot.classroomId ? classroomsAll.value.find(r => r.classroomId === item.slot.classroomId)?.name ?? '' : '';
-  const where = `周${CN[item.slot.weekday - 1]} ${PERIODS.find(p => p.seq === item.slot.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}${item.clazz ? ' · ' + item.clazz : ''}`;
+  // 没教室必须写出来（2026-10-30 F 项）：原来留空等于看不见，而这门课学生根本不知道去哪上
+  const where = `周${CN[item.slot.weekday - 1]} ${PERIODS.find(p => p.seq === item.slot.periodNo)?.label ?? ''} · ${roomName || '无教室'}${item.clazz ? ' · ' + item.clazz : ''}`;
   const n = autoRepeatTimes(item.parity);
   const times = item.parity === 'all' ? `${n} 周` : `${n} 次 · ${PARITY_TEXT[item.parity]}`;
   const moved = item.movedFor ? `（为「${item.movedFor}」让位，改排次优格）` : '';
@@ -2813,6 +2942,8 @@ async function commitAuto() {
   autoReport.value = null;
   const ok: string[] = [];
   const skip: string[] = [];
+  /** 没配到教室的课门数（2026-10-30 F 项）：无合适教室只轻罚放行，但报告里必须写出来 */
+  let noRoom = 0;
   try {
     for (const f of plan.failures) skip.push(`${f.label}：${f.reason}`);
     for (const [i, item] of plan.items.entries()) {
@@ -2832,8 +2963,9 @@ async function commitAuto() {
         }
       );
       const roomName = item.slot.classroomId ? classroomsAll.value.find(r => r.classroomId === item.slot.classroomId)?.name ?? '' : '';
-      const where = `周${CN[item.slot.weekday - 1]} ${PERIODS.find(p => p.seq === item.slot.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}${item.clazz ? ' · ' + item.clazz : ''}`;
+      const where = `周${CN[item.slot.weekday - 1]} ${PERIODS.find(p => p.seq === item.slot.periodNo)?.label ?? ''} · ${roomName || '无教室'}${item.clazz ? ' · ' + item.clazz : ''}`;
       const movedNote = item.movedFor ? `（为「${item.movedFor}」让位后改排）` : '';
+      if (!item.slot.classroomId) noRoom++;
       if (createdIds.length) {
         ok.push(
           `「${item.entry.courseName}」→ ${where}（${createdIds.length}/${total}${item.parity === 'all' ? ' 周' : ` 次 · ${PARITY_TEXT[item.parity]}`}${failed.length ? `，跳过 ${failed.length} 周` : ''}${item.clazz ? '' : '，未填班级'}）${movedNote}`
@@ -2843,7 +2975,7 @@ async function commitAuto() {
         skip.push(`「${item.entry.courseName}」：预览方案写入失败（${failed[0] ?? '原因未知'}）`);
       }
     }
-    autoReport.value = { ok, skip };
+    autoReport.value = { ok, skip, noRoom };
     autoPlan.value = null;
   } finally {
     autoRunning.value = false;
@@ -3065,6 +3197,8 @@ onMounted(async () => {
   // 没必要让它拖慢课表与下拉的首屏
   void loadPeriods();
   await Promise.all([load(), loadPickers()]);
+  // 撤销栈恢复放在数据加载之后：判定「同一学期」依赖 currentTermId 已就绪（2026-10-30 E 项）
+  restoreUndo();
 });
 
 /** 学期切换（服务端过滤）⇒ 重查本周课次 */
@@ -4080,6 +4214,11 @@ watch(
     <template v-else-if="autoReport">
       <p style="margin-top: 0">
         <b>排课结果：成功 {{ autoReport.ok.length }} 门，跳过 {{ autoReport.skip.length }} 门</b>
+      </p>
+      <!-- F 项（2026-10-30）：无教室只轻罚放行，但必须让业主看见——学生端会显示不出上课地点 -->
+      <p v-if="autoReport.noRoom" class="small" style="margin: 0 0 8px; color: var(--warning, #b45309)">
+        其中 <b>{{ autoReport.noRoom }}</b> 门课<b>没有配到教室</b>（容量够的教室已被占满）：课能排上，
+        但学生不知道去哪上课，建议先腾一间空教室再调整这几门。
       </p>
       <ul v-if="autoReport.ok.length" class="small" style="padding-left: 18px; line-height: 2">
         <li v-for="(t, i) in autoReport.ok" :key="'ok' + i">{{ t }}</li>
