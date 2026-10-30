@@ -2852,6 +2852,139 @@ async function commitAuto() {
   await load(true);
 }
 
+/* ---------- 批量放回待排（2026-10-30）：课程级批量入口 ----------
+ * 缺口：原来只有单节放回（C-22：拖到池子 / 详情弹窗）⇒ 取消整门课要重复 21 次；
+ *   10-29 清空整张课表（417 条）时页面根本没有入口，是走接口脚本删的。
+ * 设计：按课程聚合（该范围内共几节），选中课程一次性软删 —— 与单节放回**同一个端点**，
+ *   所以回池口径、撤销能力、报告文案全部一致，不引入第二套删除语义。
+ * 并发：后端没有批量删端点，仍逐条 DELETE；沿用 createBatch 实测结论（6 路稳定，12 路打满连接池）。 */
+interface ReturnGroup {
+  courseId: string;
+  courseName: string;
+  teacherName: string;
+  count: number;
+}
+const returnVisible = ref(false);
+const returnLoading = ref(false);
+const returnRunning = ref(false);
+const returnProgress = ref('');
+/** 放回范围：整学期（选中学期起止）/ 本周（当前浏览周） */
+const returnScope = ref<'term' | 'week'>('term');
+const returnGroups = ref<ReturnGroup[]>([]);
+/** courseId -> 该课程待放回的 scheduleId 列表（聚合时顺手记下，删除时不再二次查询） */
+const returnCellIds = ref<Record<string, Array<string | number>>>({});
+const returnPicked = ref<string[]>([]);
+
+/** 放回范围对应的日期区间：整学期取选中学期（没有则取当前学期），缺日期时回落本周 */
+function returnRange() {
+  if (returnScope.value === 'week') return { startDate: weekStartStr.value, endDate: weekEndStr.value };
+  const term = terms.value.find(t => String(t.termId) === String(filters.termId || currentTermId.value));
+  const s = parseDateOnly(term?.startDate);
+  const e = parseDateOnly(term?.endDate);
+  return s && e ? { startDate: fmt(s), endDate: fmt(e) } : { startDate: weekStartStr.value, endDate: weekEndStr.value };
+}
+
+async function loadReturnGroups() {
+  returnLoading.value = true;
+  returnProgress.value = '';
+  try {
+    const range = returnRange();
+    const res = await listSchedules({
+      ...range,
+      termId: filters.termId || undefined,
+      schoolId: filters.schoolId || undefined,
+      page: 1,
+      pageSize: 1000,
+      includeDeleted: false
+    });
+    const rows = (res?.list ?? []).filter(c => !c.deleted);
+    const ids: Record<string, Array<string | number>> = {};
+    const groups = new Map<string, ReturnGroup>();
+    for (const c of rows) {
+      const k = String(c.courseId);
+      (ids[k] ??= []).push(c.scheduleId);
+      const g = groups.get(k);
+      if (g) g.count++;
+      else groups.set(k, { courseId: k, courseName: c.courseName ?? '—', teacherName: c.teacherName ?? '', count: 1 });
+    }
+    returnCellIds.value = ids;
+    returnGroups.value = [...groups.values()].sort((a, b) => b.count - a.count || a.courseName.localeCompare(b.courseName));
+    // 默认全选：这个入口最常见的用法就是「整张课表退回待排」（10-29 业主的原话）
+    returnPicked.value = returnGroups.value.map(g => g.courseId);
+  } catch {
+    ElMessage.error('拉取课次失败，请稍后重试');
+    returnGroups.value = [];
+    returnCellIds.value = {};
+    returnPicked.value = [];
+  } finally {
+    returnLoading.value = false;
+  }
+}
+
+async function openReturn() {
+  returnPicked.value = [];
+  returnGroups.value = [];
+  returnCellIds.value = {};
+  returnVisible.value = true;
+  await loadReturnGroups();
+}
+
+/** 切范围：重新聚合（旧的选择作废，避免「整学期选的课」被带到「本周」范围上） */
+async function switchReturnScope(scope: 'term' | 'week') {
+  if (returnRunning.value || returnScope.value === scope) return;
+  returnScope.value = scope;
+  await loadReturnGroups();
+}
+
+/** 已选课程合计要放回的条数（页脚与按钮文案都读它，保证「点之前就知道删多少」） */
+const returnPickCount = computed(() =>
+  returnPicked.value.reduce((n, cid) => n + (returnCellIds.value[cid]?.length ?? 0), 0)
+);
+
+/** 执行放回：两道确认 → 6 路并发软删 → 回读刷新（失败条目如实计入，不假装成功） */
+async function runReturn() {
+  if (returnRunning.value) return;
+  const ids = returnPicked.value.flatMap(cid => returnCellIds.value[cid] ?? []);
+  if (!ids.length) return;
+  try {
+    await ElMessageBox.confirm(
+      `将把选中的 ${returnPicked.value.length} 门课、共 ${ids.length} 条课次放回待排池（软删，之后可重新排课）。确定放回？`,
+      '批量放回待排',
+      { type: 'warning', confirmButtonText: '确认放回', cancelButtonText: '取消' }
+    );
+  } catch {
+    return; // 用户取消
+  }
+  returnRunning.value = true;
+  let cursor = 0;
+  let done = 0;
+  let failed = 0;
+  const CONCURRENCY = 6;
+  const worker = async () => {
+    while (cursor < ids.length) {
+      const i = cursor++;
+      try {
+        const r = await deleteSchedule(ids[i]);
+        if (r && r.removed === false) failed++;
+      } catch {
+        failed++;
+      }
+      done++;
+      returnProgress.value = `已放回 ${done}/${ids.length}${failed ? `（失败 ${failed}）` : ''}`;
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, ids.length) }, worker));
+  } finally {
+    returnRunning.value = false;
+  }
+  if (failed) ElMessage.warning(`已放回 ${done - failed} 条，${failed} 条失败（可重试）`);
+  else ElMessage.success(`已放回 ${done} 条课次`);
+  returnVisible.value = false;
+  returnProgress.value = '';
+  await load(true);
+}
+
 /* ---------- 发布课表（C-24）：draft→published，整学期口径 ----------
  * ★ 新建课次 = 未发布（学生/教师端不可见，卡片带「未发布」灰标）；
  *   点发布后其他端才可见。已发布课次再改动保持已发布（2026-10-19 拍板）。 */
@@ -3436,9 +3569,73 @@ watch(
       <span class="row small"><i class="legend-dot drop"></i>可放置（拖动中）</span>
       <span class="small muted">拖动调课：拖到空格即移动 · 拖到已有课可并入或互换（同一教师只能互换）</span>
       <span class="spacer" style="flex: 1"></span>
+      <button
+        class="btn btn-outline"
+        :disabled="!allCells.length"
+        title="按课程把课次批量退回待排池（可选整学期 / 本周），与单节放回同一个软删端点"
+        @click="openReturn"
+      >
+        <ZkIcon name="undo-2" :size="13" style="margin-right: 4px" />批量放回
+      </button>
       <button class="btn btn-primary" @click="onPublish">发布课表</button>
     </div>
   </div>
+
+  <!-- 批量放回待排（2026-10-30）：按课程聚合的批量入口，补「取消整门课要拖 21 次」的缺口 -->
+  <el-dialog v-model="returnVisible" title="批量放回待排" width="560px" :close-on-click-modal="!returnRunning">
+    <p class="small" style="margin-top: 0">
+      把选中课程的课次退回待排池（<b>软删</b>，之后可用自动排课或拖拽重新排）。只影响所选范围内的课次。
+    </p>
+    <div class="detail-row">
+      <span class="detail-k">范围</span>
+      <div class="row" style="flex: 1; min-width: 0; gap: 6px; align-items: center">
+        <button
+          type="button"
+          class="btn btn-sm"
+          :class="returnScope === 'term' ? 'btn-primary' : 'btn-outline'"
+          :disabled="returnRunning"
+          @click="switchReturnScope('term')"
+        >整学期</button>
+        <button
+          type="button"
+          class="btn btn-sm"
+          :class="returnScope === 'week' ? 'btn-primary' : 'btn-outline'"
+          :disabled="returnRunning"
+          @click="switchReturnScope('week')"
+        >本周</button>
+        <span class="small muted" style="margin-left: 6px">
+          {{ returnRange().startDate }} ~ {{ returnRange().endDate }}
+        </span>
+      </div>
+    </div>
+    <div v-loading="returnLoading" style="max-height: 320px; overflow: auto; margin-top: 6px">
+      <div v-if="!returnGroups.length && !returnLoading" class="small muted">该范围内没有可放回的课次</div>
+      <label
+        v-for="g in returnGroups"
+        :key="g.courseId"
+        class="row"
+        style="gap: 8px; padding: 5px 0; align-items: center; cursor: pointer"
+      >
+        <input v-model="returnPicked" type="checkbox" :value="g.courseId" :disabled="returnRunning" />
+        <span class="small">
+          <b>{{ g.courseName }}</b>
+          <span class="muted">{{ g.teacherName || '未指定教师' }} · {{ g.count }} 节</span>
+        </span>
+      </label>
+    </div>
+    <p v-if="returnProgress" class="small" style="margin: 10px 0 0">
+      <ZkIcon name="refresh-cw" :size="13" style="margin-right: 4px" />{{ returnProgress }}
+    </p>
+    <template #footer>
+      <span class="small muted" style="float: left; line-height: 32px">
+        已选 {{ returnPicked.length }}/{{ returnGroups.length }} 门，共 {{ returnPickCount }} 条
+      </span>
+      <el-button :disabled="returnRunning" @click="returnVisible = false">取消</el-button>
+      <el-button type="danger" :loading="returnRunning" :disabled="!returnPickCount" @click="runReturn">
+        放回 {{ returnPickCount }} 条
+      </el-button>
+    </template>
+  </el-dialog>
 
   <!-- 课次详情 / 调整（C-19：教室与备注可改，时间坐标原样回传，不改上课时间） -->
   <el-dialog v-model="detailVisible" :title="`调整课次 · ${detailCell?.courseName ?? ''}`" width="460px">
