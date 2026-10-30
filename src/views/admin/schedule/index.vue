@@ -152,11 +152,12 @@ function clearFilters() {
   // 学期清空会经 watcher 再 load 一次；非空时这次 load 就是把服务端过滤撤掉的那一次
   void load();
 }
+// termId/schoolId 用 string：基础数据主键 10-28 起后端字符串化（@JsonFormat STRING），19 位雪花 id 用 number 会截断
 /** 学期下拉（后端 ScheduleQueryBo 支持 termId 过滤 ⇒ 服务端筛，变化即重查）；
  *  startDate/endDate 用于「学期第 N 周」标注（2026-10-21） */
-const terms = ref<{ termId: number; name: string; startDate?: string; endDate?: string }[]>([]);
+const terms = ref<{ termId: string; name: string; startDate?: string; endDate?: string }[]>([]);
 /** 学校列表（基础数据 school 表，学校级）：≥2 个才显示学校筛选，单校无筛选意义 */
-const schools = ref<{ schoolId: number; name: string }[]>([]);
+const schools = ref<{ schoolId: string; name: string }[]>([]);
 /** 班级名 → 专业名 映射（schedule.target_class 是冗余字符串、无 clazzId 外键，
  *  专业信息只能借基础数据的班级列表接口按名称映射） */
 const clazzMajorMap = ref<Record<string, string>>({});
@@ -1885,7 +1886,7 @@ async function loadPickers() {
       terms.value = (res?.list ?? [])
         .filter(t => t.termId !== undefined)
         .map(t => ({
-          termId: t.termId as number,
+          termId: t.termId as string,
           name: t.name || String(t.termId),
           startDate: t.startDate,
           endDate: t.endDate
@@ -1905,7 +1906,7 @@ async function loadPickers() {
       const res = await listSchools({ page: 1, pageSize: 50 });
       schools.value = (res?.list ?? [])
         .filter(s => s.schoolId !== undefined)
-        .map(s => ({ schoolId: s.schoolId as number, name: s.name || String(s.schoolId) }));
+        .map(s => ({ schoolId: s.schoolId as string, name: s.name || String(s.schoolId) }));
     } catch {
       /* 已在请求层提示 */
     }
@@ -2373,7 +2374,7 @@ const poolParitySummary = computed(() => {
     : '当前学期未配开始日期，隔周以当前浏览周为锚，开始前请先翻到学期第 1 周';
   return `单周 ${odd} 门 · 双周 ${even} 门——${anchorNote}`;
 });
-type AutoSlot = { weekday: number; periodNo: number; classroomId?: number; capacity?: number };
+type AutoSlot = { weekday: number; periodNo: number; classroomId?: string; capacity?: number };
 const AUTO_W = {
   /** 主目标：同一班级同一天已有几节课（每多一节 +100，等于把班级摊到不同天） */
   sameClassDay: 100,

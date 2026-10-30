@@ -68,8 +68,14 @@ export interface BasicDataQuery {
   parentId?: number;
 }
 
+/*
+ * ⚠️ 基础数据五域的主键/外键一律 string（对齐后端 @JsonFormat(shape=STRING)，10-28 eb3400b 入库）。
+ * 后端是 19 位雪花 id，写 number 会在 JSON.parse 阶段就被截断（Number.MAX_SAFE_INTEGER = 2^53-1），
+ * 之后无论怎么修都救不回来——所以契约层面必须是 string，而不是「用时再 String()」。
+ * 现役 10-26 运行包还没有这个注解（返回裸数字），页面层用 isSafeInteger 探测做旧包降级。
+ */
 export interface School {
-  schoolId?: number;
+  schoolId?: string;
   name?: string;
   code?: string;
   domain?: string;
@@ -79,8 +85,8 @@ export interface School {
 }
 
 export interface Major {
-  majorId?: number;
-  deptId?: number;
+  majorId?: string;
+  deptId?: string;
   name?: string;
   majorCode?: string;
   sortNo?: number;
@@ -89,10 +95,10 @@ export interface Major {
 }
 
 export interface Clazz {
-  clazzId?: number;
-  schoolId?: number;
-  deptId?: number;
-  majorId?: number;
+  clazzId?: string;
+  schoolId?: string;
+  deptId?: string;
+  majorId?: string;
   majorName?: string;
   clazzName?: string;
   clazzCode?: string;
@@ -104,8 +110,8 @@ export interface Clazz {
 }
 
 export interface Term {
-  termId?: number;
-  schoolId?: number;
+  termId?: string;
+  schoolId?: string;
   name?: string;
   code?: string;
   startDate?: string;
@@ -117,8 +123,8 @@ export interface Term {
 
 /** classroom 表（C-21 教室 4 件套，2026-10-15） */
 export interface Classroom {
-  classroomId?: number;
-  schoolId?: number;
+  classroomId?: string;
+  schoolId?: string;
   name?: string;
   code?: string;
   /** physical 物理教室 / virtual 虚拟教室（线上直播间） */

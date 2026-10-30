@@ -123,11 +123,35 @@ function onSearch() {
   fetchList();
 }
 
+/** 重置 = 清关键词 + 回第一页（保留当前 tab，与课程总览页的「重置」口径一致） */
+function resetQuery() {
+  query.keyword = '';
+  query.page = 1;
+  fetchList();
+}
+
 onMounted(fetchList);
 
 /* ---------------- 增删改（只对有接口的 tab 开放） ---------------- */
 const CRUD_TABS: TabKey[] = ['school', 'major', 'clazz', 'term', 'room'];
 const canCrud = computed(() => CRUD_TABS.includes(active.value));
+
+/** 各 CRUD tab 的主键字段名（删除/编辑都要用，收口一处避免五处各写一份） */
+const CRUD_ID_KEYS: Record<string, string> = { school: 'schoolId', major: 'majorId', clazz: 'clazzId', term: 'termId', room: 'classroomId' };
+
+/**
+ * 旧包探测（能力检测，判据用 typeof 而不是值比较）：
+ * 10-28 eb3400b 后端才把基础数据主键 @JsonFormat(STRING) 字符串化；现役 10-26 运行包
+ * 返回的是**裸 19 位数字**，JSON.parse 阶段就已经截断（> Number.MAX_SAFE_INTEGER）。
+ * 表现特征：id 字段是 number 且 !Number.isSafeInteger —— 旧包+小自增 id（安全整数）不误报，
+ * 新包（string）也不误报。命中时编辑/删除会定位到错误 id，必须停用并提示换包。
+ */
+const idsCorrupted = computed(() =>
+  rows.value.some(r => {
+    const v = r[CRUD_ID_KEYS[active.value]];
+    return typeof v === 'number' && !Number.isSafeInteger(v);
+  })
+);
 
 const formVisible = ref(false);
 const formMode = ref<'create' | 'edit'>('create');
@@ -220,8 +244,18 @@ async function submitForm() {
 }
 
 async function doDelete(row: Record<string, unknown>) {
-  const idKey: Record<string, string> = { school: 'schoolId', major: 'majorId', clazz: 'clazzId', term: 'termId', room: 'classroomId' };
-  const id = Number(row[idKey[active.value]]);
+  // 主键保持后端原样（string）：历史版本在这里 Number(row.id) 强转，
+  // 19 位雪花 id 截断后拼进 URL，删除打到不存在的记录上——这是编号 68 之外本页真正的 P1。
+  // 旧包返回的小自增 id（安全整数）仍放行，只有真被截断的才拦下。
+  const rawId = row[CRUD_ID_KEYS[active.value]];
+  const id =
+    typeof rawId === 'string' && rawId ? rawId
+    : typeof rawId === 'number' && Number.isSafeInteger(rawId) ? String(rawId)
+    : null;
+  if (!id) {
+    ElMessage.warning('该行缺少有效主键，无法删除' + (idsCorrupted.value ? '（运行包过旧，需换包）' : ''));
+    return;
+  }
   const name = String(row.name ?? row.clazzName ?? row.code ?? id);
   await ElMessageBox.confirm(`确定要删除「${name}」吗？`, '删除', { type: 'warning', confirmButtonText: '删除' });
   if (active.value === 'school') await deleteSchool(id);
@@ -326,7 +360,13 @@ const columns = computed<Col[]>(() => {
     <div class="right" v-if="!isGap">
       <el-input v-model="query.keyword" placeholder="关键词" clearable style="width: 180px" @keyup.enter="onSearch" @clear="onSearch" />
       <el-button text @click="onSearch">查询</el-button>
+      <el-button text @click="resetQuery">重置</el-button>
     </div>
+  </div>
+
+  <!-- 旧运行包警示：主键被 JSON.parse 截断，写路径不可用（能力检测，换包后自动消失） -->
+  <div v-if="idsCorrupted" class="ids-warn">
+    <strong>编辑 / 删除暂不可用：</strong>当前运行包（10-26）返回的 19 位主键已被截断，直接操作会定位到错误记录。需发布线换新包（10-28 之后的构建）后自动恢复，列表查看不受影响。
   </div>
 
   <!-- 缺口 tab -->
@@ -351,8 +391,8 @@ const columns = computed<Col[]>(() => {
       </el-table-column>
       <el-table-column v-if="canCrud" label="操作" width="150" align="right">
         <template #default="{ row }">
-          <el-button text size="small" @click="openEdit(row)">编辑</el-button>
-          <el-button text size="small" style="color: var(--error)" @click="doDelete(row)">删除</el-button>
+          <el-button text size="small" :disabled="idsCorrupted" @click="openEdit(row)">编辑</el-button>
+          <el-button text size="small" style="color: var(--error)" :disabled="idsCorrupted" @click="doDelete(row)">删除</el-button>
         </template>
       </el-table-column>
       <template #empty>
@@ -401,3 +441,42 @@ const columns = computed<Col[]>(() => {
     </template>
   </el-dialog>
 </template>
+
+<style scoped>
+/* 编号 68：EP 分页器「当前页」实测是两层规则叠加——
+   ① background-color: var(--el-color-primary)（桥接 = --brand-600 #0d9488）
+   ② color: var(--el-pagination-hover-color)（默认又指回 --el-color-primary）
+   ⇒ brand-600 字压 brand-600 底，纯函数对比 1.0（台账里记的 3.74 是按白底口径算的另一处）。
+   确定性覆盖：--brand-700 底 + 白字 = 5.48:1（编号 42 对同一组色复算过 5.47），过 AA。
+   只覆盖本页；analytics / courses / logs 同根因，全局修属共享样式批次，另行派单。 */
+:deep(.el-pagination .el-pager li.is-active) {
+  background-color: var(--brand-700);
+  color: #fff;
+}
+
+/* 「查询/重置」两个文字按钮：EP 默认 .el-button+.el-button{margin-left:12px} 叠加 .right 的 gap:10px
+   会变成 22px（课程总览页修过的同一处坑），归零交给 gap 管 */
+.toolbar .right :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+
+/* 8 个 tab pill + 搜索框一行放不下（1024/1080 视口实测溢出），允许换行；
+   pill 胶囊组自身也可换行，避免在窄视口被压出容器 */
+.toolbar {
+  flex-wrap: wrap;
+}
+.toolbar .pilltabs {
+  flex-wrap: wrap;
+}
+
+/* 旧包警示条：与缺口 tab 的呈现同级，用 warning 文字专用深阶保证 AA */
+.ids-warn {
+  border: 1px solid var(--warning);
+  background: var(--warning-soft);
+  color: var(--warning-strong);
+  border-radius: var(--r-lg);
+  padding: 10px 16px;
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+</style>
