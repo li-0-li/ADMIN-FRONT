@@ -439,6 +439,85 @@ interface HealthCard {
   sub: string;
 }
 
+/* ---------------- 核心指标 4 卡（随包能力切换） ----------------
+ * 「四面板法则」（RED + Saturation，监控仪表盘方法论共识）：首屏 4 卡应是 4 个真数据面板，
+ * 占位卡挤在黄金区会稀释「有没有事」的判读效率。但**旧包**下磁盘/连接池没有数据，
+ * 换成真卡就全变「—」，比占位卡更糟 ⇒ 双形态：
+ *   旧包：原型 4 卡原样（当前上课课堂 / CPU / 内存 / 今日异常）
+ *   新包：磁盘、连接池顶替两张无数据源的占位卡（业主 10-30 拍板）
+ * 被顶掉的两条信息没有丢：课堂数据指向「课堂巡查」页（下方空态卡有说明），
+ * 异常情况由综合判定条 + ERROR 日志块承接（比一张恒为「—」的卡有用）。
+ */
+
+interface StatCard {
+  key: string;
+  label: string;
+  num: string;
+  muted: boolean;
+  trend: string;
+  badge?: string;
+}
+
+const statCards = computed<StatCard[]>(() => {
+  const cpu = num(status.value?.cpu);
+  const cards: StatCard[] = [
+    {
+      key: 'cpu',
+      label: 'CPU 负载',
+      num: cpu == null ? '—' : `${cpu}%`,
+      muted: cpu == null,
+      trend:
+        cpu != null
+          ? `${coreCount.value == null ? '' : `${coreCount.value} 核 · `}全机口径，与上次轮询做差`
+          : hasNewFields.value
+            ? '首次采样中…（5 秒后出值）'
+            : '后端未提供 CPU 指标'
+    },
+    {
+      key: 'mem',
+      label: '内存占用',
+      num: memPct.value == null ? '—' : `${memPct.value}%`,
+      muted: memPct.value == null,
+      trend: memPct.value == null ? 'JVM 数据缺失' : `${memText.value} · JVM 堆`
+    }
+  ];
+  if (hasNewFields.value) {
+    const dt = num(status.value?.disk?.totalMB);
+    const df = num(status.value?.disk?.freeMB);
+    const pct = dt != null && df != null && dt > 0 ? Math.round(((dt - df) / dt) * 100) : null;
+    cards.push({
+      key: 'disk',
+      label: '磁盘',
+      num: pct == null ? '—' : `${pct}%`,
+      muted: pct == null,
+      trend:
+        pct == null
+          ? '磁盘数据缺失'
+          : `已用 ${pct}% · 可用 ${fmtMb(df)} / 共 ${fmtMb(dt)}`
+    });
+    const pa = num(status.value?.pool?.active);
+    const pm = num(status.value?.pool?.max);
+    const pw = num(status.value?.pool?.waitCount);
+    const ppct = pa != null && pm != null && pm > 0 ? Math.round((pa / pm) * 100) : null;
+    cards.push({
+      key: 'pool',
+      label: '数据库连接',
+      num: ppct == null ? '—' : `${ppct}%`,
+      muted: ppct == null,
+      trend:
+        ppct == null
+          ? '无连接池指标'
+          : `${pa} 活跃 / ${pm} 最大${pw != null && pw > 0 ? ` · ⚠ ${pw} 排队` : ''}`
+    });
+  } else {
+    cards.push(
+      { key: 'live', label: '当前上课课堂', num: '—', muted: true, trend: onlineText.value, badge: '无端点' },
+      { key: 'err', label: '今日异常', num: '—', muted: true, trend: '后端未提供异常计数 · 见下方 ERROR 日志块' }
+    );
+  }
+  return cards;
+});
+
 function probeState(p: ProbeInfo | undefined): HealthState {
   if (!p) return 'unknown';
   if (p.status === 'up') return 'ok';
@@ -598,6 +677,7 @@ const trendHint = computed(() => {
             仍无数据源的三项，显示「—」而不是编一个数：<b>网络出口</b>（实训环境无此指标）、
             <b>服务可用率（近 7 天）</b>（需历史采样存储）、<b>当前课堂列表</b>（课堂数据在「课堂巡查」页，
             本页不重复接）。趋势图为<b>前端本地采样</b>（进页起每 5 秒 1 点），不是后端历史序列。
+            首屏 4 卡随包能力切换：旧包保留原型占位卡，新包换成磁盘 / 数据库连接真数据卡（业主 10-30 拍板）。
           </div>
         </div>
       </div>
@@ -627,42 +707,15 @@ const trendHint = computed(() => {
     </div>
 
     <template v-else>
-      <!-- 核心指标 4 卡（.grid.g4 / .card.stat 均来自 theme.css） -->
+      <!-- 核心指标 4 卡：随包能力切换（旧包=原型占位卡，新包=四面板真数据卡），见 statCards 注释 -->
       <div class="grid g4">
-        <div class="card stat">
-          <div class="label">当前上课课堂</div>
-          <div class="num muted-num">—</div>
+        <div v-for="card in statCards" :key="card.key" class="card stat">
+          <div class="label">{{ card.label }}</div>
+          <div class="num" :class="{ 'muted-num': card.muted }">{{ card.num }}</div>
           <div class="trend">
-            <span class="badge badge-neutral">无端点</span>
-            <span>{{ onlineText }}</span>
+            <span v-if="card.badge" class="badge badge-neutral">{{ card.badge }}</span>
+            <span>{{ card.trend }}</span>
           </div>
-        </div>
-        <div class="card stat">
-          <div class="label">CPU 负载</div>
-          <div class="num" :class="{ 'muted-num': num(status?.cpu) == null }">
-            {{ num(status?.cpu) == null ? '—' : `${num(status?.cpu)}%` }}
-          </div>
-          <div class="trend">
-            {{
-              num(status?.cpu) != null
-                ? `${coreCount == null ? '' : `${coreCount} 核 · `}全机口径，与上次轮询做差`
-                : hasNewFields
-                  ? '首次采样中…（5 秒后出值）'
-                  : '后端未提供 CPU 指标'
-            }}
-          </div>
-        </div>
-        <div class="card stat">
-          <div class="label">内存占用</div>
-          <div class="num">{{ memPct == null ? '—' : `${memPct}%` }}</div>
-          <div class="trend">
-            {{ memPct == null ? 'JVM 数据缺失' : `${memText} · JVM 堆` }}
-          </div>
-        </div>
-        <div class="card stat">
-          <div class="label">今日异常</div>
-          <div class="num muted-num">—</div>
-          <div class="trend">后端未提供异常计数</div>
         </div>
       </div>
 
