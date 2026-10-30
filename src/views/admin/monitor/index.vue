@@ -37,8 +37,18 @@ const hasNewFields = computed(() => {
   return 'cpu' in status.value || 'pool' in status.value || 'uptimeMs' in status.value;
 });
 
-/** 异常日志级别筛选。后端无日志端点，筛选结果恒为空，但控件保留原型形态 */
+/**
+ * 日志级别筛选（本地过滤，不发请求）：'ERROR' 只显示 ERROR 行（本区块的主题），
+ * 'ALL' 显示文件尾部的全部行（排查时看上下文用）。旧包下这个控件 disabled 是摆设，
+ * 端点可用后激活为真功能——过滤是纯前端行为，不需要后端参数。
+ */
 const logLevel = ref<'ERROR' | 'ALL'>('ERROR');
+
+/** 按筛选级别过滤后的行。ERROR 行判定复用行高亮的 isErrLine，两处口径永不脱节 */
+const errLinesShown = computed(() => {
+  const lines = errLogs.value?.lines ?? [];
+  return logLevel.value === 'ERROR' ? lines.filter(l => isErrLine(l)) : lines;
+});
 
 /** 自动刷新间隔，与原型「实时 · 5s 刷新」一致 */
 const AUTO_MS = 5000;
@@ -48,6 +58,10 @@ const ERR_MS = 30000;
 let timer: number | undefined;
 /** 防重入：5s 定时器和人手点「立即刷新」会撞车，撞上就复用正在飞的那次请求 */
 let inFlight = false;
+
+/** 距下次自动刷新的秒数（1 秒心跳递减、成功取数即重置）——「实时」要让人看见节奏，不是一句静态文案 */
+const refreshIn = ref(AUTO_MS / 1000);
+let tickTimer: number | undefined;
 
 /* ---- ERROR 日志（新端点 /error-logs，30 秒一拉）---- */
 
@@ -90,6 +104,7 @@ async function fetchStatus(silent = false) {
     failed.value = false;
     failMsg.value = '';
     fetchedAt.value = clock(new Date());
+    refreshIn.value = AUTO_MS / 1000;
     // 每次成功取数都喂一个点给趋势缓冲：cpu 首次为 null 也喂（mem 有值），
     // 图上 CPU 线就从第一次非 null 的点开始画——不编造「回到 0%」
     pushTrendPoint();
@@ -145,6 +160,10 @@ function startAuto() {
     if (document.hidden) return;
     fetchStatus(true);
   }, AUTO_MS);
+  // 1 秒心跳只做倒计时减法，不发请求——倒计时是展示层的事，别和取数节奏耦合
+  tickTimer = window.setInterval(() => {
+    if (refreshIn.value > 0) refreshIn.value -= 1;
+  }, 1000);
   // ERROR 日志用独立的慢定时器：探测过端点不存在（旧包）就不再起，省掉无意义的轮询
   if (errSupported.value !== false) {
     fetchErrorLogs();
@@ -159,6 +178,10 @@ function stopAuto() {
   if (timer !== undefined) {
     window.clearInterval(timer);
     timer = undefined;
+  }
+  if (tickTimer !== undefined) {
+    window.clearInterval(tickTimer);
+    tickTimer = undefined;
   }
   if (errTimer !== undefined) {
     window.clearInterval(errTimer);
@@ -180,13 +203,15 @@ function isErrLine(line: string): boolean {
   return /\b(ERROR)\b/.test(line);
 }
 
-/** 日志块底部统计：按三分态给不同口径，绝不把「没接入」说成「共 0 条」 */
+/** 日志块底部统计：按筛选态给口径——筛选后要同时报「显示/全部」，否则行数对不上会像丢了数据 */
 const errFootText = computed(() => {
-  if (errSupported.value === false) return `ERROR 日志端点未接入（旧包）`;
-  const lines = errLogs.value?.lines?.length ?? 0;
+  if (errSupported.value === false) return 'ERROR 日志端点未接入（旧包）';
+  const total = errLogs.value?.lines?.length ?? 0;
+  const shown = errLinesShown.value.length;
   const size = errLogs.value?.fileSizeKB;
   const sizeText = size == null ? '' : ` · 文件 ${size} KB`;
-  return `共 ${lines} 条 ${logLevel.value} 级别日志（尾部 50 行）${sizeText}`;
+  const scope = logLevel.value === 'ERROR' ? '仅 ERROR' : '全部级别';
+  return `显示 ${shown}/${total} 行（${scope}，尾部 50 行）${sizeText}`;
 });
 
 /* ---------------- 工具 ---------------- */
@@ -364,6 +389,49 @@ const uptimeText = computed<string | null>(() => {
   return `${m} 分钟`;
 });
 
+/* ---------------- 综合判定条（风险前置） ----------------
+ * 行业惯例（运维监控页设计共识）：打开页面先读「有没有事」这一条，而不是扫 8 张卡找红点。
+ * 判据与负载行的进度条颜色同一套阈值（≥80 预警），探针 down 属故障级、阈值越限属预警级，
+ * 两级分开展示——把「Redis 挂了」和「CPU 偏高」混成一档会误导处置优先级。
+ */
+
+interface Verdict {
+  level: 'ok' | 'warn' | 'err';
+  text: string;
+  items: string[];
+}
+
+const verdict = computed<Verdict>(() => {
+  if (failed.value) {
+    return { level: 'err', text: '状态接口读取失败', items: [failMsg.value || '网络或服务异常'] };
+  }
+  if (!status.value) {
+    return { level: 'ok', text: '正在获取系统状态…', items: [] };
+  }
+  const errs: string[] = [];
+  const warns: string[] = [];
+  if (status.value.db?.status === 'down') errs.push('MySQL 不可达');
+  if (status.value.redis?.status === 'down') errs.push('Redis 不可达');
+  const cpu = num(status.value.cpu);
+  if (cpu != null && cpu >= 80) warns.push(`CPU ${cpu}%（阈值 80%）`);
+  if (memPct.value != null && memPct.value >= 80) warns.push(`堆内存 ${memPct.value}%（阈值 80%）`);
+  const dt = num(status.value.disk?.totalMB);
+  const df = num(status.value.disk?.freeMB);
+  if (dt != null && df != null && dt > 0 && (df / dt) * 100 < 10) {
+    warns.push(`磁盘剩余不足 10%（可用 ${fmtMb(df)}）`);
+  }
+  const wc = num(status.value.pool?.waitCount);
+  if (wc != null && wc > 0) warns.push(`连接池 ${wc} 个请求排队等连接`);
+  if (errs.length) return { level: 'err', text: `${errs.length} 项探针异常`, items: errs.concat(warns) };
+  if (warns.length) return { level: 'warn', text: `${warns.length} 项越过预警阈值`, items: warns };
+  const okBits: string[] = [];
+  if (cpu != null) okBits.push(`CPU ${cpu}%`);
+  if (memPct.value != null) okBits.push(`内存 ${memPct.value}%`);
+  const online = num(status.value.onlineUsers);
+  if (online != null && online >= 0) okBits.push(`在线 ${online}`);
+  return { level: 'ok', text: okBits.length ? `各探针正常 · ${okBits.join(' · ')}` : '各探针正常', items: [] };
+});
+
 interface HealthCard {
   key: string;
   name: string;
@@ -454,6 +522,32 @@ const cpuLine = computed(() => toPolyline('cpu'));
 const memLine = computed(() => toPolyline('mem'));
 const trendSampled = computed(() => trendPoints.value.length);
 
+/* ---- 悬停读数：鼠标贴哪个采样点，就亮那条竖线并出数值框 ---- */
+
+const hoverIdx = ref(-1);
+
+/** 鼠标 → viewBox 坐标 → 缓冲区索引。viewBox 480 宽 ≠ 渲染宽度，必须按 rect 比例换算 */
+function onTrendMove(e: MouseEvent) {
+  const svg = e.currentTarget as SVGSVGElement;
+  const rect = svg.getBoundingClientRect();
+  if (!rect.width) return;
+  const svgX = ((e.clientX - rect.left) / rect.width) * 480;
+  const offset = TREND_MAX - trendPoints.value.length;
+  const idx = Math.round(((svgX - TREND_LEFT) / (TREND_RIGHT - TREND_LEFT)) * (TREND_MAX - 1)) - offset;
+  hoverIdx.value = idx >= 0 && idx < trendPoints.value.length ? idx : -1;
+}
+
+const hoverPoint = computed<TrendPoint | null>(() =>
+  hoverIdx.value >= 0 ? trendPoints.value[hoverIdx.value] ?? null : null
+);
+
+/** 悬停点的 x 坐标（与折线同一套右对齐映射，竖线必须正好穿过点） */
+const hoverX = computed(() => {
+  if (hoverIdx.value < 0) return TREND_LEFT;
+  const offset = TREND_MAX - trendPoints.value.length;
+  return TREND_LEFT + ((offset + hoverIdx.value) / (TREND_MAX - 1)) * (TREND_RIGHT - TREND_LEFT);
+});
+
 /** 空轴说明：有采样了就报「采到几个点」，别再让人以为整页挂了 */
 const trendHint = computed(() => {
   if (trendSampled.value === 0) return '暂无采样数据';
@@ -467,12 +561,23 @@ const trendHint = computed(() => {
     <div class="page-head">
       <h1>系统状态监控</h1>
       <div class="actions">
-        <span class="badge badge-success">
-          <ZkIcon name="activity" :size="11" style="margin-right: 4px" />实时 · 5s 刷新
+        <span class="badge badge-success" title="自动刷新间隔 5 秒，后台标签页时暂停">
+          <ZkIcon name="activity" :size="11" style="margin-right: 4px" />实时 · {{ refreshIn }}s 后刷新
         </span>
         <el-button @click="manualRefresh">
           <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />立即刷新
         </el-button>
+      </div>
+    </div>
+
+    <!-- 综合判定条（风险前置）：打开页面先读这一条，不用扫全页找红点 -->
+    <div class="card card-pad verdict mt16" :class="`verdict-${verdict.level}`">
+      <div class="row gap-10">
+        <span class="verdict-dot"></span>
+        <div>
+          <b class="small">{{ verdict.text }}</b>
+          <div v-if="verdict.items.length" class="small muted mt4">{{ verdict.items.join('；') }}</div>
+        </div>
       </div>
     </div>
 
@@ -589,7 +694,14 @@ const trendHint = computed(() => {
             进页起算，最多 30 点 ≈ 150 秒）。点数 <2 时画不出线，回落空轴 + 说明
             （空白看着像页面挂了）。
           -->
-          <svg viewBox="0 0 480 170" class="trend-svg" role="img" :aria-label="trendHint">
+          <svg
+            viewBox="0 0 480 170"
+            class="trend-svg"
+            role="img"
+            :aria-label="trendHint"
+            @mousemove="onTrendMove"
+            @mouseleave="hoverIdx = -1"
+          >
             <line x1="36" y1="10" x2="36" y2="130" stroke="#e3eaec" />
             <line x1="36" y1="130" x2="470" y2="130" stroke="#e3eaec" />
             <g stroke="#f1f5f6">
@@ -611,6 +723,19 @@ const trendHint = computed(() => {
             <!-- 最新点永远贴右缘（toPolyline 右对齐），线随采样从右向左生长 -->
             <polyline v-if="cpuLine" :points="cpuLine" class="trend-line-cpu" fill="none" />
             <polyline v-if="memLine" :points="memLine" class="trend-line-mem" fill="none" />
+            <!-- 悬停读数：竖线穿过采样点，数值框贴点右侧（靠右半区时翻到左侧防出画布） -->
+            <template v-if="hoverPoint">
+              <line :x1="hoverX" y1="10" :x2="hoverX" y2="130" class="tt-guide" />
+              <circle :cx="hoverX" :cy="trendY(hoverPoint.mem)" r="3" class="tt-dot" />
+              <g :transform="`translate(${hoverX > 330 ? hoverX - 128 : hoverX + 10}, 18)`">
+                <rect width="118" height="48" rx="4" class="tt-box" />
+                <text class="tt-t" x="8" y="15">{{ hoverPoint.t }}</text>
+                <text class="tt-v" x="8" y="30">
+                  CPU {{ hoverPoint.cpu == null ? '采样中' : `${hoverPoint.cpu}%` }}
+                </text>
+                <text class="tt-v" x="8" y="42">内存 {{ hoverPoint.mem }}%</text>
+              </g>
+            </template>
             <template v-if="!cpuLine && !memLine">
               <text class="svg-empty" x="253" y="74" text-anchor="middle">{{ trendHint }}</text>
               <text class="svg-empty-sub" x="253" y="92" text-anchor="middle">
@@ -674,9 +799,9 @@ const trendHint = computed(() => {
         <div class="card-pad between head-tight">
           <div class="card-title">异常日志查看（ERROR 级别）</div>
           <span class="row gap-8">
-            <el-select v-model="logLevel" size="small" style="width: 140px" disabled>
-              <el-option label="ERROR" value="ERROR" />
-              <el-option label="ERROR + WARN" value="ALL" />
+            <el-select v-model="logLevel" size="small" style="width: 150px">
+              <el-option label="只看 ERROR" value="ERROR" />
+              <el-option label="全部级别" value="ALL" />
             </el-select>
             <el-button size="small" @click="manualRefresh">
               <ZkIcon name="refresh-cw" :size="13" style="margin-right: 4px" />刷新
@@ -703,19 +828,23 @@ const trendHint = computed(() => {
               — 端点可达但读日志失败：{{ errLogs.error }}
             </div>
           </div>
-          <!-- 正常态：逐行渲染 sys-error.log 尾部（时间正序，最新在最底部） -->
-          <div v-else-if="errLogs?.lines?.length" class="err-log">
-            <div v-for="(line, i) in errLogs.lines" :key="i" :class="{ 'err-line-hot': isErrLine(line) }">
+          <!-- 正常态：逐行渲染（默认只看 ERROR，可切「全部级别」看上下文） -->
+          <div v-else-if="errLinesShown.length" class="err-log">
+            <div v-for="(line, i) in errLinesShown" :key="i" :class="{ 'err-line-hot': isErrLine(line) }">
               {{ line }}
             </div>
           </div>
-          <!-- 端点存在但没有 ERROR 行：这是好事，明说而不是留白 -->
+          <!-- 端点存在但当前筛选下没有行：说清是「筛后为空」还是「文件里本来就没有」，不留歧义 -->
           <div v-else class="err-log">
             <div>
               <span class="ts">{{ clock(new Date()) }}</span>
               <span class="lv lv-ok">[OK]</span>
               <b>monitor</b>
-              — {{ errSupported === null ? '正在探测 ERROR 日志端点…' : '日志文件中暂无 ERROR 行（近 256KB 内）' }}
+              — {{ errSupported === null
+                ? '正在探测 ERROR 日志端点…'
+                : logLevel === 'ERROR'
+                  ? `尾部 ${errLogs?.lines?.length ?? 0} 行中没有 ERROR 行（可切「全部级别」查看）`
+                  : '日志文件近 256KB 内没有内容' }}
             </div>
           </div>
           <div class="small muted mt8">
@@ -890,6 +1019,57 @@ const trendHint = computed(() => {
   stroke-width: 1.6;
   stroke-linejoin: round;
   stroke-linecap: round;
+}
+
+/* ---- 综合判定条：左竖条 + 圆点用同一色，绿/黄/红三档 ---- */
+.verdict {
+  border-left: 3px solid var(--success);
+}
+.verdict-warn {
+  border-left-color: var(--warning);
+}
+.verdict-err {
+  border-left-color: var(--error);
+}
+.verdict-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--success);
+  box-shadow: 0 0 0 3px var(--success-soft);
+}
+.verdict-warn .verdict-dot {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px var(--warning-soft);
+}
+.verdict-err .verdict-dot {
+  background: var(--error);
+  box-shadow: 0 0 0 3px var(--error-soft);
+}
+
+/* ---- 趋势图悬停读数 ---- */
+.tt-guide {
+  stroke: var(--ink-300);
+  stroke-dasharray: 3 3;
+}
+.tt-dot {
+  fill: var(--brand-600);
+  stroke: #fff;
+  stroke-width: 1.5;
+}
+.tt-box {
+  fill: var(--ink-900);
+  fill-opacity: 0.92;
+}
+.tt-t {
+  font-size: 10px;
+  fill: #94a3b8;
+}
+.tt-v {
+  font-size: 11px;
+  fill: #e2e8f0;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---- 服务健康度卡（原型 .svc）---- */
