@@ -2180,10 +2180,21 @@ const repeatHint = computed(() => {
  *  ★ 隔周锚定学期起点（2026-10-29）：单周=学期第 1、3、5…周、双周=第 2、4、6…周，
  *    从学期中间哪一周排都不错位，且补全整学期（含已过去的周，业主拍板）；
  *    学期没配起点才回退锚定当前浏览周。学期锚定时不出学期结束日。 */
-function repeatDates(weekday: number, rp: { mode: RepeatMode; times: number } = repeatForm): string[] {
+function repeatDates(
+  weekday: number,
+  rp: { mode: RepeatMode; times: number } = repeatForm,
+  /**
+   * 自动排课传 true：**无视 mode 一律从学期起点铺到学期末**（2026-10-30 修）。
+   * 为什么必须这样：原实现只有隔周（odd/even）才锚定学期，每周（all）是从
+   *   `weekStart.value`（当前浏览的那一周）起算 ⇒ 实测 10-30 的库：学期 2026-08-24~2027-01-15，
+   *   课次却分布成「8~9 月 0 条、10 月 29、11 月 118、12 月 128、次年 1~2 月 230」——
+   *   既漏掉学期前 9 周，又排到学期结束日之后 6 周。自动排课语义就是「给整学期排课」，必须锚学期。
+   */
+  anchorToTerm = false
+): string[] {
   const anchor = termAnchorMonday.value;
   const semEnd = parseDateOnly(currentTermInfo.value?.endDate);
-  const semesterAnchored = !!anchor && (rp.mode === 'odd' || rp.mode === 'even');
+  const semesterAnchored = !!anchor && (anchorToTerm || rp.mode === 'odd' || rp.mode === 'even');
   const base = new Date(semesterAnchored ? anchor! : weekStart.value);
   base.setDate(base.getDate() + (weekday - 1) + (rp.mode === 'even' ? 7 : 0));
   const step = rp.mode === 'odd' || rp.mode === 'even' ? 14 : 7;
@@ -2220,8 +2231,10 @@ async function createBatch(
   opts?: {
     slots?: Array<{ weekday: number; periodNo: number }>;
     capTotal?: number;
-    /** 重复口径覆盖：自动排课传固定「每周 × AUTO_WEEKS」，不跟随弹窗残留的单双周选择（2026-10-29） */
+    /** 重复口径覆盖：自动排课传「每周/隔周 × 学期真实周数」，不跟随弹窗残留的单双周选择（2026-10-29） */
     repeat?: { mode: RepeatMode; times: number };
+    /** 铺日期时锚定学期起点（自动排课必传）：见 repeatDates 第三参说明（2026-10-30） */
+    anchorToTerm?: boolean;
   },
   onProgress?: (done: number, total: number) => void
 ) {
@@ -2229,7 +2242,7 @@ async function createBatch(
   type Plan = { date: string; weekday: number; periodNo: number };
   const plans: Plan[] = [];
   for (const s of slots) {
-    for (const d of repeatDates(s.weekday, opts?.repeat)) plans.push({ date: d, weekday: s.weekday, periodNo: s.periodNo });
+    for (const d of repeatDates(s.weekday, opts?.repeat, opts?.anchorToTerm)) plans.push({ date: d, weekday: s.weekday, periodNo: s.periodNo });
   }
   plans.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   const cap = opts?.capTotal;
@@ -2377,8 +2390,26 @@ function entryClass(entry: PoolEntry) {
  * 8 门课会全堆进周一 2~5 节 + 周二 1~5 节，看着"排上了但没排开"。
  * 现规则：把 5×5=25 个格子全部过一遍硬约束，再按下面的权重打分取最低分。
  * 权重集中在这里，日后按业务口径调参只动这张表，不动结构。 */
-/** 自动排课固定展开周数（每周 × 18）：与弹窗表单解耦，避免被残留的单双周模式带偏（2026-10-29 修） */
+/**
+ * 自动排课的**兜底**周数：只在学期没配开始/结束日期时使用（2026-10-29 起与弹窗表单解耦）。
+ * ★ 2026-10-30 更正：原来把它当唯一口径（写死 18 周），而学期实际 2026-08-24~2027-01-15 = 21 周，
+ *   于是自动排课每次都少排 3 周、且起点跟着「当前浏览周」跑。真实周数以 termWeekCount 为准，
+ *   本常量退化为「学期没配日期时」的兜底值。
+ */
 const AUTO_WEEKS = 18;
+/** 自动排课要铺的周数 = 学期真实周数（学期起点周一起算，含头尾）；学期没配日期回落 AUTO_WEEKS */
+const termWeekCount = computed(() => {
+  const anchor = termAnchorMonday.value;
+  const end = parseDateOnly(currentTermInfo.value?.endDate);
+  if (!anchor || !end) return AUTO_WEEKS;
+  const days = Math.floor((end.getTime() - anchor.getTime()) / 86400000) + 1;
+  // clamp 1~25 与手动排课 repeatForm.times 的上限一致，避免脏日期把写入量放大到不可控
+  return Math.max(1, Math.min(25, Math.ceil(days / 7)));
+});
+/** 本次自动排课一条课要写的次数：每周=学期周数，隔周=学期内单/双周数 */
+function autoRepeatTimes(parity: PoolParity): number {
+  return parity === 'all' ? termWeekCount.value : Math.ceil(termWeekCount.value / 2);
+}
 /* ---------- 每门课的自动排课口径（2026-10-29）：每周 / 单周 / 双周 ----------
  * 会话级状态，key = PoolEntry.key（lesson-{scheduleId} / course-{courseId}，签刷新后仍在）。
  * 残留键不清理也无副作用（签没了就查不到）；隔周展开次数 = 学期周数的一半。 */
@@ -2600,15 +2631,47 @@ function bestAutoSlot(
   return rng && ties.length > 1 ? ties[Math.floor(rng() * ties.length)] : ties[0];
 }
 
+/** 一条签在给定占用下的自由度：教师还剩几格 / 班级还剩几格 / 两者同时空的格数（诊断与排序共用一套口径） */
+function slotFreedom(ctx: AutoCtx, entry: PoolEntry) {
+  const clz = entryClass(entry).trim();
+  let freeTeacher = 0;
+  let freeClazz = 0;
+  let common = 0;
+  for (const wd of [1, 2, 3, 4, 5]) {
+    for (const pn of [1, 2, 3, 4, 5]) {
+      const t = !entry.teacherId || !ctx.teacherBusy.has(`${wd}-${pn}-${entry.teacherId}`);
+      const c = !clz || !ctx.clazzBusy.has(`${wd}-${pn}-${clz}`);
+      if (t) freeTeacher++;
+      if (c) freeClazz++;
+      if (t && c) common++;
+    }
+  }
+  return { freeTeacher, freeClazz, common };
+}
+
+/**
+ * 排不进的**具体**原因（2026-10-30）。原来失败时统一写「该教师或该班级已被占满」，
+ * 用户看不出到底谁满、还能不能救；实测 10-30 「张老师占满 25 格」时这条笼统文案几乎没信息量。
+ * 三种无解情形分开报：教师满 / 班级满 / 各自有空但无交集。
+ * 教室不参与判定：没有合适教室只按 AUTO_W.noRoom 轻罚，不会让一门课排不进。
+ * 返回 null = 其实有空位（调用方不该走到失败分支）。
+ */
+function noSlotReason(ctx: AutoCtx, entry: PoolEntry): string | null {
+  if (!entry.teacherId) return '课程未指定授课教师，自动排课要求先定教师';
+  const f = slotFreedom(ctx, entry);
+  if (f.common > 0) return null;
+  const who = entry.teacherName || String(entry.teacherId);
+  if (f.freeTeacher === 0) return `教师「${who}」本周 25 个格已排满，排不到任何时间`;
+  const clz = entryClass(entry).trim();
+  if (clz && f.freeClazz === 0) return `班级「${clz}」本周 25 个格已排满，换教师也排不进`;
+  return `教师还剩 ${f.freeTeacher} 格、班级还剩 ${f.freeClazz} 格，但没有共同的空档（要错开其中一方才有位）`;
+}
+
 /** 饱和度（Brelaz 1979）：教师×班级当前还剩多少可并存格；缺教师的课返回 ∞ 不参与排序（反正要跳过） */
 function freeAutoSlots(ctx: AutoCtx, entry: PoolEntry): number {
   if (!entry.teacherId) return Number.POSITIVE_INFINITY;
-  const clz = entryClass(entry).trim();
-  let n = 0;
-  for (const wd of [1, 2, 3, 4, 5])
-    for (const pn of [1, 2, 3, 4, 5])
-      if (!ctx.teacherBusy.has(`${wd}-${pn}-${entry.teacherId}`) && !(clz && ctx.clazzBusy.has(`${wd}-${pn}-${clz}`))) n++;
-  return n;
+  // 与 noSlotReason 共用 slotFreedom 一处口径：排序与诊断必须看到同一组数字
+  return slotFreedom(ctx, entry).common;
 }
 
 /** 构造一个完整方案（纯内存，不写库）：动态饱和度选课 → 打分选格 → 失败时单层腾挪 → 罚分汇总 */
@@ -2676,9 +2739,11 @@ function buildPlanOnce(ctxBase: AutoCtx, roomCandidates: Classroom[], rng: () =>
       items.push({ entry, clazz, parity: parityOf(entry), slot: deal.ePick.slot, score: deal.ePick.score, movedFor: null, ejected: deal.q.entry.courseName });
       penalty += deal.qNew.score - deal.qOldScore + deal.ePick.score;
     } else {
+      // 精确归因（2026-10-30）：走到这里 ctx 已是「全部落位 + 腾挪尝试完」的状态，诊断的就是真实占用
+      const why = noSlotReason(ctx, entry) ?? '周一至周五 1~5 节无可用格（规划期未定位到具体原因）';
       failures.push({
         label: `${label}${clazz ? `（${clazz}）` : ''}`,
-        reason: '周一至周五 1~5 节该教师或该班级已被占满，腾挪回溯后仍无位可排'
+        reason: why
       });
     }
   }
@@ -2687,6 +2752,34 @@ function buildPlanOnce(ctxBase: AutoCtx, roomCandidates: Classroom[], rng: () =>
 }
 
 const autoPlan = ref<AutoPlan | null>(null);
+
+/**
+ * 排课前的可行性预检（2026-10-30）：点「生成排课方案」之前就把「无论如何都排不进」的签指出来。
+ * 用与规划完全相同的占用表（buildAutoCtx）与诊断函数（noSlotReason），所以预检结论与预览必然一致。
+ * 只在弹窗打开时计算——buildAutoCtx 要遍历本周全部课次，页面其余时刻没必要跑。
+ */
+const autoFeasibility = computed(() => {
+  if (!autoVisible.value) return null;
+  const entries = autoEntries.value;
+  if (!entries.length) return null;
+  const ctx = buildAutoCtx();
+  const blocked = entries
+    .map(e => ({ e, reason: noSlotReason(ctx, e) }))
+    .filter((x): x is { e: PoolEntry; reason: string } => !!x.reason);
+  return { total: entries.length, blocked };
+});
+
+/** 本学期自动排课会写入的日期范围（设置视图明示，避免「排了但没覆盖整学期」这种事后才发现的问题） */
+const autoTermRangeLabel = computed(() => {
+  const anchor = termAnchorMonday.value;
+  const end = parseDateOnly(currentTermInfo.value?.endDate);
+  if (!anchor || !end) return `未配置学期起止日期，按兜底 ${AUTO_WEEKS} 周铺`;
+  const fmt = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return `学期第 1~${termWeekCount.value} 周（${fmt(anchor)} ~ ${fmt(end)}）`;
+});
+
+/** 隔周课在本学期实际要写的次数（设置视图明示用；与 autoRepeatTimes('odd'|'even') 同值） */
+const autoOddEvenTimes = computed(() => Math.ceil(termWeekCount.value / 2));
 
 /** 阶段一「生成排课方案」：纯内存规划（毫秒级），产出预览；一条数据都不写（P2） */
 function runAuto() {
@@ -2706,7 +2799,8 @@ function runAuto() {
 function planItemText(item: PlannedItem): string {
   const roomName = item.slot.classroomId ? classroomsAll.value.find(r => r.classroomId === item.slot.classroomId)?.name ?? '' : '';
   const where = `周${CN[item.slot.weekday - 1]} ${PERIODS.find(p => p.seq === item.slot.periodNo)?.label ?? ''}${roomName ? ' · ' + roomName : ''}${item.clazz ? ' · ' + item.clazz : ''}`;
-  const times = item.parity === 'all' ? `${AUTO_WEEKS} 周` : `${Math.ceil(AUTO_WEEKS / 2)} 次 · ${PARITY_TEXT[item.parity]}`;
+  const n = autoRepeatTimes(item.parity);
+  const times = item.parity === 'all' ? `${n} 周` : `${n} 次 · ${PARITY_TEXT[item.parity]}`;
   const moved = item.movedFor ? `（为「${item.movedFor}」让位，改排次优格）` : '';
   return `「${item.entry.courseName}」→ ${where}（${times}${item.clazz ? '' : '，未填班级'}）${moved}`;
 }
@@ -2732,7 +2826,7 @@ async function commitAuto() {
           periodNo: item.slot.periodNo,
           targetClass: item.clazz || undefined
         },
-        { repeat: { mode: item.parity, times: item.parity === 'all' ? AUTO_WEEKS : Math.ceil(AUTO_WEEKS / 2) } },
+        { repeat: { mode: item.parity, times: autoRepeatTimes(item.parity) }, anchorToTerm: true },
         (done, t) => {
           autoProgress.value = `正在写入「${item.entry.courseName}」第 ${done}/${t} 周（第 ${i + 1}/${plan.items.length} 门）`;
         }
@@ -3715,6 +3809,29 @@ watch(
             <el-checkbox v-model="autoIncludeScheduled" size="small">
               连「已在课表」的也重排（会重复排课）
             </el-checkbox>
+          </div>
+        </div>
+      </div>
+      <!-- 写入范围（2026-10-30）：自动排课锚学期起点铺到学期末，范围与条数在这里明示，
+           避免「排完才发现只覆盖一半学期」——原实现从当前浏览周起算、写死 18 周，正是这个坑 -->
+      <div class="detail-row">
+        <span class="detail-k">范围</span>
+        <div class="small" style="flex: 1; min-width: 0">
+          {{ autoTermRangeLabel }}；每周课写 <b>{{ termWeekCount }}</b> 条，单/双周课写
+          <b>{{ autoOddEvenTimes }}</b> 条
+        </div>
+      </div>
+      <!-- 可行性预检：点「生成排课方案」之前就把「无论如何都排不进」的签点出来 -->
+      <div v-if="autoFeasibility && autoFeasibility.blocked.length" class="detail-row">
+        <span class="detail-k">预警</span>
+        <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">
+          {{ autoFeasibility.total }} 条里有 <b>{{ autoFeasibility.blocked.length }}</b> 条现在排不进
+          （会原样出现在「排不进」列表里）：
+          <div v-for="(b, i) in autoFeasibility.blocked.slice(0, 4)" :key="'fb' + i">
+            ·「{{ b.e.courseName }}」{{ b.reason }}
+          </div>
+          <div v-if="autoFeasibility.blocked.length > 4" class="muted">
+            …另 {{ autoFeasibility.blocked.length - 4 }} 条同类
           </div>
         </div>
       </div>
