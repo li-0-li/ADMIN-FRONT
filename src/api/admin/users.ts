@@ -70,7 +70,7 @@ export function getUserFootprint(userId: string) {
   return request<FootprintVo>({ url: `${BASE}/${userId}/footprint`, method: 'get' });
 }
 
-/** 若依原生院系节点（只列账号页要用的三个键；后端原生 VO 字段更多，用不到的不去声明） */
+/** 若依原生院系节点（账号页用三个键；基础数据页 B1 落地后编辑/详情还需要 orderNum/leader/phone/email） */
 export interface DeptNodeVo {
   /** ★ 这个端点是若依原生控制器，deptId 没加 @JsonFormat ⇒ 实测仍是裸数字（现库 100~203，未触精度）。
       类型留成 number | string 并一律 String() 归一，是为了后端日后补注解时不用再改这里。 */
@@ -81,6 +81,11 @@ export interface DeptNodeVo {
   ancestors?: string;
   status?: string;
   delFlag?: string;
+  /** 以下为若依 SysDept 原生字段，编辑回显/保存要带上（后端 PUT 全量收） */
+  orderNum?: number | string;
+  leader?: string;
+  phone?: string;
+  email?: string;
 }
 
 /**

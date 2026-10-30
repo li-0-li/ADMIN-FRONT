@@ -1,4 +1,5 @@
-import { request } from '@/api/request';
+import { ElMessage } from 'element-plus';
+import { rawRequest, request } from '@/api/request';
 import type { BasicDataQuery, Classroom, Clazz, Major, PageResult, School, Term } from '@/types/admin';
 
 /* ---------------- 学校 ---------------- */
@@ -94,4 +95,25 @@ export function updateClassroom(body: Classroom) {
 }
 export function deleteClassroom(classroomId: string) {
   return request<boolean>({ url: `/api/v1/admin/classrooms/${classroomId}`, method: 'delete' });
+}
+
+/* ---------------- 院系（B1，2026-10-30 后端补授 system:dept:* 后点亮写路径） ----------------
+ * 走若依原生端点，信封是 {code:200,...}（与 admin 模块的 code=0 不同），必须 rawRequest 自查。
+ * 失败先弹可读文案再抛错：页面 submitForm 不 catch，靠这里保证用户看得见原因
+ * （原生删除的常见失败=「部门下有用户/下级」，比吞掉强）。
+ */
+async function nativeOk(env: { code?: number; msg?: string }, fallback: string) {
+  if (env.code !== undefined && env.code !== 200) {
+    ElMessage.error(env.msg || fallback);
+    throw new Error(env.msg || fallback);
+  }
+}
+export async function createDept(body: Record<string, unknown>) {
+  return nativeOk(await rawRequest({ url: '/system/dept', method: 'post', data: body }), '新增院系失败');
+}
+export async function updateDept(body: Record<string, unknown>) {
+  return nativeOk(await rawRequest({ url: '/system/dept', method: 'put', data: body }), '保存院系失败');
+}
+export async function deleteDept(deptId: string) {
+  return nativeOk(await rawRequest({ url: `/system/dept/${deptId}`, method: 'delete' }), '删除院系失败');
 }

@@ -5,11 +5,13 @@ import ZkIcon from '@/components/ZkIcon.vue';
 import {
   createClazz,
   createClassroom,
+  createDept,
   createMajor,
   createSchool,
   createTerm,
   deleteClazz,
   deleteClassroom,
+  deleteDept,
   deleteMajor,
   deleteSchool,
   deleteTerm,
@@ -20,6 +22,7 @@ import {
   listTerms,
   updateClazz,
   updateClassroom,
+  updateDept,
   updateMajor,
   updateSchool,
   updateTerm
@@ -42,12 +45,10 @@ const TABS: { key: TabKey; label: string }[] = [
 ];
 
 /**
- * 院系 tab（B1 只读版）：数据走若依原生 GET /system/dept/list（账号页同源）。
- * 增删改需要 system:dept:* 权限（role 100 未登记）⇒ 只读 + 页内提示，已派后端线（B1）。
+ * 只读 tab 提示位（B1 已落地：后端 10-30 补授 system:dept:*（103/1016~1019 → role 100），
+ * 院系 tab 已切到写路径。此结构留给未来可能出现的缺口 tab 复用。
  */
-const READ_ONLY_TABS: Partial<Record<TabKey, string>> = {
-  dept: '院系数据来自若依组织架构，当前为只读（增删改需 system:dept:* 权限登记，已派后端线）'
-};
+const READ_ONLY_TABS: Partial<Record<TabKey, string>> = {};
 
 const active = ref<TabKey>('school');
 
@@ -71,6 +72,11 @@ const statusCls = (v: unknown) => STATUS_CLS[String(v)] ?? 'badge-neutral';
 const STATUS_OPTIONS = [
   { value: 'active', label: '启用' },
   { value: 'inactive', label: '停用' }
+];
+/** 院系走若依原生口径：'0' 正常 / '1' 停用（statusLabel/statusCls 已兼容这两个值） */
+const DEPT_STATUS_OPTIONS = [
+  { value: '0', label: '正常' },
+  { value: '1', label: '停用' }
 ];
 
 /** 各 tab 拉全量（导出用 pageSize=1000；院系走树接口，本地按关键词过滤） */
@@ -100,19 +106,15 @@ async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<
     const r = await listUsers({ page: q.page, pageSize: q.pageSize, keyword: q.keyword, roleKey: tab });
     return { list: asRows(r?.list), total: r?.total ?? 0 };
   }
-  // dept：若依原生院系树，拍平成行；关键词本地过滤（数据量 = 院系数，最多百级）
+  // dept：若依原生院系树，拍平成行。行里**保留原生全字段**（parentId/orderNum/leader/phone/email），
+  // 编辑回显与保存都要用；parentName 只是展示用的派生列。关键词本地过滤（院系量级百以内）。
   const res = await listDeptTree();
   if (!res.ok) return { list: [], total: 0 };
   const all = res.list.filter(d => d.delFlag !== '2');
   const nameById = new Map(all.map(d => [String(d.deptId), d.deptName]));
   const kw = (q.keyword ?? '').trim();
   const flat = all
-    .map(d => ({
-      deptId: String(d.deptId),
-      deptName: d.deptName,
-      parentName: nameById.get(String(d.parentId ?? '')) ?? '—',
-      status: d.status ?? '0'
-    }))
+    .map(d => ({ ...d, deptId: String(d.deptId), parentName: nameById.get(String(d.parentId ?? '')) ?? '—' }))
     .filter(d => !kw || d.deptName.includes(kw));
   return { list: flat, total: flat.length };
 }
@@ -158,11 +160,11 @@ function resetQuery() {
 onMounted(fetchList);
 
 /* ---------------- 增删改（只对有接口的 tab 开放；院系只读） ---------------- */
-const CRUD_TABS: TabKey[] = ['school', 'major', 'clazz', 'term', 'room'];
+const CRUD_TABS: TabKey[] = ['school', 'dept', 'major', 'clazz', 'term', 'room'];
 const canCrud = computed(() => CRUD_TABS.includes(active.value));
 
 /** 各 CRUD tab 的主键字段名（删除/编辑都要用，收口一处避免五处各写一份） */
-const CRUD_ID_KEYS: Record<string, string> = { school: 'schoolId', major: 'majorId', clazz: 'clazzId', term: 'termId', room: 'classroomId' };
+const CRUD_ID_KEYS: Record<string, string> = { school: 'schoolId', dept: 'deptId', major: 'majorId', clazz: 'clazzId', term: 'termId', room: 'classroomId' };
 
 /**
  * 旧包探测（能力检测，判据用 typeof 而不是值比较）：
@@ -186,7 +188,13 @@ const form = reactive<Record<string, unknown>>({});
 
 const majorOptions = ref<{ value: string; label: string }[]>([]);
 const schoolOptions = ref<{ value: string; label: string }[]>([]);
+const deptOptions = ref<{ value: string; label: string }[]>([]);
 const OPTION_LOADERS: Record<string, () => Promise<void>> = {
+  depts: async () => {
+    if (deptOptions.value.length) return;
+    const res = await listDeptTree();
+    if (res.ok) deptOptions.value = res.list.map(d => ({ value: String(d.deptId), label: d.deptName }));
+  },
   majors: async () => {
     if (majorOptions.value.length) return;
     const r = await listMajors({ page: 1, pageSize: 500 });
@@ -205,7 +213,7 @@ type FormField = {
   type?: 'select' | 'date' | 'number';
   options?: { value: string; label: string }[];
   /** 动态下拉：渲染时从 OPTION_LOADERS 缓存取，避免 FORM_FIELDS 里写死数据 */
-  optionsKey?: 'majors' | 'schools';
+  optionsKey?: 'majors' | 'schools' | 'depts';
 };
 
 const FORM_FIELDS: Record<string, FormField[]> = {
@@ -215,6 +223,15 @@ const FORM_FIELDS: Record<string, FormField[]> = {
     { prop: 'domain', label: '域名' },
     { prop: 'bindMode', label: '绑定方式', type: 'select', options: [{ value: 'auto', label: '自动' }, { value: 'manual', label: '人工' }] },
     { prop: 'status', label: '状态', type: 'select', options: STATUS_OPTIONS }
+  ],
+  dept: [
+    { prop: 'deptName', label: '院系名称' },
+    { prop: 'parentId', label: '上级部门', type: 'select', optionsKey: 'depts' },
+    { prop: 'orderNum', label: '显示顺序', type: 'number' },
+    { prop: 'leader', label: '负责人' },
+    { prop: 'phone', label: '联系电话' },
+    { prop: 'email', label: '邮箱' },
+    { prop: 'status', label: '状态', type: 'select', options: DEPT_STATUS_OPTIONS }
   ],
   major: [
     { prop: 'name', label: '专业名称' },
@@ -250,9 +267,18 @@ const FORM_FIELDS: Record<string, FormField[]> = {
 };
 
 const currentFields = computed(() =>
-  (FORM_FIELDS[active.value] ?? []).map(f => (f.optionsKey ? { ...f, options: f.options ?? dynamicOptions(f.optionsKey) } : f))
+  (FORM_FIELDS[active.value] ?? []).map(f => {
+    if (!f.optionsKey) return f;
+    let options = f.options ?? dynamicOptions(f.optionsKey);
+    // 上级部门下拉排除自己：把自己选成自己的父级会造出环，若依后端不一定拦
+    if (f.prop === 'parentId' && form.deptId !== undefined && form.deptId !== null && form.deptId !== '') {
+      options = options.filter(o => o.value !== String(form.deptId));
+    }
+    return { ...f, options };
+  })
 );
-const dynamicOptions = (key: 'majors' | 'schools') => (key === 'majors' ? majorOptions.value : schoolOptions.value);
+const dynamicOptions = (key: 'majors' | 'schools' | 'depts') =>
+  key === 'majors' ? majorOptions.value : key === 'schools' ? schoolOptions.value : deptOptions.value;
 
 async function openCreate() {
   // 关联下拉数据先备齐再开弹窗，避免弹窗里下拉是空的
@@ -290,6 +316,8 @@ async function submitForm() {
       formMode.value === 'create' ? await createSchool({ ...form }) : await updateSchool({ ...form });
     } else if (active.value === 'major') {
       formMode.value === 'create' ? await createMajor({ ...form }) : await updateMajor({ ...form });
+    } else if (active.value === 'dept') {
+      formMode.value === 'create' ? await createDept({ ...form }) : await updateDept({ ...form });
     } else if (active.value === 'clazz') {
       formMode.value === 'create' ? await createClazz({ ...form }) : await updateClazz({ ...form });
     } else if (active.value === 'term') {
@@ -318,9 +346,10 @@ async function doDelete(row: Record<string, unknown>) {
     ElMessage.warning('该行缺少有效主键，无法删除' + (idsCorrupted.value ? '（运行包过旧，需换包）' : ''));
     return;
   }
-  const name = String(row.name ?? row.clazzName ?? row.code ?? id);
+  const name = String(row.name ?? row.deptName ?? row.clazzName ?? row.code ?? id);
   await ElMessageBox.confirm(`确定要删除「${name}」吗？`, '删除', { type: 'warning', confirmButtonText: '删除' });
   if (active.value === 'school') await deleteSchool(id);
+  else if (active.value === 'dept') await deleteDept(id);
   else if (active.value === 'major') await deleteMajor(id);
   else if (active.value === 'clazz') await deleteClazz(id);
   else if (active.value === 'term') await deleteTerm(id);
@@ -485,7 +514,7 @@ async function exportCsv() {
   <div class="page-head">
     <h1>基础数据</h1>
     <div class="actions">
-      <el-button v-if="!READ_ONLY_TABS[active]" text :loading="exporting" @click="exportCsv">
+      <el-button text :loading="exporting" @click="exportCsv">
         <ZkIcon name="download" :size="15" style="margin-right: 4px" />导出 CSV
       </el-button>
       <el-button v-if="canCrud" type="primary" @click="openCreate">
@@ -532,9 +561,8 @@ async function exportCsv() {
     </div>
   </div>
 
-  <!-- B1 只读提示（院系） / 旧运行包警示：主键被 JSON.parse 截断，写路径不可用（能力检测，换包后自动消失） -->
-  <div v-if="READ_ONLY_TABS[active]" class="ids-warn">{{ READ_ONLY_TABS[active] }}</div>
-  <div v-else-if="idsCorrupted" class="ids-warn">
+  <!-- 旧运行包警示：主键被 JSON.parse 截断，写路径不可用（能力检测，换包后自动消失） -->
+  <div v-if="idsCorrupted" class="ids-warn">
     <strong>编辑 / 删除暂不可用：</strong>当前运行包（10-26）返回的 19 位主键已被截断，直接操作会定位到错误记录。需发布线换新包（10-28 之后的构建）后自动恢复，列表查看不受影响。
   </div>
 
@@ -571,7 +599,7 @@ async function exportCsv() {
       <span class="small muted">
         共 {{ total }} 条记录
         <span v-if="active === 'teacher' || active === 'student'">（数据来自账号接口，按角色过滤）</span>
-        <span v-else-if="active === 'dept'">（数据来自若依组织架构）</span>
+        <span v-else-if="active === 'dept'">（来自若依组织架构 sys_dept，删除前须先清空该院系下的用户）</span>
       </span>
       <el-pagination
         v-model:current-page="query.page"
