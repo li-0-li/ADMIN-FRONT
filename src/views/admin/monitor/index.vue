@@ -12,8 +12,8 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import ZkIcon from '@/components/ZkIcon.vue';
-import { getSystemStatus } from '@/api/admin/monitor';
-import type { HealthState, ProbeInfo, SystemStatusVo } from './types';
+import { getErrorLogs, getSystemStatus } from '@/api/admin/monitor';
+import type { ErrorLogsVo, HealthState, ProbeInfo, SystemStatusVo } from './types';
 
 /* ---------------- 状态 ---------------- */
 
@@ -26,15 +26,52 @@ const status = ref<SystemStatusVo | null>(null);
 /** 最近一次成功取数的本地时刻，用来让「数据是旧的」这件事可见 */
 const fetchedAt = ref('');
 
+/**
+ * 「新包探测」：status 响应里有没有 10-30 新增的字段（cpu / pool / uptimeMs）。
+ * 旧包没有 ⇒ 相关区块回落「后端未提供」的原缺口显示；新包在 ⇒ 显示真数据。
+ * 用 `'cpu' in status` 而不是 `status.cpu != null`：**新包首次轮询 cpu 就是 null**，
+ * 那是「首次采样中」，不是「没有这个指标」——两种 null 必须显示成不同文案。
+ */
+const hasNewFields = computed(() => {
+  if (!status.value) return false;
+  return 'cpu' in status.value || 'pool' in status.value || 'uptimeMs' in status.value;
+});
+
 /** 异常日志级别筛选。后端无日志端点，筛选结果恒为空，但控件保留原型形态 */
 const logLevel = ref<'ERROR' | 'ALL'>('ERROR');
 
 /** 自动刷新间隔，与原型「实时 · 5s 刷新」一致 */
 const AUTO_MS = 5000;
+/** ERROR 日志慢节奏：30 秒一拉。日志文本重复率极高，捆进 5s 轮询纯属浪费带宽 */
+const ERR_MS = 30000;
 
 let timer: number | undefined;
 /** 防重入：5s 定时器和人手点「立即刷新」会撞车，撞上就复用正在飞的那次请求 */
 let inFlight = false;
+
+/* ---- ERROR 日志（新端点 /error-logs，30 秒一拉）---- */
+
+const errLogs = ref<ErrorLogsVo | null>(null);
+/**
+ * 端点能力：null = 还没探测过；true = 有端点（渲染日志行）；false = 探测过不存在（旧包）
+ * ⇒ 区块回落「未接入」的缺口显示。探测失败后**不再重试**：换包是发布线的动作，
+ * 前端轮询打不出新端点，每 30 秒白打一次没意义。
+ */
+const errSupported = ref<boolean | null>(null);
+let errTimer: number | undefined;
+let errInFlight = false;
+
+/* ---- 趋势图本地采样 ---- */
+
+/** 环形缓冲长度：30 点 × 5 秒 = 近 150 秒，与原型「近 30 个采样点」一致 */
+const TREND_MAX = 30;
+interface TrendPoint {
+  t: string;
+  cpu: number | null;
+  mem: number;
+}
+/** 只在组件存活期间累积，进页清零重新采——历史序列在后端不存在，这是前端本地采样，不是假历史 */
+const trendPoints = ref<TrendPoint[]>([]);
 
 /* ---------------- 取数 ---------------- */
 
@@ -53,6 +90,9 @@ async function fetchStatus(silent = false) {
     failed.value = false;
     failMsg.value = '';
     fetchedAt.value = clock(new Date());
+    // 每次成功取数都喂一个点给趋势缓冲：cpu 首次为 null 也喂（mem 有值），
+    // 图上 CPU 线就从第一次非 null 的点开始画——不编造「回到 0%」
+    pushTrendPoint();
   } catch (e) {
     // 失败时**不清 status**：监控页把「刚才还好好的」整屏清空，比继续显示旧值更误导。
     // 正确做法是留着旧值 + 明确标出「数据停在几点」，让人知道看到的是旧数据。
@@ -64,8 +104,37 @@ async function fetchStatus(silent = false) {
   }
 }
 
+/** 往趋势缓冲压一个采样点；超长从头丢（环形缓冲，shift 掉最旧的） */
+function pushTrendPoint() {
+  const s = status.value;
+  if (!s) return;
+  const mem = memPct.value;
+  if (mem == null) return; // 连 JVM 内存都没有就没必要压点，图维持空态说明
+  trendPoints.value.push({ t: clock(new Date()), cpu: num(s.cpu), mem });
+  if (trendPoints.value.length > TREND_MAX) trendPoints.value.shift();
+}
+
+/**
+ * 拉一次 ERROR 日志尾部。silent 探测：旧包没有端点时 catch 住，仅首次失败时置 false。
+ */
+async function fetchErrorLogs() {
+  if (errInFlight) return;
+  errInFlight = true;
+  try {
+    const r = await getErrorLogs(50);
+    errLogs.value = r && typeof r === 'object' ? r : null;
+    errSupported.value = true;
+  } catch {
+    if (errSupported.value === null) errSupported.value = false;
+  } finally {
+    errInFlight = false;
+  }
+}
+
 function manualRefresh() {
   fetchStatus();
+  // 已探测过端点不存在（旧包）就不白打；null/true 都打（探测或正常拉取）
+  if (errSupported.value !== false) fetchErrorLogs();
 }
 
 /** 起自动刷新。切页时必须停掉，否则组件已卸载、定时器还在往后台发请求 */
@@ -76,12 +145,24 @@ function startAuto() {
     if (document.hidden) return;
     fetchStatus(true);
   }, AUTO_MS);
+  // ERROR 日志用独立的慢定时器：探测过端点不存在（旧包）就不再起，省掉无意义的轮询
+  if (errSupported.value !== false) {
+    fetchErrorLogs();
+    errTimer = window.setInterval(() => {
+      if (document.hidden || errSupported.value === false) return;
+      fetchErrorLogs();
+    }, ERR_MS);
+  }
 }
 
 function stopAuto() {
   if (timer !== undefined) {
     window.clearInterval(timer);
     timer = undefined;
+  }
+  if (errTimer !== undefined) {
+    window.clearInterval(errTimer);
+    errTimer = undefined;
   }
 }
 
@@ -92,6 +173,20 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopAuto();
+});
+
+/** 日志行是否 ERROR 级别（logback pattern: `HH:mm:ss.SSS [thread] LEVEL`）——真 ERROR 行加亮显示 */
+function isErrLine(line: string): boolean {
+  return /\b(ERROR)\b/.test(line);
+}
+
+/** 日志块底部统计：按三分态给不同口径，绝不把「没接入」说成「共 0 条」 */
+const errFootText = computed(() => {
+  if (errSupported.value === false) return `ERROR 日志端点未接入（旧包）`;
+  const lines = errLogs.value?.lines?.length ?? 0;
+  const size = errLogs.value?.fileSizeKB;
+  const sizeText = size == null ? '' : ` · 文件 ${size} KB`;
+  return `共 ${lines} 条 ${logLevel.value} 级别日志（尾部 50 行）${sizeText}`;
 });
 
 /* ---------------- 工具 ---------------- */
@@ -185,21 +280,89 @@ interface LoadRow {
 }
 
 /**
- * 服务器负载 5 行。原型这 5 行全是模拟值；这里只有「内存」能从 jvm 算出来，
- * 其余 4 行后端无端点 ⇒ pct=null（不画进度）+ 文字写清为什么没有。
+ * 服务器负载 5 行。原型这 5 行全是模拟值。
+ * 10-30 起内存 / CPU / 磁盘 / 数据库连接四行有真数据（新包字段 + 能力探测），网络出口仍无端点。
+ * 「新包但值为 null」与「旧包没字段」必须显示成不同文案（前者是采样中/缺失，后者是真没有）。
  */
-const loadRows = computed<LoadRow[]>(() => [
-  { key: 'cpu', name: 'CPU', pct: null, text: '— · 后端未提供' },
-  {
-    key: 'mem',
-    name: '内存',
-    pct: memPct.value,
-    text: memPct.value == null ? '— · JVM 数据缺失' : `${memPct.value}% · ${memText.value}`
-  },
-  { key: 'disk', name: '磁盘', pct: null, text: '— · 后端未提供' },
-  { key: 'net', name: '网络出口', pct: null, text: '— · 后端未提供' },
-  { key: 'db', name: '数据库连接', pct: null, text: '— · 无连接池指标' }
-]);
+const loadRows = computed<LoadRow[]>(() => {
+  // 显式提取为局部标量：比 `x && num(x.y)!` 的断言链可读，也避开 TS 在对象链上的收窄盲区
+  const diskInfo = status.value?.disk ?? null;
+  const diskTotal = num(diskInfo?.totalMB);
+  const diskFree = num(diskInfo?.freeMB);
+  const diskPct =
+    diskTotal != null && diskFree != null && diskTotal > 0
+      ? Math.round(((diskTotal - diskFree) / diskTotal) * 100)
+      : null;
+  const poolInfo = status.value?.pool ?? null;
+  const poolActive = num(poolInfo?.active);
+  const poolMax = num(poolInfo?.max);
+  const poolWait = num(poolInfo?.waitCount);
+  const poolPct =
+    poolActive != null && poolMax != null && poolMax > 0
+      ? Math.round((poolActive / poolMax) * 100)
+      : null;
+  const cpu = num(status.value?.cpu);
+  return [
+    {
+      key: 'cpu',
+      name: 'CPU',
+      pct: cpu,
+      text:
+        cpu != null
+          ? `${cpu}% · 全机口径`
+          : hasNewFields.value
+            ? '首次采样中…'
+            : '— · 后端未提供'
+    },
+    {
+      key: 'mem',
+      name: '内存',
+      pct: memPct.value,
+      text: memPct.value == null ? '— · JVM 数据缺失' : `${memPct.value}% · ${memText.value}`
+    },
+    {
+      key: 'disk',
+      name: '磁盘',
+      pct: diskPct,
+      text:
+        diskPct == null
+          ? hasNewFields.value
+            ? '— · 磁盘数据缺失'
+            : '— · 后端未提供'
+          : `${diskPct}% · 可用 ${fmtMb(diskFree)} / 共 ${fmtMb(diskTotal)}`
+    },
+    { key: 'net', name: '网络出口', pct: null, text: '— · 后端未提供（实训环境无此指标）' },
+    {
+      key: 'db',
+      name: '数据库连接',
+      pct: poolPct,
+      text:
+        poolPct == null
+          ? '— · 无连接池指标'
+          : `${poolActive} 活跃 / ${poolMax} 最大${poolWait != null && poolWait > 0 ? ` · ⚠ ${poolWait} 个请求排队等连接` : ''}`
+    }
+  ];
+});
+
+/** MB 展示：<1GB 用 MB（JVM 堆才几百 MB 的教训），≥1GB 用 GB 一位小数 */
+function fmtMb(mb: number | null | undefined): string {
+  const n = num(mb);
+  if (n == null) return '—';
+  return n >= 1024 ? `${(n / 1024).toFixed(1)} GB` : `${n} MB`;
+}
+
+/** 运行时长：毫秒 → 「X 天 X 小时 X 分」；不足一天只显示时分。旧包无此字段 ⇒ null */
+const uptimeText = computed<string | null>(() => {
+  const ms = num(status.value?.uptimeMs);
+  if (ms == null) return null;
+  const min = Math.floor(ms / 60000);
+  const d = Math.floor(min / 1440);
+  const h = Math.floor((min % 1440) / 60);
+  const m = min % 60;
+  if (d > 0) return `${d} 天 ${h} 小时 ${m} 分`;
+  if (h > 0) return `${h} 小时 ${m} 分`;
+  return `${m} 分钟`;
+});
 
 interface HealthCard {
   key: string;
@@ -247,10 +410,44 @@ const healthCards = computed<HealthCard[]>(() => {
   ];
 });
 
-/** 趋势图没有第二个采样点，图里那句说明就要带上当前值，否则人以为整页都挂了 */
-const trendHint = computed(() =>
-  memPct.value == null ? '暂无历史采样数据' : `暂无历史采样数据（当前堆内存 ${memPct.value}%）`
-);
+/**
+ * 趋势图：后端没有历史序列接口，改用**前端本地采样**（每次 5s 轮询成功后压一个点，
+ * 最多 30 个 = 近 150 秒）。这是「本页进入以来的真采样」，不是假历史——
+ * 图上会标明采样口径，不会让人误以为是后端长期数据。
+ */
+const TREND_LEFT = 36;
+const TREND_RIGHT = 470;
+const TREND_BOTTOM = 130;
+const TREND_TOP = 10;
+
+/** pct(0~100) → SVG y 坐标 */
+function trendY(pct: number): number {
+  return TREND_BOTTOM - (Math.min(100, Math.max(0, pct)) / 100) * (TREND_BOTTOM - TREND_TOP);
+}
+
+/** 点 → SVG 坐标。不足 30 点时**右对齐**：最新点永远贴右缘，线从右侧向左生长 */
+function toPolyline(key: 'cpu' | 'mem'): string | null {
+  const pts = trendPoints.value.filter(p => p[key] != null) as TrendPoint[];
+  if (pts.length < 2) return null;
+  const offset = TREND_MAX - trendPoints.value.length;
+  return pts
+    .map(p => {
+      const idx = offset + trendPoints.value.indexOf(p);
+      const x = TREND_LEFT + (idx / (TREND_MAX - 1)) * (TREND_RIGHT - TREND_LEFT);
+      return `${x.toFixed(1)},${trendY(p[key] as number).toFixed(1)}`;
+    })
+    .join(' ');
+}
+
+const cpuLine = computed(() => toPolyline('cpu'));
+const memLine = computed(() => toPolyline('mem'));
+const trendSampled = computed(() => trendPoints.value.length);
+
+/** 空轴说明：有采样了就报「采到几个点」，别再让人以为整页挂了 */
+const trendHint = computed(() => {
+  if (trendSampled.value === 0) return '暂无采样数据';
+  return `本地采样中 · 已采 ${trendSampled.value}/${TREND_MAX} 点（每 5 秒 1 点，进页起算）`;
+});
 </script>
 
 <template>
@@ -275,12 +472,16 @@ const trendHint = computed(() =>
         <div>
           <div class="card-title gap-title">数据源缺口（本页不编数据）</div>
           <div class="small muted">
-            唯一数据源 <code>GET /api/v1/admin/system/status</code> 只返回 JVM 内存、在线账号数、服务器时间、
-            MySQL 探活、Redis 探活五项。以下项目<b>后端没有任何端点</b>，页面上显示「—」而不是编一个数：
-            CPU 使用率 / 磁盘 / 网络出口 / 连接池占用 / 服务可用率 / 运行时长 / 当前课堂列表 / ERROR 日志。
+            数据源 <code>GET /api/v1/admin/system/status</code> 现返回九项：JVM 内存、核数、在线账号数、
+            服务器时间、MySQL 探活、Redis 探活、<b>CPU 使用率、磁盘、连接池水位</b>，
+            外加独立端点 <code>GET /api/v1/admin/system/error-logs</code>（ERROR 日志尾部）与
+            运行时长（<code>uptimeMs</code>）。
+            若当前看到「—」，说明后端还在跑 10-30 之前的旧包，换包后本页自动点亮，无需改前端。
           </div>
           <div class="small muted mt8">
-            Redis 探活其实有值，但原型的 6 个服务卡里没有 Redis 卡位，为不偏离设计稿，这里不额外插卡。
+            仍无数据源的三项，显示「—」而不是编一个数：<b>网络出口</b>（实训环境无此指标）、
+            <b>服务可用率（近 7 天）</b>（需历史采样存储）、<b>当前课堂列表</b>（课堂数据在「课堂巡查」页，
+            本页不重复接）。趋势图为<b>前端本地采样</b>（进页起每 5 秒 1 点），不是后端历史序列。
           </div>
         </div>
       </div>
@@ -322,9 +523,17 @@ const trendHint = computed(() =>
         </div>
         <div class="card stat">
           <div class="label">CPU 负载</div>
-          <div class="num muted-num">—</div>
+          <div class="num" :class="{ 'muted-num': num(status?.cpu) == null }">
+            {{ num(status?.cpu) == null ? '—' : `${num(status?.cpu)}%` }}
+          </div>
           <div class="trend">
-            {{ coreCount == null ? '后端未提供 CPU 指标' : `${coreCount} 核 · 使用率后端未提供` }}
+            {{
+              num(status?.cpu) != null
+                ? `${coreCount == null ? '' : `${coreCount} 核 · `}全机口径，与上次轮询做差`
+                : hasNewFields
+                  ? '首次采样中…（5 秒后出值）'
+                  : '后端未提供 CPU 指标'
+            }}
           </div>
         </div>
         <div class="card stat">
@@ -365,8 +574,9 @@ const trendHint = computed(() =>
 
           <div class="card-title mt16 trend-title">CPU / 内存 负载趋势（近 30 个采样点）</div>
           <!--
-            后端只返回「当前一次」采样，没有历史序列，画不出折线。
-            按启动包 §五.11：数据为空也要画轴 + 一句说明，不能留一片空白（空白看着像页面挂了）。
+            后端没有历史序列接口：趋势线来自前端本地采样（每次 5s 轮询成功压 1 点，
+            进页起算，最多 30 点 ≈ 150 秒）。点数 <2 时画不出线，回落空轴 + 说明
+            （空白看着像页面挂了）。
           -->
           <svg viewBox="0 0 480 170" class="trend-svg" role="img" :aria-label="trendHint">
             <line x1="36" y1="10" x2="36" y2="130" stroke="#e3eaec" />
@@ -387,10 +597,15 @@ const trendHint = computed(() =>
               <text x="230" y="146">-75s</text>
               <text x="440" y="146">现在</text>
             </g>
-            <text class="svg-empty" x="253" y="74" text-anchor="middle">{{ trendHint }}</text>
-            <text class="svg-empty-sub" x="253" y="92" text-anchor="middle">
-              后端只返回当前一次采样，无历史序列接口
-            </text>
+            <!-- 最新点永远贴右缘（toPolyline 右对齐），线随采样从右向左生长 -->
+            <polyline v-if="cpuLine" :points="cpuLine" class="trend-line-cpu" fill="none" />
+            <polyline v-if="memLine" :points="memLine" class="trend-line-mem" fill="none" />
+            <template v-if="!cpuLine && !memLine">
+              <text class="svg-empty" x="253" y="74" text-anchor="middle">{{ trendHint }}</text>
+              <text class="svg-empty-sub" x="253" y="92" text-anchor="middle">
+                前端本地采样，进页后每 5 秒累积 1 点
+              </text>
+            </template>
           </svg>
           <div class="row small muted legend">
             <span class="row gap-6"><i class="lg-cpu"></i>CPU</span>
@@ -413,8 +628,15 @@ const trendHint = computed(() =>
             </div>
             <div class="hair"></div>
             <div class="pf-row"><span class="k">服务可用率（近 7 天）</span><b class="small">—</b></div>
-            <div class="pf-row last"><span class="k">运行时长</span><b class="small">—</b></div>
-            <div class="small muted mt8">这两项后端无端点，未编造。</div>
+            <div class="pf-row last">
+              <span class="k">运行时长</span>
+              <b class="small">
+                {{ uptimeText ?? (hasNewFields ? '数据缺失' : '—') }}
+              </b>
+            </div>
+            <div class="small muted mt8">
+              可用率后端无端点，未编造；运行时长来自 <code>uptimeMs</code>（JVM 自启动起）。
+            </div>
           </div>
 
           <div class="card">
@@ -451,17 +673,42 @@ const trendHint = computed(() =>
           </span>
         </div>
         <div class="log-wrap">
-          <div class="err-log">
+          <!-- 旧包探测：端点不存在 ⇒ 保留原缺口说明（与换包前完全一致） -->
+          <div v-if="errSupported === false" class="err-log">
             <div>
               <span class="ts">--:--:--</span>
               <span class="lv">[GAP]</span>
               <b>monitor</b>
-              — 后端未提供 ERROR 级别日志查询端点，本区块无数据。操作/登录日志在「系统日志」页
-              （<code>GET /api/v1/admin/logs</code>），但那不是 ERROR 级别日志，不在此处冒充。
+              — 当前运行的后端包未包含 ERROR 日志端点（10-30 补丁），本区块无数据。操作/登录日志在
+              「系统日志」页（<code>GET /api/v1/admin/logs</code>），但那不是 ERROR 级别日志，不在此处冒充。
+            </div>
+          </div>
+          <!-- 端点存在但后端读文件失败：把后端给的中文原因原样亮出来 -->
+          <div v-else-if="errLogs?.error" class="err-log">
+            <div>
+              <span class="ts">{{ clock(new Date()) }}</span>
+              <span class="lv">[GAP]</span>
+              <b>monitor</b>
+              — 端点可达但读日志失败：{{ errLogs.error }}
+            </div>
+          </div>
+          <!-- 正常态：逐行渲染 sys-error.log 尾部（时间正序，最新在最底部） -->
+          <div v-else-if="errLogs?.lines?.length" class="err-log">
+            <div v-for="(line, i) in errLogs.lines" :key="i" :class="{ 'err-line-hot': isErrLine(line) }">
+              {{ line }}
+            </div>
+          </div>
+          <!-- 端点存在但没有 ERROR 行：这是好事，明说而不是留白 -->
+          <div v-else class="err-log">
+            <div>
+              <span class="ts">{{ clock(new Date()) }}</span>
+              <span class="lv lv-ok">[OK]</span>
+              <b>monitor</b>
+              — {{ errSupported === null ? '正在探测 ERROR 日志端点…' : '日志文件中暂无 ERROR 行（近 256KB 内）' }}
             </div>
           </div>
           <div class="small muted mt8">
-            共 0 条 {{ logLevel }} 级别日志 · 未接入；服务器时间 {{ fmtServerTime(status.serverTime) }}
+            {{ errFootText }}；服务器时间 {{ fmtServerTime(status.serverTime) }}
           </div>
         </div>
       </div>
@@ -620,6 +867,19 @@ const trendHint = computed(() =>
 .lg-mem {
   background: var(--warning);
 }
+/* 折线颜色与图例一一对应——图例换了色这线不同步就是误导 */
+.trend-line-cpu {
+  stroke: var(--brand-600);
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.trend-line-mem {
+  stroke: var(--warning);
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
 
 /* ---- 服务健康度卡（原型 .svc）---- */
 .health-grid {
@@ -696,6 +956,14 @@ const trendHint = computed(() =>
 .err-log .lv {
   color: #f87171;
   font-weight: 700;
+}
+/* 探测中 / 无 ERROR 行时的绿色徽标——深色底上的「没有错误」用绿，不用和 GAP 同色的红 */
+.err-log .lv-ok {
+  color: #4ade80;
+}
+/* 真 ERROR 行整行加亮：扫一眼能定位到最近一次出错的位置 */
+.err-line-hot {
+  color: #fca5a5;
 }
 .err-log .ts {
   color: #94a3b8;
