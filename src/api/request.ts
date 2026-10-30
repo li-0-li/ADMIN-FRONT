@@ -19,6 +19,14 @@ export interface ApiEnvelope<T = unknown> {
   [key: string]: unknown;
 }
 
+/**
+ * 请求配置：在 axios 配置上加 `silent`。
+ * silent = true ⇒ 业务失败/网络失败都**只 throw 不弹 toast**，提示交给调用方（典型用法：能力探测
+ * 与「有兜底方案」的可降级请求——页面自己能降级时，弹一条英文技术报错只会污染界面）。
+ * ★ 401 不受 silent 影响：登录失效必须提示并跳登录，静默会把用户留在坏状态。
+ */
+export type ApiRequestConfig = AxiosRequestConfig & { silent?: boolean };
+
 const http = axios.create({ baseURL: '/', timeout: 30000 });
 
 http.interceptors.request.use(config => {
@@ -37,24 +45,27 @@ function gotoLogin() {
 }
 
 /** 拿原始响应体（需要读平铺字段，比如 /login 的 token 时用它） */
-export async function rawRequest<T = unknown>(config: AxiosRequestConfig): Promise<ApiEnvelope<T>> {
+export async function rawRequest<T = unknown>(config: ApiRequestConfig): Promise<ApiEnvelope<T>> {
+  const { silent = false, ...axiosConfig } = config;
   try {
-    const res = await http.request<ApiEnvelope<T>>(config);
+    const res = await http.request<ApiEnvelope<T>>(axiosConfig);
     return res.data ?? {};
   } catch (error) {
     const status = (error as { response?: { status?: number } })?.response?.status;
     if (status === 401) {
+      // 401 不静默：这不是「可降级」场景，静默会把用户留在没登录的坏状态里
       ElMessage.error('登录已失效，请重新登录');
       gotoLogin();
-    } else {
+    } else if (!silent) {
       ElMessage.error((error as Error)?.message ?? '网络异常');
     }
     throw error;
   }
 }
 
-/** 统一解包：成功返回 data；业务失败抛错并提示 */
-export async function request<T = unknown>(config: AxiosRequestConfig): Promise<T> {
+/** 统一解包：成功返回 data；业务失败抛错并提示（silent=true 时只抛错不提示） */
+export async function request<T = unknown>(config: ApiRequestConfig): Promise<T> {
+  const silent = config.silent === true;
   const body = await rawRequest<T>(config);
   const code = body.code;
   if (code === undefined || SUCCESS_CODES.has(code)) {
@@ -64,7 +75,7 @@ export async function request<T = unknown>(config: AxiosRequestConfig): Promise<
   if (code === 401) {
     ElMessage.error(message || '登录已失效，请重新登录');
     gotoLogin();
-  } else {
+  } else if (!silent) {
     ElMessage.error(message);
   }
   throw new Error(message);

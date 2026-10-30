@@ -31,11 +31,16 @@ export interface PageShell<T> {
   pageSize: number;
 }
 
-/** page/pageSize 后端可缺省（归一为 1/10）；全量就 5 行，10 足够，不翻页 */
+/** page/pageSize 后端可缺省（归一为 1/10）；全量就 5 行，10 足够，不翻页
+ *  ★ silent: true（2026-10-30 修 P1-2）：本请求是「接口主源 + 本地兜底」的可降级请求——
+ *    旧运行包没有这个端点，回的是 HTTP 200 + code:500「No static resource…」，
+ *    解包层会把它当业务失败弹英文 toast，页面级 catch 吞不掉（toast 在更底层已经弹出）。
+ *    传 silent 后失败只 throw，由排课页 catch 走本地兜底 + 顶部业务化提示条。 */
 export function listPeriods(params?: { page?: number; pageSize?: number }) {
   return request<PageShell<AdminPeriodVo>>({
     url: '/api/v1/admin/periods',
     method: 'get',
-    params: { page: 1, pageSize: 10, ...params }
+    params: { page: 1, pageSize: 10, ...params },
+    silent: true
   });
 }
