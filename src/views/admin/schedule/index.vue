@@ -745,6 +745,14 @@ const currentTermId = ref('');
 interface PoolEntry extends CourseBrief {
   /** 唯一键：lesson-{scheduleId} / course-{courseId} */
   key: string;
+  /**
+   * 该课程在本学期已有活跃课次 ⇒ 这张签是**重复排课入口**（2026-10-30 P0-A）。
+   * 成因：放回=软删课次行，而软删行会一直留在池里成签（后端列表仍返回 deleted 行）；
+   * 这门课其余节次还好端端在课表上，于是每点一次自动排课就把它重排一遍
+   * （10-29 实测一次多出 126 条 = 7 张残留签 × 18 周）。
+   * 自动排课默认跳过这类签（见 autoEntries）；要重排整门课，先把该课全部放回。
+   */
+  inSchedule: boolean;
 }
 
 /**
@@ -776,10 +784,10 @@ const poolEntries = computed<PoolEntry[]>(() => {
     if (rows?.length) {
       // 放回即回池：每条放回课次 1 张签（拖一次排回一节）
       for (const r of rows) {
-        out.push({ ...c, key: `lesson-${r.scheduleId}` });
+        out.push({ ...c, key: `lesson-${r.scheduleId}`, inSchedule: used.has(String(r.courseId)) });
       }
     } else if (!used.has(String(c.courseId))) {
-      out.push({ ...c, key: `course-${c.courseId}` });
+      out.push({ ...c, key: `course-${c.courseId}`, inSchedule: false });
     }
   }
   return out.filter(c => {
@@ -2320,10 +2328,31 @@ const autoProgress = ref('');
 const autoReport = ref<{ ok: string[]; skip: string[] } | null>(null);
 /** 本次自动排课统一写入的班级（放回签优先用各自原课次的班级） */
 const autoClass = ref('');
+/**
+ * 是否连「课程已在课表」的签也重排（默认关，2026-10-30 P0-A）。
+ * 关 = 护栏生效：inSchedule 的签是放回留下的软删行，课程其实还在课表上，
+ * 让它参与排课就是重复排课（10-29 那次 126 条重复就是这么来的）。
+ * 真实需求如果是「整门课换时间」，正确操作是把该课全部节次放回（used 里没它了 → inSchedule 自动变 false）。
+ */
+const autoIncludeScheduled = ref(false);
+/** 本次自动排课实际参与的签 */
+const autoEntries = computed(() =>
+  poolEntries.value.filter(e => autoIncludeScheduled.value || !e.inSchedule)
+);
+/** 被护栏挡下的签数（设置视图上说明，不静默吞） */
+const autoSkippedInSchedule = computed(() =>
+  autoIncludeScheduled.value ? 0 : poolEntries.value.filter(e => e.inSchedule).length
+);
 
 function openAuto() {
   if (!poolEntries.value.length) {
     ElMessage.info('待排课程为空，没有可自动排课的课程');
+    return;
+  }
+  // 安全默认：每次打开都回到「跳过已在课表的签」，避免上一次勾选遗留成隐性重复排课
+  autoIncludeScheduled.value = false;
+  if (!autoEntries.value.length) {
+    ElMessage.warning('待排池里的签都对应「课程已在课表上」的放回记录，没有需要排的课；若要整门重排，先把该课全部节次放回');
     return;
   }
   autoReport.value = null;
@@ -2364,10 +2393,10 @@ function cycleParity(e: PoolEntry) {
   const cur = parityOf(e);
   poolParity[e.key] = cur === 'all' ? 'odd' : cur === 'odd' ? 'even' : 'all';
 }
-/** 自动排课弹窗的隔周汇总与锚定说明（存在非每周口径的课才显示） */
+/** 自动排课弹窗的隔周汇总与锚定说明（存在非每周口径的课才显示）；口径按**实际参与集**统计，不按全池 */
 const poolParitySummary = computed(() => {
-  const odd = poolEntries.value.filter(e => parityOf(e) === 'odd').length;
-  const even = poolEntries.value.filter(e => parityOf(e) === 'even').length;
+  const odd = autoEntries.value.filter(e => parityOf(e) === 'odd').length;
+  const even = autoEntries.value.filter(e => parityOf(e) === 'even').length;
   if (!odd && !even) return '';
   const anchorNote = termAnchorMonday.value
     ? `隔周按学期起点锚定（学期始于 ${termStartDateLabel.value}，单周=第 1、3、5…周）`
@@ -2585,7 +2614,9 @@ function freeAutoSlots(ctx: AutoCtx, entry: PoolEntry): number {
 /** 构造一个完整方案（纯内存，不写库）：动态饱和度选课 → 打分选格 → 失败时单层腾挪 → 罚分汇总 */
 function buildPlanOnce(ctxBase: AutoCtx, roomCandidates: Classroom[], rng: () => number): AutoPlan {
   const ctx = cloneAutoCtx(ctxBase);
-  const remaining = poolEntries.value.slice();
+  // ★ 只取 autoEntries（默认剔除 inSchedule 的签）：直接读全池会把放回留下的软删行
+  //   当成「待排的新课」再铺满一学期 —— 10-29 那次 126 条重复排课就是这么产生的（P0-A 护栏）。
+  const remaining = autoEntries.value.slice();
   const items: PlannedItem[] = [];
   const failures: AutoPlan['failures'] = [];
   let penalty = 0;
@@ -2659,7 +2690,7 @@ const autoPlan = ref<AutoPlan | null>(null);
 
 /** 阶段一「生成排课方案」：纯内存规划（毫秒级），产出预览；一条数据都不写（P2） */
 function runAuto() {
-  if (autoRunning.value || !poolEntries.value.length) return;
+  if (autoRunning.value || !autoEntries.value.length) return;
   const ctxBase = buildAutoCtx();
   const roomCandidates = classroomsAll.value.filter(r => (r.status ?? 'active') !== 'inactive');
   // P4 随机重启：同分随机破平跑 N 个方案取罚分最低
@@ -2957,6 +2988,12 @@ watch(
         <ZkIcon name="grip-vertical" :size="13" class="grip" />
         <b>{{ c.courseName }}</b>
         <span class="small muted">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
+        <!-- 重复排课入口的可视化（2026-10-30 P0-A）：这门课还在课表上，这张签是放回留下的软删记录 -->
+        <span
+          v-if="c.inSchedule"
+          class="badge badge-warning"
+          title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
+        >已在课表</span>
         <!-- 自动排课口径胶囊（2026-10-29）：每周/单周/双周循环切换，只影响自动排课；
              .stop 防止误触发签本体的「打开新增表单」点击与拖拽 -->
         <button
@@ -3494,6 +3531,12 @@ watch(
         <div class="panel-info">
           <b>{{ c.courseName }}</b>
           <span class="small muted">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
+        <!-- 重复排课入口的可视化（2026-10-30 P0-A）：这门课还在课表上，这张签是放回留下的软删记录 -->
+        <span
+          v-if="c.inSchedule"
+          class="badge badge-warning"
+          title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
+        >已在课表</span>
         </div>
         <button
           class="btn btn-outline btn-sm"
@@ -3659,6 +3702,22 @@ watch(
   <el-dialog v-model="autoVisible" title="自动排课" width="560px" :close-on-click-modal="!autoRunning">
     <template v-if="!autoReport && !autoPlan">
       <p class="small" style="margin-top: 0">把「待排课程」池里的课自动排进空位；<b>课表上已有的课一律不动</b>。</p>
+      <!-- P0-A 护栏（2026-10-30）：池里会有「课程已在课表」的放回残留签（软删行一直成签），
+           它们默认不参与排课，否则每排一次就把那门课重排一遍。这里如实报数，不静默跳。 -->
+      <div v-if="autoSkippedInSchedule || autoIncludeScheduled" class="detail-row">
+        <span class="detail-k">参与</span>
+        <div class="small" style="flex: 1; min-width: 0">
+          本次排 <b>{{ autoEntries.length }}</b> 条
+          <span v-if="autoSkippedInSchedule" class="muted">
+            · 已跳过 <b>{{ autoSkippedInSchedule }}</b> 条「课程已在课表」的放回记录（避免重复排课）
+          </span>
+          <div style="margin-top: 4px">
+            <el-checkbox v-model="autoIncludeScheduled" size="small">
+              连「已在课表」的也重排（会重复排课）
+            </el-checkbox>
+          </div>
+        </div>
+      </div>
       <!-- 重复口径在待排池每条签上单独标（2026-10-29）：每周/单周/双周点胶囊切换；原弹窗内
            的「重复」下拉在口径与 runAuto 解耦后已是摆设，换成隔周汇总与锚定警告 -->
       <div v-if="poolParitySummary" class="detail-row">
@@ -3684,6 +3743,9 @@ watch(
     <template v-else-if="autoPlan">
       <p style="margin-top: 0">
         <b>排课方案预览：可排 {{ autoPlan.items.length }} 门，排不进 {{ autoPlan.failures.length }} 门</b>
+      </p>
+      <p v-if="autoSkippedInSchedule" class="small muted" style="margin: 0 0 8px">
+        另有 {{ autoSkippedInSchedule }} 条「课程已在课表」的放回记录已跳过，不会重复排课。
       </p>
       <p class="small muted" style="margin: 0 0 8px">
         已按「最紧的课先占位、排不进的尝试腾挪让位、多方案取最优」在本地算好；点「确认写入课表」才真正保存。
