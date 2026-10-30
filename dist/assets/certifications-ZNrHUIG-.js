@@ -1,0 +1,1 @@
+import{r as e}from"./request-YSWfuRMp.js";function t(t={}){return e({url:`/api/v1/certifications`,method:`get`,params:{page:1,pageSize:10,...t}})}function n(t){return e({url:`/api/v1/courses/${t}/certifications`,method:`get`})}function r(t,n){return e({url:`/api/v1/certifications/${t}/review`,method:`put`,data:n})}export{t as n,r,n as t};
