@@ -24,7 +24,7 @@ import {
   updateSchool,
   updateTerm
 } from '@/api/admin/basicdata';
-import { listUsers } from '@/api/admin/users';
+import { listDeptTree, listUsers, type DeptNodeVo } from '@/api/admin/users';
 import type { BasicDataQuery } from '@/types/admin';
 
 /* ---------------- tab 定义（与原型 admin-basicdata.html 的 8 个 pill 一致） ---------------- */
@@ -41,13 +41,15 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: 'room', label: '教室' }
 ];
 
-/** 后端未提供接口的 tab（按缺口处理，不做假数据）。教室已随 C-21 补齐（2026-10-15），院系仍缺口 */
-const GAP_TABS: Partial<Record<TabKey, string>> = {
-  dept: '院系'
+/**
+ * 院系 tab（B1 只读版）：数据走若依原生 GET /system/dept/list（账号页同源）。
+ * 增删改需要 system:dept:* 权限（role 100 未登记）⇒ 只读 + 页内提示，已派后端线（B1）。
+ */
+const READ_ONLY_TABS: Partial<Record<TabKey, string>> = {
+  dept: '院系数据来自若依组织架构，当前为只读（增删改需 system:dept:* 权限登记，已派后端线）'
 };
 
 const active = ref<TabKey>('school');
-const isGap = computed(() => Boolean(GAP_TABS[active.value]));
 
 /* ---------------- 通用列表状态 ---------------- */
 const loading = ref(false);
@@ -71,40 +73,63 @@ const STATUS_OPTIONS = [
   { value: 'inactive', label: '停用' }
 ];
 
-async function fetchList() {
-  if (isGap.value) {
-    rows.value = [];
-    total.value = 0;
-    return;
+/** 各 tab 拉全量（导出用 pageSize=1000；院系走树接口，本地按关键词过滤） */
+async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<string, unknown>[]; total: number }> {
+  if (tab === 'school') {
+    const r = await listSchools(q);
+    return { list: asRows(r?.list), total: r?.total ?? 0 };
   }
+  if (tab === 'major') {
+    const r = await listMajors(q);
+    return { list: asRows(r?.list), total: r?.total ?? 0 };
+  }
+  if (tab === 'clazz') {
+    const r = await listClasses(q);
+    return { list: asRows(r?.list), total: r?.total ?? 0 };
+  }
+  if (tab === 'term') {
+    const r = await listTerms(q);
+    return { list: asRows(r?.list), total: r?.total ?? 0 };
+  }
+  if (tab === 'room') {
+    const r = await listClassrooms(q);
+    return { list: asRows(r?.list), total: r?.total ?? 0 };
+  }
+  if (tab === 'teacher' || tab === 'student') {
+    // 教师 / 学生复用账号接口，按角色键过滤
+    const r = await listUsers({ page: q.page, pageSize: q.pageSize, keyword: q.keyword, roleKey: tab });
+    return { list: asRows(r?.list), total: r?.total ?? 0 };
+  }
+  // dept：若依原生院系树，拍平成行；关键词本地过滤（数据量 = 院系数，最多百级）
+  const res = await listDeptTree();
+  if (!res.ok) return { list: [], total: 0 };
+  const all = res.list.filter(d => d.delFlag !== '2');
+  const nameById = new Map(all.map(d => [String(d.deptId), d.deptName]));
+  const kw = (q.keyword ?? '').trim();
+  const flat = all
+    .map(d => ({
+      deptId: String(d.deptId),
+      deptName: d.deptName,
+      parentName: nameById.get(String(d.parentId ?? '')) ?? '—',
+      status: d.status ?? '0'
+    }))
+    .filter(d => !kw || d.deptName.includes(kw));
+  return { list: flat, total: flat.length };
+}
+
+async function fetchList() {
   loading.value = true;
   try {
     const q: BasicDataQuery = { ...query };
-    if (active.value === 'school') {
-      const r = await listSchools(q);
-      rows.value = asRows(r?.list);
-      total.value = r?.total ?? 0;
-    } else if (active.value === 'major') {
-      const r = await listMajors(q);
-      rows.value = asRows(r?.list);
-      total.value = r?.total ?? 0;
-    } else if (active.value === 'clazz') {
-      const r = await listClasses(q);
-      rows.value = asRows(r?.list);
-      total.value = r?.total ?? 0;
-    } else if (active.value === 'term') {
-      const r = await listTerms(q);
-      rows.value = asRows(r?.list);
-      total.value = r?.total ?? 0;
-    } else if (active.value === 'room') {
-      const r = await listClassrooms(q);
-      rows.value = asRows(r?.list);
-      total.value = r?.total ?? 0;
-    } else if (active.value === 'teacher' || active.value === 'student') {
-      // 教师 / 学生复用账号接口，按角色键过滤
-      const r = await listUsers({ page: q.page, pageSize: q.pageSize, keyword: q.keyword, roleKey: active.value });
-      rows.value = asRows(r?.list);
-      total.value = r?.total ?? 0;
+    const r = await fetchTab(active.value, q);
+    // 院系是无分页本地过滤：整表给表格；其余域直接用后端分页结果
+    if (active.value === 'dept') {
+      const start = ((q.page ?? 1) - 1) * (q.pageSize ?? 10);
+      rows.value = r.list.slice(start, start + (q.pageSize ?? 10));
+      total.value = r.total;
+    } else {
+      rows.value = r.list;
+      total.value = r.total;
     }
   } finally {
     loading.value = false;
@@ -132,7 +157,7 @@ function resetQuery() {
 
 onMounted(fetchList);
 
-/* ---------------- 增删改（只对有接口的 tab 开放） ---------------- */
+/* ---------------- 增删改（只对有接口的 tab 开放；院系只读） ---------------- */
 const CRUD_TABS: TabKey[] = ['school', 'major', 'clazz', 'term', 'room'];
 const canCrud = computed(() => CRUD_TABS.includes(active.value));
 
@@ -141,7 +166,7 @@ const CRUD_ID_KEYS: Record<string, string> = { school: 'schoolId', major: 'major
 
 /**
  * 旧包探测（能力检测，判据用 typeof 而不是值比较）：
- * 10-28 eb3400b 后端才把基础数据主键 @JsonFormat(STRING) 字符串化；现役 10-26 运行包
+ * 10-28 eb3400b 后端才把基础数据主键 @JsonFormat(STRING) 字符串化；更早的运行包
  * 返回的是**裸 19 位数字**，JSON.parse 阶段就已经截断（> Number.MAX_SAFE_INTEGER）。
  * 表现特征：id 字段是 number 且 !Number.isSafeInteger —— 旧包+小自增 id（安全整数）不误报，
  * 新包（string）也不误报。命中时编辑/删除会定位到错误 id，必须停用并提示换包。
@@ -153,12 +178,37 @@ const idsCorrupted = computed(() =>
   })
 );
 
+/* ---------------- 表单（动态关联下拉：专业/学校，数据现成接口拉一次缓存） ---------------- */
 const formVisible = ref(false);
 const formMode = ref<'create' | 'edit'>('create');
 const saving = ref(false);
 const form = reactive<Record<string, unknown>>({});
 
-const FORM_FIELDS: Record<string, { prop: string; label: string; type?: 'select' | 'date' | 'number'; options?: { value: string; label: string }[] }[]> = {
+const majorOptions = ref<{ value: string; label: string }[]>([]);
+const schoolOptions = ref<{ value: string; label: string }[]>([]);
+const OPTION_LOADERS: Record<string, () => Promise<void>> = {
+  majors: async () => {
+    if (majorOptions.value.length) return;
+    const r = await listMajors({ page: 1, pageSize: 500 });
+    majorOptions.value = asRows(r?.list).map(m => ({ value: String(m.majorId), label: String(m.name ?? m.majorId) }));
+  },
+  schools: async () => {
+    if (schoolOptions.value.length) return;
+    const r = await listSchools({ page: 1, pageSize: 500 });
+    schoolOptions.value = asRows(r?.list).map(s => ({ value: String(s.schoolId), label: String(s.name ?? s.schoolId) }));
+  }
+};
+
+type FormField = {
+  prop: string;
+  label: string;
+  type?: 'select' | 'date' | 'number';
+  options?: { value: string; label: string }[];
+  /** 动态下拉：渲染时从 OPTION_LOADERS 缓存取，避免 FORM_FIELDS 里写死数据 */
+  optionsKey?: 'majors' | 'schools';
+};
+
+const FORM_FIELDS: Record<string, FormField[]> = {
   school: [
     { prop: 'name', label: '学校名称' },
     { prop: 'code', label: '学校编码' },
@@ -175,12 +225,15 @@ const FORM_FIELDS: Record<string, { prop: string; label: string; type?: 'select'
   clazz: [
     { prop: 'clazzName', label: '班级名称' },
     { prop: 'clazzCode', label: '班级编码' },
+    { prop: 'schoolId', label: '所属学校', type: 'select', optionsKey: 'schools' },
+    { prop: 'majorId', label: '所属专业', type: 'select', optionsKey: 'majors' },
     { prop: 'gradeYear', label: '年级', type: 'number' },
     { prop: 'status', label: '状态', type: 'select', options: STATUS_OPTIONS }
   ],
   term: [
     { prop: 'name', label: '学期名称' },
     { prop: 'code', label: '学期编码' },
+    { prop: 'schoolId', label: '所属学校', type: 'select', optionsKey: 'schools' },
     { prop: 'startDate', label: '开始日期', type: 'date' },
     { prop: 'endDate', label: '结束日期', type: 'date' },
     { prop: 'status', label: '状态', type: 'select', options: STATUS_OPTIONS }
@@ -188,6 +241,7 @@ const FORM_FIELDS: Record<string, { prop: string; label: string; type?: 'select'
   room: [
     { prop: 'name', label: '教室名称' },
     { prop: 'code', label: '教室编码' },
+    { prop: 'schoolId', label: '所属学校', type: 'select', optionsKey: 'schools' },
     { prop: 'roomType', label: '类型', type: 'select', options: [{ value: 'physical', label: '物理教室' }, { value: 'virtual', label: '虚拟教室' }] },
     { prop: 'capacity', label: '容纳人数', type: 'number' },
     { prop: 'location', label: '位置' },
@@ -195,9 +249,15 @@ const FORM_FIELDS: Record<string, { prop: string; label: string; type?: 'select'
   ]
 };
 
-const currentFields = computed(() => FORM_FIELDS[active.value] ?? []);
+const currentFields = computed(() =>
+  (FORM_FIELDS[active.value] ?? []).map(f => (f.optionsKey ? { ...f, options: f.options ?? dynamicOptions(f.optionsKey) } : f))
+);
+const dynamicOptions = (key: 'majors' | 'schools') => (key === 'majors' ? majorOptions.value : schoolOptions.value);
 
-function openCreate() {
+async function openCreate() {
+  // 关联下拉数据先备齐再开弹窗，避免弹窗里下拉是空的
+  const keys = (FORM_FIELDS[active.value] ?? []).map(f => f.optionsKey).filter(Boolean) as ('majors' | 'schools')[];
+  await Promise.all([...new Set(keys)].map(k => OPTION_LOADERS[k]()));
   formMode.value = 'create';
   const init: Record<string, unknown> = {};
   currentFields.value.forEach(f => {
@@ -209,7 +269,9 @@ function openCreate() {
   formVisible.value = true;
 }
 
-function openEdit(row: Record<string, unknown>) {
+async function openEdit(row: Record<string, unknown>) {
+  const keys = (FORM_FIELDS[active.value] ?? []).map(f => f.optionsKey).filter(Boolean) as ('majors' | 'schools')[];
+  await Promise.all([...new Set(keys)].map(k => OPTION_LOADERS[k]()));
   formMode.value = 'edit';
   Object.keys(form).forEach(k => delete form[k]);
   Object.assign(form, JSON.parse(JSON.stringify(row)));
@@ -268,56 +330,71 @@ async function doDelete(row: Record<string, unknown>) {
 }
 
 /* ---------------- 列定义 ---------------- */
-type Col = { prop: string; label: string; render?: (row: Record<string, unknown>) => string; badge?: (row: Record<string, unknown>) => string };
+type Col = {
+  prop: string;
+  label: string;
+  render?: (row: Record<string, unknown>) => string;
+  badge?: (row: Record<string, unknown>) => string;
+  /** 名称列：可点开只读详情抽屉（A2），渲染为主链接样式并冻结首列 */
+  link?: boolean;
+  align?: 'right' | 'center';
+};
 
 const columns = computed<Col[]>(() => {
   switch (active.value) {
     case 'school':
       return [
-        { prop: 'name', label: '学校名称' },
+        { prop: 'name', label: '学校名称', link: true },
         { prop: 'code', label: '编码' },
         { prop: 'domain', label: '域名' },
         { prop: 'bindMode', label: '绑定方式', badge: r => (String(r.bindMode) === 'auto' ? 'badge-brand' : 'badge-neutral'), render: r => (String(r.bindMode) === 'auto' ? '自动' : '人工') },
         { prop: 'status', label: '状态', badge: r => statusCls(r.status), render: r => statusLabel(r.status) }
       ];
+    case 'dept':
+      return [
+        { prop: 'deptName', label: '院系名称', link: true },
+        { prop: 'deptId', label: '编号', align: 'center' },
+        { prop: 'parentName', label: '上级院系' },
+        { prop: 'status', label: '状态', badge: r => statusCls(r.status), render: r => statusLabel(r.status) }
+      ];
     case 'major':
       return [
-        { prop: 'name', label: '专业名称' },
+        { prop: 'name', label: '专业名称', link: true },
         { prop: 'majorCode', label: '专业编码' },
-        { prop: 'sortNo', label: '排序号' },
+        { prop: 'sortNo', label: '排序号', align: 'right' },
         { prop: 'status', label: '状态', badge: r => statusCls(r.status), render: r => statusLabel(r.status) }
       ];
     case 'clazz':
       return [
-        { prop: 'clazzName', label: '班级名称' },
+        { prop: 'clazzName', label: '班级名称', link: true },
         { prop: 'clazzCode', label: '班级编码' },
         { prop: 'majorName', label: '所属专业' },
-        { prop: 'gradeYear', label: '年级' },
-        { prop: 'studentCount', label: '学生数' },
+        { prop: 'gradeYear', label: '年级', align: 'right' },
+        { prop: 'studentCount', label: '学生数', align: 'right' },
         { prop: 'status', label: '状态', badge: r => statusCls(r.status), render: r => statusLabel(r.status) }
       ];
     case 'term':
       return [
-        { prop: 'name', label: '学期名称' },
+        { prop: 'name', label: '学期名称', link: true },
         { prop: 'code', label: '学期编码' },
         { prop: 'startDate', label: '开始日期' },
         { prop: 'endDate', label: '结束日期' },
-        { prop: 'isCurrent', label: '当前学期', render: r => (Number(r.isCurrent) === 1 ? '是' : '否') },
+        { prop: 'isCurrent', label: '当前学期', align: 'center', render: r => (Number(r.isCurrent) === 1 ? '是' : '否') },
         { prop: 'status', label: '状态', badge: r => statusCls(r.status), render: r => statusLabel(r.status) }
       ];
     case 'room':
       return [
-        { prop: 'name', label: '教室名称' },
+        { prop: 'name', label: '教室名称', link: true },
         { prop: 'code', label: '教室编码' },
         { prop: 'roomType', label: '类型', render: r => (String(r.roomType) === 'virtual' ? '虚拟教室' : '物理教室') },
-        { prop: 'capacity', label: '容纳人数' },
+        { prop: 'capacity', label: '容纳人数', align: 'right' },
         { prop: 'location', label: '位置' },
         { prop: 'status', label: '状态', badge: r => statusCls(r.status), render: r => statusLabel(r.status) }
       ];
     case 'teacher':
       return [
         { prop: 'username', label: '登录账号' },
-        { prop: 'nickName', label: '姓名' },
+        { prop: 'nickName', label: '姓名', link: true },
         { prop: 'email', label: '邮箱' },
         { prop: 'deptName', label: '所属院系' },
         { prop: 'createTime', label: '创建时间' }
@@ -325,7 +402,7 @@ const columns = computed<Col[]>(() => {
     case 'student':
       return [
         { prop: 'username', label: '登录账号' },
-        { prop: 'nickName', label: '姓名' },
+        { prop: 'nickName', label: '姓名', link: true },
         { prop: 'email', label: '邮箱' },
         { prop: 'deptName', label: '所属院系' },
         { prop: 'createTime', label: '创建时间' }
@@ -334,12 +411,83 @@ const columns = computed<Col[]>(() => {
       return [];
   }
 });
+
+/* ---------------- A4 列设置（显隐记忆，名称列锁定显示） ---------------- */
+const COLS_STORE_KEY = 'zk_basicdata_columns';
+const hiddenCols = ref<Record<string, string[]>>(readColsStore());
+
+function readColsStore(): Record<string, string[]> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(COLS_STORE_KEY) ?? '{}');
+    return typeof raw === 'object' && raw ? raw : {};
+  } catch {
+    return {};
+  }
+}
+function persistCols() {
+  localStorage.setItem(COLS_STORE_KEY, JSON.stringify(hiddenCols.value));
+}
+const visibleColumns = computed(() => {
+  const hidden = hiddenCols.value[active.value] ?? [];
+  return columns.value.filter(c => c.link || !hidden.includes(c.prop));
+});
+function toggleCol(prop: string, show: boolean) {
+  const cur = hiddenCols.value[active.value] ?? [];
+  const next = show ? cur.filter(p => p !== prop) : [...cur, prop];
+  hiddenCols.value = { ...hiddenCols.value, [active.value]: next };
+  persistCols();
+}
+function resetCols() {
+  hiddenCols.value = { ...hiddenCols.value, [active.value]: [] };
+  persistCols();
+}
+
+/* ---------------- A2 详情抽屉（只读，复用列定义取值） ---------------- */
+const detailVisible = ref(false);
+const detailRow = ref<Record<string, unknown> | null>(null);
+const detailTitle = ref('');
+function openDetail(row: Record<string, unknown>) {
+  detailRow.value = row;
+  const nameCol = columns.value.find(c => c.link);
+  detailTitle.value = nameCol ? String(nameCol.render?.(row) ?? row[nameCol.prop] ?? '') : '详情';
+  detailVisible.value = true;
+}
+
+/* ---------------- A3 本地 CSV 导出（当前 tab + 关键词，最多 1000 行） ---------------- */
+const exporting = ref(false);
+function csvCell(v: unknown): string {
+  const s = String(v ?? '');
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+async function exportCsv() {
+  exporting.value = true;
+  try {
+    const r = await fetchTab(active.value, { ...query, page: 1, pageSize: 1000 });
+    const cols = columns.value;
+    const head = cols.map(c => csvCell(c.label)).join(',');
+    const body = r.list.map(row => cols.map(c => csvCell(c.render ? c.render(row) : (row[c.prop] ?? ''))).join(','));
+    const csv = '\uFEFF' + [head, ...body].join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const tabLabel = TABS.find(t => t.key === active.value)?.label ?? active.value;
+    a.download = `基础数据-${tabLabel}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    ElMessage.success(`已导出 ${r.list.length} 条（关键词「${query.keyword || '全部'}」，上限 1000）`);
+  } finally {
+    exporting.value = false;
+  }
+}
 </script>
 
 <template>
   <div class="page-head">
     <h1>基础数据</h1>
     <div class="actions">
+      <el-button v-if="!READ_ONLY_TABS[active]" text :loading="exporting" @click="exportCsv">
+        <ZkIcon name="download" :size="15" style="margin-right: 4px" />导出 CSV
+      </el-button>
       <el-button v-if="canCrud" type="primary" @click="openCreate">
         <ZkIcon name="plus" :size="15" style="margin-right: 4px" />新增
       </el-button>
@@ -357,39 +505,51 @@ const columns = computed<Col[]>(() => {
         >{{ t.label }}</span
       >
     </span>
-    <div class="right" v-if="!isGap">
+    <div class="right">
       <el-input v-model="query.keyword" placeholder="关键词" clearable style="width: 180px" @keyup.enter="onSearch" @clear="onSearch" />
       <el-button text @click="onSearch">查询</el-button>
       <el-button text @click="resetQuery">重置</el-button>
+      <!-- A4 列设置：名称列锁定显示，其余列显隐记忆到 localStorage -->
+      <el-popover placement="bottom-end" :width="200" trigger="click">
+        <template #reference>
+          <el-button text circle title="列设置"><ZkIcon name="settings" :size="16" /></el-button>
+        </template>
+        <div class="col-set">
+          <div class="small muted" style="margin-bottom: 6px">显示列（名称列固定显示）</div>
+          <el-checkbox
+            v-for="c in columns"
+            :key="c.prop"
+            :model-value="c.link || !(hiddenCols[active] ?? []).includes(c.prop)"
+            :disabled="c.link"
+            @change="(v: any) => toggleCol(c.prop, Boolean(v))"
+            >{{ c.label }}</el-checkbox
+          >
+          <div style="margin-top: 8px; text-align: right">
+            <el-button text size="small" @click="resetCols">恢复默认</el-button>
+          </div>
+        </div>
+      </el-popover>
     </div>
   </div>
 
-  <!-- 旧运行包警示：主键被 JSON.parse 截断，写路径不可用（能力检测，换包后自动消失） -->
-  <div v-if="idsCorrupted" class="ids-warn">
+  <!-- B1 只读提示（院系） / 旧运行包警示：主键被 JSON.parse 截断，写路径不可用（能力检测，换包后自动消失） -->
+  <div v-if="READ_ONLY_TABS[active]" class="ids-warn">{{ READ_ONLY_TABS[active] }}</div>
+  <div v-else-if="idsCorrupted" class="ids-warn">
     <strong>编辑 / 删除暂不可用：</strong>当前运行包（10-26）返回的 19 位主键已被截断，直接操作会定位到错误记录。需发布线换新包（10-28 之后的构建）后自动恢复，列表查看不受影响。
   </div>
 
-  <!-- 缺口 tab -->
-  <div v-if="isGap" class="card card-pad">
-    <div class="center" style="padding: 30px 0">
-      <div class="icon-box lg" style="margin: 0 auto 12px"><ZkIcon name="database" :size="26" /></div>
-      <div class="card-title" style="margin-bottom: 6px">{{ GAP_TABS[active] }} · 后端未提供接口</div>
-      <div class="muted small">
-        当前接口清单（/v3/api-docs）里没有{{ GAP_TABS[active] }}的增删改查端点，按缺口处理，不接假数据。
-      </div>
-      <div class="muted small mt8">已有的基础数据端点：学校 / 专业 / 班级 / 学期 / 教室（教室随 C-21 于 2026-10-15 补齐）。</div>
-    </div>
-  </div>
-
-  <div v-else class="card">
-    <el-table v-loading="loading" :data="rows" style="width: 100%">
-      <el-table-column v-for="c in columns" :key="c.prop" :label="c.label" :prop="c.prop" min-width="130">
+  <div class="card">
+    <el-table v-loading="loading" :data="rows" style="width: 100%" max-height="calc(100vh - 360px)">
+      <!-- A1 序号列 + A5 首列冻结 -->
+      <el-table-column type="index" label="#" width="56" align="center" fixed="left" />
+      <el-table-column v-for="c in visibleColumns" :key="c.prop" :label="c.label" :prop="c.prop" min-width="130" :align="c.align" :fixed="c.link ? 'left' : undefined">
         <template #default="{ row }">
           <span v-if="c.badge" class="badge" :class="c.badge(row)">{{ c.render ? c.render(row) : row[c.prop] }}</span>
+          <a v-else-if="c.link" class="name-link" href="javascript:void(0)" @click="openDetail(row)">{{ c.render ? c.render(row) : (row[c.prop] ?? '—') }}</a>
           <span v-else>{{ c.render ? c.render(row) : (row[c.prop] ?? '—') }}</span>
         </template>
       </el-table-column>
-      <el-table-column v-if="canCrud" label="操作" width="150" align="right">
+      <el-table-column v-if="canCrud" label="操作" width="150" align="right" fixed="right">
         <template #default="{ row }">
           <el-button text size="small" :disabled="idsCorrupted" @click="openEdit(row)">编辑</el-button>
           <el-button text size="small" style="color: var(--error)" :disabled="idsCorrupted" @click="doDelete(row)">删除</el-button>
@@ -397,7 +557,12 @@ const columns = computed<Col[]>(() => {
       </el-table-column>
       <template #empty>
         <div class="muted small" style="padding: 18px 0">
-          {{ active === 'teacher' || active === 'student' ? '暂无数据（数据源＝账号接口按角色过滤）' : '暂无数据' }}
+          <template v-if="active === 'teacher' || active === 'student'">暂无数据（数据源＝账号接口按角色过滤）</template>
+          <template v-else-if="query.keyword">没有匹配「{{ query.keyword }}」的记录</template>
+          <template v-else>
+            暂无数据
+            <el-button v-if="canCrud" text type="primary" size="small" @click="openCreate">去新增</el-button>
+          </template>
         </div>
       </template>
     </el-table>
@@ -406,6 +571,7 @@ const columns = computed<Col[]>(() => {
       <span class="small muted">
         共 {{ total }} 条记录
         <span v-if="active === 'teacher' || active === 'student'">（数据来自账号接口，按角色过滤）</span>
+        <span v-else-if="active === 'dept'">（数据来自若依组织架构）</span>
       </span>
       <el-pagination
         v-model:current-page="query.page"
@@ -417,6 +583,23 @@ const columns = computed<Col[]>(() => {
       />
     </div>
   </div>
+
+  <!-- A2 只读详情抽屉：字段取自当前 tab 的列定义（render 后的业务语言） -->
+  <el-drawer v-model="detailVisible" :title="detailTitle" size="420px">
+    <div v-if="detailRow" class="detail-list">
+      <div v-for="c in columns" :key="c.prop" class="detail-item">
+        <span class="detail-label">{{ c.label }}</span>
+        <span v-if="c.badge" class="badge" :class="c.badge(detailRow)">{{ c.render ? c.render(detailRow) : detailRow[c.prop] }}</span>
+        <span v-else>{{ c.render ? c.render(detailRow) : (detailRow[c.prop] ?? '—') }}</span>
+      </div>
+      <div v-if="detailRow.remark" class="detail-item">
+        <span class="detail-label">备注</span><span>{{ detailRow.remark }}</span>
+      </div>
+      <div v-if="detailRow.createTime" class="detail-item">
+        <span class="detail-label">创建时间</span><span>{{ detailRow.createTime }}</span>
+      </div>
+    </div>
+  </el-drawer>
 
   <el-dialog v-model="formVisible" :title="formMode === 'create' ? '新增' : '编辑'" width="440px">
     <el-form label-width="88px" label-position="left">
@@ -469,7 +652,7 @@ const columns = computed<Col[]>(() => {
   flex-wrap: wrap;
 }
 
-/* 旧包警示条：与缺口 tab 的呈现同级，用 warning 文字专用深阶保证 AA */
+/* 旧包警示条 / 院系只读提示：用 warning 文字专用深阶保证 AA */
 .ids-warn {
   border: 1px solid var(--warning);
   background: var(--warning-soft);
@@ -478,5 +661,43 @@ const columns = computed<Col[]>(() => {
   padding: 10px 16px;
   font-size: 13px;
   margin-bottom: 16px;
+}
+
+/* A2 名称链接：主色加深一档保证白底对比度，hover 出下划线 */
+.name-link {
+  color: var(--brand-700);
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+}
+.name-link:hover {
+  text-decoration: underline;
+}
+
+/* 详情抽屉键值对 */
+.detail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.detail-item {
+  display: flex;
+  gap: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.detail-label {
+  flex: 0 0 76px;
+  color: var(--ink-500);
+}
+.detail-item > span:last-child {
+  color: var(--ink-900);
+  word-break: break-all;
+}
+
+/* 列设置弹层 */
+.col-set {
+  display: flex;
+  flex-direction: column;
 }
 </style>
