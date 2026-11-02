@@ -85,7 +85,7 @@ const DEPT_STATUS_OPTIONS = [
  * school 保持服务端分页（用户明确不加筛选）；teacher/student 账号量级小（实测 12 条）也并入本地。 */
 const FILTER_TABS: TabKey[] = ['dept', 'major', 'clazz', 'term', 'room', 'teacher', 'student'];
 
-type FilterDef = { prop: string; label: string; optionsKey?: 'majors' | 'schools' | 'depts'; options?: { value: string; label: string }[] };
+type FilterDef = { prop: string; label: string; optionsKey?: 'majors' | 'schools' | 'depts' | 'clazzes'; options?: { value: string; label: string }[] };
 const FILTER_FIELDS: Partial<Record<TabKey, FilterDef[]>> = {
   dept: [
     { prop: 'schoolId', label: '学校', optionsKey: 'schools' },
@@ -130,6 +130,9 @@ const FILTER_FIELDS: Partial<Record<TabKey, FilterDef[]>> = {
 };
 
 const gradeOptions = ref<{ value: string; label: string }[]>([]);
+/** 学生归属字段（D2 biz_user_ext：majorId/clazzId/className）是否已由运行包透出——
+ *  旧包无这些字段，筛选项/班级列按探测决定，避免「下拉在但一筛就空」 */
+const extFieldsReady = ref(false);
 /** 每个 tab 独立记忆筛选（切 tab 不清，回来还在；会话级，不落 localStorage） */
 const filters = reactive<Partial<Record<TabKey, Record<string, string>>>>({});
 
@@ -146,7 +149,18 @@ function clearFilters() {
   fetchList();
 }
 
-const activeFilterDefs = computed<FilterDef[]>(() => FILTER_FIELDS[active.value] ?? []);
+/** 学生归属扩展筛选（D2 biz_user_ext 透出后启用）；独立常量避免数组字面量类型加宽 */
+const STUDENT_EXT_FILTERS: FilterDef[] = [
+  { prop: 'majorId', label: '所属专业', optionsKey: 'majors' },
+  { prop: 'clazzId', label: '所属班级', optionsKey: 'clazzes' }
+];
+
+const activeFilterDefs = computed<FilterDef[]>(() => {
+  const base = FILTER_FIELDS[active.value] ?? [];
+  // 学生的专业/班级筛选依赖 D2 归属字段透出（能力探测），旧包不显示
+  if (active.value === 'student' && extFieldsReady.value) return [...base, ...STUDENT_EXT_FILTERS];
+  return base;
+});
 const filterOptions = (d: FilterDef) => d.options ?? (d.optionsKey ? dynamicOptions(d.optionsKey) : []);
 const activeChips = computed(() =>
   activeFilterDefs.value
@@ -182,10 +196,15 @@ async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<
   }
   if (tab === 'teacher' || tab === 'student') {
     // 教师 / 学生复用账号接口按角色过滤。账号量级小（实测 12 条）⇒ 与五域同口径拉全量，
-    // 筛选/关键词/分页全本地（UserQueryBo 虽有 status/deptId 服务端参数，但学校筛选无对应
-    // 参数且 VO 的 schoolId 现库全空——混两套口径不如统一本地，数据涨到千级再切服务端）。
+    // 筛选/关键词/分页全本地（UserQueryBo 新包已加 schoolId/majorId/clazzId 参数，
+    // 但本地过滤口径已统一，数据涨到千级再切服务端）。出参带 clazzId ⇒ D2 归属字段就绪。
     const r = await listUsers({ page: 1, pageSize: 1000, roleKey: tab });
     const list = asRows(r?.list);
+    extFieldsReady.value = list.some(u => 'clazzId' in u);
+    if (extFieldsReady.value) {
+      OPTION_LOADERS.majors();
+      OPTION_LOADERS.clazzes();
+    }
     return { list, total: list.length };
   }
   // dept：若依原生院系树。行里**保留原生全字段**（parentId/orderNum/leader/phone/email），
@@ -195,16 +214,26 @@ async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<
   if (!res.ok) return { list: [], total: 0 };
   const all = res.list.filter(d => d.delFlag !== '2');
   const nameById = new Map(all.map(d => [String(d.deptId), d.deptName]));
-  // 学校归属推导（D1 纯数据方案，零后端依赖）：学校 = dept 树顶级节点且名称与 school 表精确同名。
-  // 行的归属 = ancestors 链上第一个非 0 节点（顶级）的归属；顶级自己匹配上则归属自身。
-  // ⚠️ 脆弱点：dept 改名与 school 表不同步会断链——后端将来给 sys_dept 加 school_id 字段后换掉此推导。
+  // 学校归属推导：行的归属 = ancestors 链顶级节点。
+  // 权威口径（D1 已落地 be-admin 8e3f933）：school.dept_root_id 关联 dept 树根，
+  // 出参带 deptRootId 时按 id 匹配；旧包无该字段则按「顶级节点名称=school 名称」回退
+  // （名称匹配脆弱：dept 改名与 school 表不同步会断链，仅作旧包过渡）。
   await OPTION_LOADERS.schools();
-  const schoolIdByName = new Map(schoolOptions.value.map(o => [o.label, o.value]));
+  const schoolRows = asRows((await listSchools({ page: 1, pageSize: 500 }))?.list);
+  const schoolIdByRoot = new Map<string, { id: string; name: string }>();
+  const schoolIdByName = new Map<string, { id: string; name: string }>();
+  for (const sc of schoolRows) {
+    const entry = { id: String(sc.schoolId), name: String(sc.name ?? '') };
+    if (sc.deptRootId !== undefined && sc.deptRootId !== null) schoolIdByRoot.set(String(sc.deptRootId), entry);
+    schoolIdByName.set(entry.name, entry);
+  }
   const deriveSchool = (d: { deptId: unknown; ancestors?: string; deptName: string }) => {
     const topId = (d.ancestors ?? '').split(',').filter(x => x !== '0')[0] ?? String(d.deptId);
+    const byRoot = schoolIdByRoot.get(topId);
+    if (byRoot) return { schoolId: byRoot.id, schoolName: byRoot.name };
     const topName = topId === String(d.deptId) ? d.deptName : nameById.get(topId);
-    const sid = topName ? schoolIdByName.get(topName) : undefined;
-    return { schoolId: sid ?? '0', schoolName: sid ? topName : '' };
+    const byName = topName ? schoolIdByName.get(topName) : undefined;
+    return byName ? { schoolId: byName.id, schoolName: byName.name } : { schoolId: '0', schoolName: '' };
   };
   const flat = all.map(d => ({
     ...d,
@@ -333,6 +362,7 @@ const form = reactive<Record<string, unknown>>({});
 const majorOptions = ref<{ value: string; label: string }[]>([]);
 const schoolOptions = ref<{ value: string; label: string }[]>([]);
 const deptOptions = ref<{ value: string; label: string }[]>([]);
+const clazzOptions = ref<{ value: string; label: string }[]>([]);
 const OPTION_LOADERS: Record<string, () => Promise<void>> = {
   depts: async () => {
     if (deptOptions.value.length) return;
@@ -348,6 +378,11 @@ const OPTION_LOADERS: Record<string, () => Promise<void>> = {
     if (schoolOptions.value.length) return;
     const r = await listSchools({ page: 1, pageSize: 500 });
     schoolOptions.value = asRows(r?.list).map(s => ({ value: String(s.schoolId), label: String(s.name ?? s.schoolId) }));
+  },
+  clazzes: async () => {
+    if (clazzOptions.value.length) return;
+    const r = await listClasses({ page: 1, pageSize: 500 });
+    clazzOptions.value = asRows(r?.list).map(c => ({ value: String(c.clazzId), label: String(c.clazzName ?? c.clazzId) }));
   }
 };
 
@@ -357,7 +392,7 @@ type FormField = {
   type?: 'select' | 'date' | 'number';
   options?: { value: string; label: string }[];
   /** 动态下拉：渲染时从 OPTION_LOADERS 缓存取，避免 FORM_FIELDS 里写死数据 */
-  optionsKey?: 'majors' | 'schools' | 'depts';
+  optionsKey?: 'majors' | 'schools' | 'depts' | 'clazzes';
 };
 
 const FORM_FIELDS: Record<string, FormField[]> = {
@@ -426,8 +461,11 @@ const currentFields = computed(() =>
     return { ...f, options };
   })
 );
-const dynamicOptions = (key: 'majors' | 'schools' | 'depts') =>
-  key === 'majors' ? majorOptions.value : key === 'schools' ? schoolOptions.value : deptOptions.value;
+const dynamicOptions = (key: 'majors' | 'schools' | 'depts' | 'clazzes') =>
+  key === 'majors' ? majorOptions.value
+  : key === 'schools' ? schoolOptions.value
+  : key === 'depts' ? deptOptions.value
+  : clazzOptions.value;
 
 async function openCreate() {
   // 关联下拉数据先备齐再开弹窗，避免弹窗里下拉是空的
@@ -642,6 +680,8 @@ const columns = computed<Col[]>(() => {
         { prop: 'nickName', label: '姓名', link: true },
         { prop: 'email', label: '邮箱' },
         { prop: 'deptName', label: '所属院系' },
+        // D2 归属：className 由 biz_user_ext 透出（新包），旧包无字段显示 —
+        { prop: 'className', label: '所属班级', render: r => (r.className ? String(r.className) : '—') },
         { prop: 'schoolName', label: '所属学校', render: r => (r.schoolName ? String(r.schoolName) : '—') },
         { prop: 'createTime', label: '创建时间' }
       ];
