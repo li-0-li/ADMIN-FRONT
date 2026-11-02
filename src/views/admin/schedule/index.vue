@@ -4172,7 +4172,32 @@ watch(
         <span class="detail-k">隔周</span>
         <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">{{ poolParitySummary }}</div>
       </div>
-      <p class="small muted" style="margin: 10px 0 0">在教师空闲时段里挑最优格（同班级分天、五天拉平、同人连着上），教室按容量最贴自动配，排不进的最后统一报告。</p>
+      <!-- 排课规则说明（2026-11-02 重写）：原一句「在教师空闲时段里挑最优格（同班级分天、五天拉平、
+           同人连着上），教室按容量最贴自动配，排不进的最后统一报告」看不出对错——候选其实是 25 格全枚举
+           （不是「教师空闲时段」，教室也不是硬约束），且六个目标的力度完全没交代。这里的数字全部绑定
+           AUTO_W / AUTO_RESTARTS / AUTO_FAIL_PENALTY，改权重时文案自动同步，不会再与实现脱节。 -->
+      <p class="small" style="margin: 12px 0 4px">
+        <b>怎么排</b><span class="muted">（全程在本地内存算，一条都不写库）</span>
+      </p>
+      <ul class="small muted" style="margin: 0; padding-left: 18px; line-height: 1.85">
+        <li>
+          <b>排序</b>：每落位一门就重算剩余课「教师与班级同时空的格数」，最少的先排——选择少的先占位，否则会被宽松的课挤死。
+        </li>
+        <li>
+          <b>选格</b>：周一~周五 × 第 1~5 节共 <b>25 格</b>；教师或班级在该时刻已有课的格直接排除，其余逐格打分取最低分——同班同天每节
+          +{{ AUTO_W.sameClassDay }}；当天全校已排每节 +{{ AUTO_W.dayLoad }}；与该教师当天最近一节课相距的节数
+          ×{{ AUTO_W.teacherGap }}；配不到教室 +{{ AUTO_W.noRoom }}；教室空座每个 ×{{ AUTO_W.roomSlack }}；节次号
+          ×{{ AUTO_W.period }}（只在前面全部打平时起作用）。
+        </li>
+        <li>
+          <b>教室</b>：在「该格空着且容量 ≥ 选课人数」的教室里取<b>容量最小</b>的一间；没有合适的就留空照排，报告里标「无教室」。
+        </li>
+        <li>
+          <b>排不进</b>：先腾挪——把一门已排课挪到次优格让位（预览会写明为哪门课让位）；仍无解的整批列进「排不进」，并区分教师已满 /
+          班级已满 / 两者各自有空但无共同空档。整套方案跑 {{ AUTO_RESTARTS }} 遍取罚分最低，每门排不进扣
+          {{ AUTO_FAIL_PENALTY.toLocaleString() }} 分，所以「少一门失败」永远优先于「格子更漂亮」。
+        </li>
+      </ul>
       <!-- 班级（2026-10-22 丙）：课程接口不出班级字段，不选就排成"未填班级"的课次（按班级筛选看不到） -->
       <div class="detail-row">
         <span class="detail-k">班级</span>
