@@ -82,8 +82,8 @@ const DEPT_STATUS_OPTIONS = [
 /* ---------------- 筛选（用户 11-02 拍板：前端全量本地过滤 + 下拉 + chips） ----------------
  * 后端 BasicDataQueryBo 只认 keyword，状态/关联筛选要等 B2 ⇒ 各域量级实测个位数~几十条，
  * 进 tab 拉一次全量（pageSize=1000）在本地过滤，分页也本地切。数据涨到千级再切服务端。
- * school 保持服务端分页（用户明确不加筛选）；teacher/student 是账号接口（量大），同样不开放。 */
-const FILTER_TABS: TabKey[] = ['dept', 'major', 'clazz', 'term', 'room'];
+ * school 保持服务端分页（用户明确不加筛选）；teacher/student 账号量级小（实测 12 条）也并入本地。 */
+const FILTER_TABS: TabKey[] = ['dept', 'major', 'clazz', 'term', 'room', 'teacher', 'student'];
 
 type FilterDef = { prop: string; label: string; optionsKey?: 'majors' | 'schools' | 'depts'; options?: { value: string; label: string }[] };
 const FILTER_FIELDS: Partial<Record<TabKey, FilterDef[]>> = {
@@ -106,6 +106,17 @@ const FILTER_FIELDS: Partial<Record<TabKey, FilterDef[]>> = {
   room: [
     { prop: 'schoolId', label: '学校', optionsKey: 'schools' },
     { prop: 'status', label: '状态', options: STATUS_OPTIONS }
+  ],
+  // 教师/学生：所属院系 + 状态（账号状态是若依口径 0/1）。
+  // 不放「学校」筛选：AdminUserVo 虽有 schoolId 字段但现库全为 null（账号建档未挂学校），
+  // 加了必现「一选就空」，等账号创建链路带学校后放开。
+  teacher: [
+    { prop: 'deptId', label: '所属院系', optionsKey: 'depts' },
+    { prop: 'status', label: '状态', options: DEPT_STATUS_OPTIONS }
+  ],
+  student: [
+    { prop: 'deptId', label: '所属院系', optionsKey: 'depts' },
+    { prop: 'status', label: '状态', options: DEPT_STATUS_OPTIONS }
   ]
 };
 
@@ -161,9 +172,12 @@ async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<
     return { list, total: list.length };
   }
   if (tab === 'teacher' || tab === 'student') {
-    // 教师 / 学生复用账号接口，按角色键过滤（量大，保持服务端分页，不开放本地筛选）
-    const r = await listUsers({ page: q.page, pageSize: q.pageSize, keyword: q.keyword, roleKey: tab });
-    return { list: asRows(r?.list), total: r?.total ?? 0 };
+    // 教师 / 学生复用账号接口按角色过滤。账号量级小（实测 12 条）⇒ 与五域同口径拉全量，
+    // 筛选/关键词/分页全本地（UserQueryBo 虽有 status/deptId 服务端参数，但学校筛选无对应
+    // 参数且 VO 的 schoolId 现库全空——混两套口径不如统一本地，数据涨到千级再切服务端）。
+    const r = await listUsers({ page: 1, pageSize: 1000, roleKey: tab });
+    const list = asRows(r?.list);
+    return { list, total: list.length };
   }
   // dept：若依原生院系树。行里**保留原生全字段**（parentId/orderNum/leader/phone/email），
   // 编辑回显与保存都要用；parentName 只是展示用的派生列。
@@ -188,7 +202,7 @@ function applyLocalFilters(list: Record<string, unknown>[]): Record<string, unkn
   const f = filters[active.value] ?? {};
   return list.filter(row => {
     if (kw) {
-      const hay = [row.name, row.deptName, row.clazzName, row.code, row.clazzCode, row.majorCode].filter(Boolean).join(' ');
+      const hay = [row.name, row.username, row.nickName, row.userNo, row.deptName, row.clazzName, row.code, row.clazzCode, row.majorCode].filter(Boolean).join(' ');
       if (!hay.includes(kw)) return false;
     }
     for (const [k, v] of Object.entries(f)) {
@@ -736,7 +750,7 @@ async function exportCsv() {
     </div>
   </div>
 
-  <!-- 筛选条（FILTER_TABS 前端本地过滤；school/教师/学生不开放。改任意下拉即查询并回第一页） -->
+  <!-- 筛选条（FILTER_TABS 前端本地过滤；仅 school 不开放。改任意下拉即查询并回第一页） -->
   <div v-if="activeFilterDefs.length" class="filter-bar">
     <span class="small muted">筛选</span>
     <el-select
@@ -797,8 +811,10 @@ async function exportCsv() {
       </el-table-column>
       <template #empty>
         <div class="muted small" style="padding: 18px 0">
-          <template v-if="active === 'teacher' || active === 'student'">暂无数据（数据源＝账号接口按角色过滤）</template>
-          <template v-else-if="query.keyword || hasActiveFilters">没有匹配当前{{ query.keyword ? '关键词' : '筛选条件' }}的记录</template>
+          <!-- 空态优先级：有筛选/关键词时先说「没匹配」（0 行是筛出来的，说「暂无数据」会误导），
+               无条件 0 行才落到各 tab 的数据源说明 -->
+          <template v-if="query.keyword || hasActiveFilters">没有匹配当前{{ query.keyword ? '关键词' : '筛选条件' }}的记录</template>
+          <template v-else-if="active === 'teacher' || active === 'student'">暂无数据（数据源＝账号接口按角色过滤）</template>
           <template v-else>
             暂无数据
             <el-button v-if="canCrud" text type="primary" size="small" @click="openCreate">去新增</el-button>
