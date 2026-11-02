@@ -106,17 +106,27 @@ async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<
     const r = await listUsers({ page: q.page, pageSize: q.pageSize, keyword: q.keyword, roleKey: tab });
     return { list: asRows(r?.list), total: r?.total ?? 0 };
   }
-  // dept：若依原生院系树，拍平成行。行里**保留原生全字段**（parentId/orderNum/leader/phone/email），
-  // 编辑回显与保存都要用；parentName 只是展示用的派生列。关键词本地过滤（院系量级百以内）。
+  // dept：若依原生院系树。行里**保留原生全字段**（parentId/orderNum/leader/phone/email），
+  // 编辑回显与保存都要用；parentName 只是展示用的派生列。
+  // 无关键词 → 按 parentId 组树（el-table tree-props 展示组织架构层级）；
+  // 有关键词 → 拍平只留命中行（树形下命中行的父级未必命中，拍平更直观）。
   const res = await listDeptTree();
   if (!res.ok) return { list: [], total: 0 };
   const all = res.list.filter(d => d.delFlag !== '2');
   const nameById = new Map(all.map(d => [String(d.deptId), d.deptName]));
   const kw = (q.keyword ?? '').trim();
   const flat = all
-    .map(d => ({ ...d, deptId: String(d.deptId), parentName: nameById.get(String(d.parentId ?? '')) ?? '—' }))
+    .map(d => ({ ...d, deptId: String(d.deptId), parentName: nameById.get(String(d.parentId ?? '')) ?? '—', children: [] as Record<string, unknown>[] }))
     .filter(d => !kw || d.deptName.includes(kw));
-  return { list: flat, total: flat.length };
+  if (kw) return { list: flat, total: flat.length };
+  const byId = new Map(flat.map(d => [d.deptId, d]));
+  const roots: Record<string, unknown>[] = [];
+  flat.forEach(d => {
+    const parent = byId.get(String(d.parentId ?? ''));
+    if (parent && parent !== d) parent.children!.push(d);
+    else roots.push(d);
+  });
+  return { list: roots, total: flat.length };
 }
 
 async function fetchList() {
@@ -125,14 +135,9 @@ async function fetchList() {
     const q: BasicDataQuery = { ...query };
     const r = await fetchTab(active.value, q);
     // 院系是无分页本地过滤：整表给表格；其余域直接用后端分页结果
-    if (active.value === 'dept') {
-      const start = ((q.page ?? 1) - 1) * (q.pageSize ?? 10);
-      rows.value = r.list.slice(start, start + (q.pageSize ?? 10));
-      total.value = r.total;
-    } else {
-      rows.value = r.list;
-      total.value = r.total;
-    }
+    // 院系走树形全量展示（关键词过滤时也是拍平全量），不分页
+    rows.value = r.list;
+    total.value = r.total;
   } finally {
     loading.value = false;
   }
@@ -236,6 +241,9 @@ const FORM_FIELDS: Record<string, FormField[]> = {
   major: [
     { prop: 'name', label: '专业名称' },
     { prop: 'majorCode', label: '专业编码' },
+    // 后端 createMajor 硬校验 deptId 必填（「所属院系不能为空」）——2026-11-02 探针实测发现，
+    // 上轮补班级关联字段时漏了专业这个必填项
+    { prop: 'deptId', label: '所属院系', type: 'select', optionsKey: 'depts' },
     { prop: 'sortNo', label: '排序号', type: 'number' },
     { prop: 'status', label: '状态', type: 'select', options: STATUS_OPTIONS }
   ],
@@ -331,6 +339,61 @@ async function submitForm() {
   } finally {
     saving.value = false;
   }
+}
+
+/* ---------------- 批量删除（前端循环版：B3 端点未落地前的替代，量级小够用） ---------------- */
+const tableRef = ref<{ clearSelection: () => void } | null>(null);
+const selectionRows = ref<Record<string, unknown>[]>([]);
+function onSelectionChange(rows: Record<string, unknown>[]) {
+  // dept 树形域无 selection 列（级联风险，见模板注释）；这里兜底防串台
+  selectionRows.value = active.value === 'dept' ? [] : rows;
+}
+
+/** 逐条循环删除：串行而不是并行——单条失败要能继续走完并给完整清单 */
+async function doBatchDelete() {
+  const n = selectionRows.value.length;
+  if (!n) return;
+  await ElMessageBox.confirm(
+    `确定要删除所选的 ${n} 条记录吗？基础数据删除为软删；个别记录可能因存在引用（如院系下仍有用户）而失败，失败项会跳过并在结果里说明。`,
+    '批量删除',
+    { type: 'warning', confirmButtonText: '全部删除' }
+  );
+  let ok = 0;
+  const fails: string[] = [];
+  for (const row of selectionRows.value) {
+    const rawId = row[CRUD_ID_KEYS[active.value]];
+    const id =
+      typeof rawId === 'string' && rawId ? rawId
+      : typeof rawId === 'number' && Number.isSafeInteger(rawId) ? String(rawId)
+      : null;
+    if (!id) {
+      fails.push(`${String(row.name ?? row.deptName ?? row.clazzName ?? '未知')}: 主键缺失（${idsCorrupted.value ? '运行包过旧' : '数据异常'}）`);
+      continue;
+    }
+    const name = String(row.name ?? row.deptName ?? row.clazzName ?? row.code ?? id);
+    try {
+      if (active.value === 'school') await deleteSchool(id);
+      else if (active.value === 'dept') await deleteDept(id);
+      else if (active.value === 'major') await deleteMajor(id);
+      else if (active.value === 'clazz') await deleteClazz(id);
+      else if (active.value === 'term') await deleteTerm(id);
+      else if (active.value === 'room') await deleteClassroom(id);
+      ok++;
+    } catch (e) {
+      fails.push(`${name}: ${(e as Error)?.message?.slice(0, 60) ?? '删除失败'}`);
+    }
+  }
+  if (fails.length) {
+    ElMessageBox.alert(
+      `成功 ${ok} 条，失败 ${fails.length} 条：\n${fails.join('\n')}`.replace(/\n/g, '<br>'),
+      '批量删除结果',
+      { dangerouslyUseHTMLString: true, type: 'warning', confirmButtonText: '知道了' }
+    ).catch(() => {});
+  } else {
+    ElMessage.success(`已删除 ${ok} 条`);
+  }
+  tableRef.value?.clearSelection();
+  fetchList();
 }
 
 async function doDelete(row: Record<string, unknown>) {
@@ -517,6 +580,11 @@ async function exportCsv() {
       <el-button text :loading="exporting" @click="exportCsv">
         <ZkIcon name="download" :size="15" style="margin-right: 4px" />导出 CSV
       </el-button>
+      <!-- ⚠️ 院系不提供批量删除：el-table 树形勾选父行会级联勾选全部子孙（探针实测：点 1 行 → 选中整棵树
+           → 5 个叶子部门被连带软删）。树形域语义复杂且后端对「有下级/有用户」本就拒绝，批量无收益纯风险。 -->
+      <el-button v-if="canCrud && active !== 'dept' && selectionRows.length" style="color: var(--error)" @click="doBatchDelete">
+        <ZkIcon name="trash-2" :size="15" style="margin-right: 4px" />删除所选（{{ selectionRows.length }}）
+      </el-button>
       <el-button v-if="canCrud" type="primary" @click="openCreate">
         <ZkIcon name="plus" :size="15" style="margin-right: 4px" />新增
       </el-button>
@@ -567,8 +635,19 @@ async function exportCsv() {
   </div>
 
   <div class="card">
-    <el-table v-loading="loading" :data="rows" style="width: 100%" max-height="calc(100vh - 360px)">
-      <!-- A1 序号列 + A5 首列冻结 -->
+    <el-table
+      ref="tableRef"
+      v-loading="loading"
+      :data="rows"
+      style="width: 100%"
+      max-height="calc(100vh - 360px)"
+      :row-key="active === 'dept' ? 'deptId' : undefined"
+      :tree-props="active === 'dept' ? { children: 'children' } : undefined"
+      default-expand-all
+      @selection-change="onSelectionChange"
+    >
+      <!-- 批量删除选择列（A1 序号列 + A5 首列冻结） -->
+      <el-table-column v-if="canCrud && active !== 'dept'" type="selection" width="42" align="center" fixed="left" />
       <el-table-column type="index" label="#" width="56" align="center" fixed="left" />
       <el-table-column v-for="c in visibleColumns" :key="c.prop" :label="c.label" :prop="c.prop" min-width="130" :align="c.align" :fixed="c.link ? 'left' : undefined">
         <template #default="{ row }">
@@ -602,6 +681,7 @@ async function exportCsv() {
         <span v-else-if="active === 'dept'">（来自若依组织架构 sys_dept，删除前须先清空该院系下的用户）</span>
       </span>
       <el-pagination
+        v-if="active !== 'dept'"
         v-model:current-page="query.page"
         v-model:page-size="query.pageSize"
         :total="total"
