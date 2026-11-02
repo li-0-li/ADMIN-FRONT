@@ -100,7 +100,9 @@ async function fetchStatus(silent = false) {
   if (!silent) loading.value = true;
   try {
     const r = await getSystemStatus();
-    status.value = r && typeof r === 'object' ? r : null;
+    // 空对象 {} 归为 null：`!status` 判不住 truthy 空对象（实测缺陷——后端返回 {} 时
+    // 页面渲染成 4 张全「—」的卡，空态横幅永远不触发）。没有任何字段 = 没有状态。
+    status.value = r && typeof r === 'object' && Object.keys(r).length > 0 ? r : null;
     failed.value = false;
     failMsg.value = '';
     fetchedAt.value = clock(new Date());
@@ -678,7 +680,7 @@ const trendHint = computed(() => {
     </div>
 
     <!-- 空态：请求成功但没拿到任何字段（后端返回空对象 / null） -->
-    <div v-else-if="!status" class="card card-pad mt16">
+    <div v-else-if="!failed && !status" class="card card-pad mt16">
       <div class="center">
         <div class="icon-box lg gap-icon"><ZkIcon name="database" :size="26" /></div>
         <div class="card-title gap-title2">后端返回了空状态</div>
@@ -687,7 +689,8 @@ const trendHint = computed(() => {
       </div>
     </div>
 
-    <template v-else>
+    <!-- 数据区独立于失败横幅：failed + 有旧快照时两者并存（横幅文案「下方仍显示旧快照」才成立） -->
+    <template v-if="status">
       <!-- 核心指标 4 卡：随包能力切换（旧包=原型占位卡，新包=四面板真数据卡），见 statCards 注释 -->
       <div class="grid g4">
         <div v-for="card in statCards" :key="card.key" class="card stat">

@@ -14,7 +14,13 @@ import type { ErrorLogsVo, SystemStatusVo } from '@/views/admin/monitor/types';
  * `{code,message,data}` 外壳，这里拿到的直接就是内层对象。
  */
 export function getSystemStatus() {
-  return request<SystemStatusVo>({ url: '/api/v1/admin/system/status', method: 'get' });
+  return request<SystemStatusVo>({
+    url: '/api/v1/admin/system/status',
+    method: 'get',
+    // 页面自带失败横幅 + 旧快照保留。不带 silent 的话，后端一挂每 5 秒弹一次报错
+    // toast（实测确认过的缺陷），横幅与 toast 同文案重复轰炸——提示职责全在横幅
+    silent: true
+  });
 }
 
 /**
