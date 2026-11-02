@@ -660,28 +660,9 @@ const trendHint = computed(() => {
       </div>
     </div>
 
-    <!-- 数据源缺口：常驻，不是错误态。这块是本页「不假装成功」的证据 -->
-    <div class="card card-pad gap-note">
-      <div class="row gap-10">
-        <div class="icon-box"><ZkIcon name="info" :size="16" /></div>
-        <div>
-          <div class="card-title gap-title">数据源缺口（本页不编数据）</div>
-          <div class="small muted">
-            数据源 <code>GET /api/v1/admin/system/status</code> 现返回九项：JVM 内存、核数、在线账号数、
-            服务器时间、MySQL 探活、Redis 探活、<b>CPU 使用率、磁盘、连接池水位</b>，
-            外加独立端点 <code>GET /api/v1/admin/system/error-logs</code>（ERROR 日志尾部）与
-            运行时长（<code>uptimeMs</code>）。
-            若当前看到「—」，说明后端还在跑 10-30 之前的旧包，换包后本页自动点亮，无需改前端。
-          </div>
-          <div class="small muted mt8">
-            仍无数据源的三项，显示「—」而不是编一个数：<b>网络出口</b>（实训环境无此指标）、
-            <b>服务可用率（近 7 天）</b>（需历史采样存储）、<b>当前课堂列表</b>（课堂数据在「课堂巡查」页，
-            本页不重复接）。趋势图为<b>前端本地采样</b>（进页起每 5 秒 1 点），不是后端历史序列。
-            首屏 4 卡随包能力切换：旧包保留原型占位卡，新包换成磁盘 / 数据库连接真数据卡（业主 10-30 拍板）。
-          </div>
-        </div>
-      </div>
-    </div>
+    <!-- 数据源缺口说明卡已按业主 11-02 指令移除（原内容见 git 历史 9989fff:bump 前）。
+         「不编数据」的口径证据保留在 工作汇报/20261030-监控页-后端补丁单.md（答辩备查）；
+         页面上无数据的项仍显示「—」，语义区分（未提供/首次采样/取不到）在各区块文案内自明。 -->
 
     <!-- 失败态：整页唯一数据源挂了，除了提示还要给重试入口 -->
     <div v-if="failed" class="card card-pad mt16">
