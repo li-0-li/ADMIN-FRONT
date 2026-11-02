@@ -671,7 +671,10 @@ const trendHint = computed(() => {
             服务器时间、MySQL 探活、Redis 探活、<b>CPU 使用率、磁盘、连接池水位</b>，
             外加独立端点 <code>GET /api/v1/admin/system/error-logs</code>（ERROR 日志尾部）与
             运行时长（<code>uptimeMs</code>）。
-            若当前看到「—」，说明后端还在跑 10-30 之前的旧包，换包后本页自动点亮，无需改前端。
+            <span v-if="!hasNewFields">
+              若当前看到「—」，说明后端还在跑 10-30 之前的旧包，换包后本页自动点亮，无需改前端。
+            </span>
+            <span v-else>以上各项当前均已生效（本页按字段能力探测自动点亮，无需手动切换）。</span>
           </div>
           <div class="small muted mt8">
             仍无数据源的三项，显示「—」而不是编一个数：<b>网络出口</b>（实训环境无此指标）、
