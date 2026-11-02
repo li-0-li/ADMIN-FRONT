@@ -2897,6 +2897,23 @@ const autoFeasibility = computed(() => {
   return { total: entries.length, blocked };
 });
 
+/**
+ * 班级缺口预检（2026-11-02）：课程接口不出班级字段，放回签没原班级时也落空 ——
+ * 这两类签在弹窗里不选「班级」就会排成空班级课次（班级视角恒显示「未填班级」，
+ * 而且同学时段的班级冲突根本不会判，因为 clazzBusy 里没有这个班）。
+ * 原来只在「写完之后」的逐条报告里写「未填班级」，等于排错了才知道；现在开跑前就报数。
+ */
+const autoClassGap = computed(() => {
+  if (!autoVisible.value) return null;
+  const entries = autoEntries.value;
+  if (!entries.length) return null;
+  const miss = entries.filter(e => !entryClass(e).trim());
+  return miss.length ? { total: entries.length, miss } : null;
+});
+
+/** 预览里「有课次没班级」的门数（与报告口径一致） */
+const autoPlanNoClass = computed(() => (autoPlan.value ? autoPlan.value.items.filter(i => !i.clazz).length : 0));
+
 /** 本学期自动排课会写入的日期范围（设置视图明示，避免「排了但没覆盖整学期」这种事后才发现的问题） */
 const autoTermRangeLabel = computed(() => {
   const anchor = termAnchorMonday.value;
@@ -4189,6 +4206,14 @@ watch(
       <p class="small muted" :title="autoWeightTip" style="margin: 10px 0 0">
         先生成一份排课方案：可选时段最少的课先排，其余逐门挑时段和教室；同班分天、课时摊匀、老师连堂，教室按人数配最合适的那间。排不下的单独列出来，确认后才写入课表。
       </p>
+      <!-- 班级缺口（2026-11-02）：课程不带班级、放回签也没原班级时，不选班级就会排成空班级课次 -->
+      <div v-if="autoClassGap" class="detail-row">
+        <span class="detail-k">预警</span>
+        <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">
+          这 {{ autoClassGap.total }} 条里 <b>{{ autoClassGap.miss.length }}</b> 条没带班级（课程本身不带班级，放回签也可能没有）。
+          在下面选一个班级，否则这些课排出来是空班级——课表按班级查不到，同学时段的班级冲突也不会判。
+        </div>
+      </div>
       <!-- 班级（2026-10-22 丙）：课程接口不出班级字段，不选就排成"未填班级"的课次（按班级筛选看不到） -->
       <div class="detail-row">
         <span class="detail-k">班级</span>
@@ -4207,6 +4232,10 @@ watch(
     <template v-else-if="autoPlan">
       <p style="margin-top: 0">
         <b>排课方案预览：可排 {{ autoPlan.items.length }} 门，排不进 {{ autoPlan.failures.length }} 门</b>
+      </p>
+      <!-- 无班级汇总（2026-11-02）：逐条后面虽写了「未填班级」，但得挨个看才能发现，先在总览报一次 -->
+      <p v-if="autoPlanNoClass" class="small" style="margin: 0 0 8px; color: var(--warning, #b45309)">
+        其中 {{ autoPlanNoClass }} 门没有班级：写入后课表里不显示班级，按班级筛选也查不到。
       </p>
       <p v-if="autoSkippedInSchedule" class="small muted" style="margin: 0 0 8px">
         另有 {{ autoSkippedInSchedule }} 条「课程已在课表」的放回记录已跳过，不会重复排课。
