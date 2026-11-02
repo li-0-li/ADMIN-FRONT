@@ -94,6 +94,8 @@ const FILTER_FIELDS: Partial<Record<TabKey, FilterDef[]>> = {
   ],
   clazz: [
     { prop: 'schoolId', label: '学校', optionsKey: 'schools' },
+    // clazz 表有 dept_id 且列表出参透出（实测 "103"）⇒ 院系筛选直接可用
+    { prop: 'deptId', label: '所属院系', optionsKey: 'depts' },
     { prop: 'majorId', label: '所属专业', optionsKey: 'majors' },
     { prop: 'gradeYear', label: '年级' /* options 由全量数据派生（fetchList 里填 gradeOptions） */ },
     { prop: 'status', label: '状态', options: STATUS_OPTIONS }
@@ -369,6 +371,8 @@ const FORM_FIELDS: Record<string, FormField[]> = {
     { prop: 'clazzName', label: '班级名称' },
     { prop: 'clazzCode', label: '班级编码' },
     { prop: 'schoolId', label: '所属学校', type: 'select', optionsKey: 'schools' },
+    // deptId 后端非必填（缺省不落），但班级筛选院系依赖它 ⇒ 表单补上，尽量让数据填全
+    { prop: 'deptId', label: '所属院系', type: 'select', optionsKey: 'depts' },
     { prop: 'majorId', label: '所属专业', type: 'select', optionsKey: 'majors' },
     { prop: 'gradeYear', label: '年级', type: 'number' },
     { prop: 'status', label: '状态', type: 'select', options: STATUS_OPTIONS }
