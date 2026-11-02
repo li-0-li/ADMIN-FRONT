@@ -18,7 +18,8 @@ import {
   updateUserStatus
 } from '@/api/admin/users';
 import type { DeptNodeVo } from '@/api/admin/users';
-import type { AdminUserVo, FootprintVo, ImportResultVo, UserSaveBo } from '@/types/admin';
+import { listClasses, listMajors, listSchools } from '@/api/admin/basicdata';
+import type { AdminUserVo, Clazz, FootprintVo, ImportResultVo, Major, School, UserSaveBo } from '@/types/admin';
 import { useUserStore } from '@/store/user';
 
 /* ---------------- 词典 ---------------- */
@@ -67,7 +68,7 @@ const total = ref(0);
  * 存文案而不是布尔：无数据(空态) / 取数失败(错误态) / 加载中 是三件事，要各自画出来。
  */
 const loadError = ref('');
-const query = reactive({ page: 1, pageSize: 20, keyword: '', roleKey: '', status: '', deptId: undefined as string | undefined, sortField: 'createTime', sortOrder: 'desc' as 'asc' | 'desc' });
+const query = reactive({ page: 1, pageSize: 20, keyword: '', roleKey: '', status: '', deptId: undefined as string | undefined, schoolId: undefined as string | undefined, majorId: undefined as string | undefined, clazzId: undefined as string | undefined, sortField: 'createTime', sortOrder: 'desc' as 'asc' | 'desc' });
 
 /* ---------------- 院系候选（A6 / 编号 23）----------------
  * 10-26 起换成全量：后端选路线②（给 role 100 授 `system:dept:list`），前端接若依原生 GET /system/dept/list。
@@ -105,6 +106,71 @@ async function loadDeptOptions() {
     /* 候选拉不到不影响列表本身（request.ts 已提示），置失败态让浮层说清原因 */
     deptLoadFailed.value = true;
   }
+}
+
+/* ---------------- 学校 / 专业 / 班级筛选（be-admin 新增的三个维度）----------------
+ * 后端列表 SQL（AdminUserMapper.xml 68-76）已支持 e.school_id / e.major_id / e.clazz_id，
+ * 但 10-26 运行包的 UserQueryBo 连这三个字段都没有 ⇒ 参数被静默忽略：用户选了
+ * 「软件 2401」列表却纹丝不动，还以为看到的就是那个班的人——静默失效比 403 更危险。
+ * 进页做一次金丝雀探测：clazzId='-1'（不可能存在的班级主键）查 1 条——
+ * 新包 ⇒ total=0（筛选真实生效）；旧包 ⇒ total=账号总数（>0）⇒ 三个下拉不渲染。
+ */
+const advFilterSupported = ref<boolean | null>(null);
+const schoolOptions = ref<School[]>([]);
+const majorOptions = ref<Major[]>([]);
+const clazzOptions = ref<Clazz[]>([]);
+const advLoadFailed = ref(false);
+const advLoaded = { school: false, major: false, clazz: false };
+
+async function probeAdvFilters() {
+  try {
+    const res = await listUsers({ page: 1, pageSize: 1, clazzId: '-1' });
+    advFilterSupported.value = res.total === 0;
+  } catch {
+    /* 探测失败按旧包处理：宁可少给一个筛选，不给一个会撒谎的筛选 */
+    advFilterSupported.value = false;
+  }
+}
+
+/** 候选懒加载（首次展开下拉才拉）。一个域拉失败就全体置失败：三域同权限族（admin:schools:majors:classes:list），
+ *  一个不通多半都不通，逐个报错只会刷三条一样的提示 */
+async function loadAdvOptions(kind: 'school' | 'major' | 'clazz') {
+  if (advLoaded[kind] || advLoadFailed.value) return;
+  try {
+    if (kind === 'school') {
+      const res = await listSchools({ page: 1, pageSize: 500 });
+      schoolOptions.value = res.list ?? [];
+    } else if (kind === 'major') {
+      const res = await listMajors({ page: 1, pageSize: 500 });
+      majorOptions.value = res.list ?? [];
+    } else {
+      const res = await listClasses({ page: 1, pageSize: 500 });
+      clazzOptions.value = res.list ?? [];
+    }
+    advLoaded[kind] = true;
+  } catch {
+    advLoadFailed.value = true;
+  }
+}
+
+/** 专业按已选院系客户端过滤（Major.deptId 就是 sys_dept 外键），班级按已选专业过滤
+ *  ——级联在前端收敛，不为联动多发一次请求；未选上级时展示全量 */
+const majorChoices = computed(() =>
+  query.deptId ? majorOptions.value.filter(m => String(m.deptId ?? '') === String(query.deptId)) : majorOptions.value
+);
+const clazzChoices = computed(() =>
+  query.majorId ? clazzOptions.value.filter(c => String(c.majorId ?? '') === String(query.majorId)) : clazzOptions.value
+);
+
+/** 院系变了 ⇒ 已选专业/班级可能已不在其子树，级联清空（子级永不保留失去上级的值） */
+function onDeptFilterChange() {
+  query.majorId = undefined;
+  query.clazzId = undefined;
+  onSearch();
+}
+function onMajorFilterChange() {
+  query.clazzId = undefined;
+  onSearch();
 }
 
 const tableRef = ref<TableInstance>();
@@ -166,6 +232,9 @@ function resetQuery() {
   query.roleKey = '';
   query.status = '';
   query.deptId = undefined;
+  query.schoolId = undefined;
+  query.majorId = undefined;
+  query.clazzId = undefined;
   query.page = 1;
   query.sortField = 'createTime';
   query.sortOrder = 'desc';
@@ -220,7 +289,9 @@ let filterMql: MediaQueryList | null = null;
 /** 已生效的筛选条件数（关键词不算：它有自带的 ✕ 和独立视觉位置）。
     用 truthy 而不是 `!== ''`：EP 的 clearable 清空时发的是 undefined，按空串比会把已清掉的筛选计进徽标。 */
 const filterCount = computed(
-  () => [query.roleKey, query.status].filter(Boolean).length + (query.deptId != null ? 1 : 0)
+  () =>
+    [query.roleKey, query.status].filter(Boolean).length +
+    [query.deptId, query.schoolId, query.majorId, query.clazzId].filter(v => v != null).length
 );
 
 function toggleFilterPanel() {
@@ -265,6 +336,7 @@ onMounted(() => {
   if (typeof v === 'string') query.roleKey = v;
   fetchList();
   loadDeptOptions();
+  probeAdvFilters();
 });
 
 /** 已挂载期间入口参数变化（如角色页再点另一角色）→ 同步筛选 */
@@ -863,7 +935,7 @@ async function openFootprint(row: AdminUserVo) {
           </el-select>
           <!-- 院系候选 = 若依原生 /system/dept/list 里「学校根子树」的全量节点（编号 23，10-26 换掉原来的账号去重快照）。
                范围与基础数据页同一口径；筛出 0 条是「该院系下确实没有账号」，不是候选缺项。 -->
-          <el-select v-model="query.deptId" filterable clearable style="width: 160px" placeholder="全部院系" @change="onSearch">
+          <el-select v-model="query.deptId" filterable clearable style="width: 160px" placeholder="全部院系" @change="onDeptFilterChange">
             <el-option v-for="o in deptOptions" :key="o.id" :label="o.name" :value="o.id" />
             <!-- 只在取不到候选时出现：静默空下拉会被读成「库里没院系」，这是 1022-P2-1 同类的隐形缺陷，必须说清 -->
             <template v-if="deptLoadFailed" #footer>
@@ -872,6 +944,47 @@ async function openFootprint(row: AdminUserVo) {
               </div>
             </template>
           </el-select>
+          <!-- 学校/专业/班级：be-admin 新增的三个筛选维度（SQL 在 AdminUserMapper.xml 68-76）。
+               旧包没有这三个入参字段 ⇒ 参数被静默忽略 ⇒ 先金丝雀探测（clazzId=-1）再渲染，
+               绝不给一个「选了却不筛」的下拉。专业按已选院系、班级按已选专业客户端级联。 -->
+          <template v-if="advFilterSupported">
+            <el-select
+              v-model="query.schoolId"
+              filterable
+              clearable
+              style="width: 140px"
+              placeholder="全部学校"
+              @visible-change="(v: boolean) => v && loadAdvOptions('school')"
+              @change="onSearch"
+            >
+              <el-option v-for="o in schoolOptions" :key="o.schoolId" :label="o.name" :value="String(o.schoolId)" />
+            </el-select>
+            <el-select
+              v-model="query.majorId"
+              filterable
+              clearable
+              style="width: 150px"
+              placeholder="全部专业"
+              @visible-change="(v: boolean) => v && loadAdvOptions('major')"
+              @change="onMajorFilterChange"
+            >
+              <el-option v-for="m in majorChoices" :key="m.majorId" :label="m.name" :value="String(m.majorId)" />
+            </el-select>
+            <el-select
+              v-model="query.clazzId"
+              filterable
+              clearable
+              style="width: 150px"
+              placeholder="全部班级"
+              @visible-change="(v: boolean) => v && loadAdvOptions('clazz')"
+              @change="onSearch"
+            >
+              <el-option v-for="c in clazzChoices" :key="c.clazzId" :label="c.clazzName" :value="String(c.clazzId)" />
+            </el-select>
+          </template>
+          <div v-else-if="advFilterSupported === false" class="small muted" style="width: 100%">
+            学校/专业/班级筛选暂不可用：当前后端运行包还没有这三个筛选维度（参数会被忽略，为免「选了却不筛」已隐藏）。后端换包后自动出现，无需改前端。
+          </div>
         </div>
       </div>
       <el-button text @click="resetQuery">重置</el-button>

@@ -10,8 +10,15 @@ const BASE = '/api/v1/admin/users';
  * 白名单 username/nickName/deptName/status/createTime/loginDate（AdminAccountServiceImpl.java:94-97），
  * 名单外的字段 WARN 后回落默认序；sortOrder 只对 'desc' 生效，其余一律 asc；先全局排序再分页。
  * 这里用交叉类型放开这两个键，不动全局 src/types/admin.ts（那是综合线的文件）。
+ *
+ * schoolId / majorId / clazzId：be-admin 分支新加的三个筛选维度
+ * （SQL 在 AdminUserMapper.xml 68-76，都落在 biz_user_ext）。★ 10-26 运行包的
+ * UserQueryBo 没有这三个字段 ⇒ 传了也被静默忽略（不报错、列表不变）——
+ * 调用方必须先做能力探测（账号页的 clazzId='-1' 金丝雀），不许直接裸发。
  */
-export function listUsers(query: UserQuery & { sortField?: string; sortOrder?: 'asc' | 'desc' }) {
+export function listUsers(
+  query: UserQuery & { schoolId?: string; majorId?: string; clazzId?: string; sortField?: string; sortOrder?: 'asc' | 'desc' }
+) {
   return request<PageResult<AdminUserVo>>({
     url: BASE,
     method: 'get',
