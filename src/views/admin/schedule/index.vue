@@ -3705,17 +3705,10 @@ watch(
         <button class="btn btn-outline" type="button" @click="jumpConflict(1)">下一处</button>
       </div>
       <!-- 撤回组（2026-10-26 用户指令：从翻周条中列挪到课表左下、贴着「只看冲突」）。
-           撤回栈存到 30 步，界面只露最后一步不够 ⇒ 另挂「本次调整记录」列出每一步并可回退到任意一步之前 -->
+           撤回栈存到 30 步，界面只露最后一步不够 ⇒ 另挂「本次调整记录」列出每一步并可回退到任意一步之前。
+           2026-11-02 业主定序：「本次调整记录」在左、撤回在右（原为撤回在左）。DOM 顺序即视觉顺序，
+           键盘 Tab 也按这个次序走。 -->
       <span class="undo-group">
-        <button
-          class="btn btn-outline"
-          type="button"
-          :disabled="!historyStack.length || busy"
-          :title="undoLabel ? `撤回上一步：${undoLabel}` : '暂无可撤回的调整（仅记录本次打开页面后的操作）'"
-          @click="undoLast"
-        >
-          <ZkIcon name="undo-2" :size="16" style="margin-right: 4px" />撤回
-        </button>
         <el-dropdown trigger="click" popper-class="sched-undo-popper" @command="(n: number) => undoToStep(n)">
           <button
             class="btn btn-outline"
@@ -3731,6 +3724,15 @@ watch(
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+        <button
+          class="btn btn-outline"
+          type="button"
+          :disabled="!historyStack.length || busy"
+          :title="undoLabel ? `撤回上一步：${undoLabel}` : '暂无可撤回的调整（仅记录本次打开页面后的操作）'"
+          @click="undoLast"
+        >
+          <ZkIcon name="undo-2" :size="16" style="margin-right: 4px" />撤回
+        </button>
       </span>
       <span class="spacer" style="flex: 1"></span>
       <div class="view-switch">
@@ -4194,12 +4196,12 @@ watch(
   <!-- 自动排课（本地实现）：待排池贪心找空位，逐条真落库；结束出报告 -->
   <el-dialog v-model="autoVisible" title="自动排课" width="560px" :close-on-click-modal="!autoRunning">
     <template v-if="!autoReport && !autoPlan">
-      <p class="small" style="margin-top: 0">把「待排课程」里的课自动排进空位；<b>课表上已有的课一律不动</b>。</p>
-      <!-- 排课规则说明（2026-11-02，第五版）：历次反馈「模糊 → 罗嗦 → AI 味 → 长句」，
-           本版把与按钮重复的「先生成一份方案：」去掉（下面按钮就叫「生成排课方案」），
-           说明只留动作：先排谁 → 排的时候做到什么 → 排不下与写库时机。权重仍挂 title 悬停。 -->
+      <p class="small" style="margin-top: 0">把「待排课程」排进空位；<b>课表上已有的课不动</b>。</p>
+      <!-- 排课规则说明（2026-11-02，第六版）：历次反馈「模糊 → 罗嗦 → AI 味 → 长句 → 再精简」。
+           本版只留动作，形容词与限定词全部去掉（「可选时段最少」→「时段最少」、「挑时段和教室」→
+           「找空档」、「最合适的」→「按人数挑」、「单独列出原因」→「列出原因」）。权重仍挂 title 悬停。 -->
       <p class="small muted" :title="autoWeightTip" style="margin: 6px 0 2px; line-height: 1.75">
-        可选时段最少的课先排，其余逐门挑时段和教室。排的时候尽量做到同班分天、课时摊匀、老师连堂，教室按人数挑最合适的。排不下的单独列出原因，确认后才写入课表。
+        时段最少的课先排，其余逐门找空档。尽量同班分天、课时摊匀、老师连堂，教室按人数挑。排不下的列出原因，确认后才写入课表。
       </p>
       <!-- P0-A 护栏（2026-10-30）：池里会有「课程已在课表」的放回残留签（软删行一直成签），
            它们默认不参与排课，否则每排一次就把那门课重排一遍。这里如实报数，不静默跳。
@@ -4528,15 +4530,11 @@ watch(
 .undo-group {
   display: inline-flex;
   align-items: center;
-  /* 2026-11-02 业主指令：撤回必须在「本次调整记录」左边。
-     DOM 顺序本来就是 撤回 → 记录，这里再用 order 显式定序，避免以后插控件或模板重排把它挤到右边；
-     间距从 8px 收到 4px，同时与前面的「只看冲突」拉开 4px —— 让「撤回 + 记录」看起来是一对操作，
-     而不是撤回贴着「只看冲突」。 */
+  /* 2026-11-02 业主定序（含自我更正）：先「本次调整记录」、后「撤回」。
+     顺序由 DOM 决定（模板里就是记录在前），这里不再用 order 反向覆盖；
+     gap 4px 让两者成对，margin-left 4px 与前面「只看冲突」拉开（合计 12px）。 */
   gap: 4px;
   margin-left: 4px;
-}
-.undo-group > .btn {
-  order: -1;
 }
 .undo-group > .btn,
 .undo-group :deep(.el-dropdown) > .btn {
