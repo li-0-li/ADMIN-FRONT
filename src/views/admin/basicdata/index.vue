@@ -87,7 +87,10 @@ const FILTER_TABS: TabKey[] = ['dept', 'major', 'clazz', 'term', 'room', 'teache
 
 type FilterDef = { prop: string; label: string; optionsKey?: 'majors' | 'schools' | 'depts'; options?: { value: string; label: string }[] };
 const FILTER_FIELDS: Partial<Record<TabKey, FilterDef[]>> = {
-  dept: [{ prop: 'status', label: '状态', options: DEPT_STATUS_OPTIONS }],
+  dept: [
+    { prop: 'schoolId', label: '学校', optionsKey: 'schools' },
+    { prop: 'status', label: '状态', options: DEPT_STATUS_OPTIONS }
+  ],
   major: [
     { prop: 'deptId', label: '所属院系', optionsKey: 'depts' },
     { prop: 'status', label: '状态', options: STATUS_OPTIONS }
@@ -112,11 +115,15 @@ const FILTER_FIELDS: Partial<Record<TabKey, FilterDef[]>> = {
   // 教师/学生：所属院系 + 状态（账号状态是若依口径 0/1）。
   // 不放「学校」筛选：AdminUserVo 虽有 schoolId 字段但现库全为 null（账号建档未挂学校），
   // 加了必现「一选就空」，等账号创建链路带学校后放开。
+  // 师生的 schoolId 由后端沿 dept 树推导（挂不上学校='0'）⇒ 筛学校当下多半 0 行，
+  // 是数据未挂的真实反映；把账号 deptId 挪到学校节点（如 201 计算机学院）下即生效。
   teacher: [
+    { prop: 'schoolId', label: '学校', optionsKey: 'schools' },
     { prop: 'deptId', label: '所属院系', optionsKey: 'depts' },
     { prop: 'status', label: '状态', options: DEPT_STATUS_OPTIONS }
   ],
   student: [
+    { prop: 'schoolId', label: '学校', optionsKey: 'schools' },
     { prop: 'deptId', label: '所属院系', optionsKey: 'depts' },
     { prop: 'status', label: '状态', options: DEPT_STATUS_OPTIONS }
   ]
@@ -188,10 +195,22 @@ async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<
   if (!res.ok) return { list: [], total: 0 };
   const all = res.list.filter(d => d.delFlag !== '2');
   const nameById = new Map(all.map(d => [String(d.deptId), d.deptName]));
+  // 学校归属推导（D1 纯数据方案，零后端依赖）：学校 = dept 树顶级节点且名称与 school 表精确同名。
+  // 行的归属 = ancestors 链上第一个非 0 节点（顶级）的归属；顶级自己匹配上则归属自身。
+  // ⚠️ 脆弱点：dept 改名与 school 表不同步会断链——后端将来给 sys_dept 加 school_id 字段后换掉此推导。
+  await OPTION_LOADERS.schools();
+  const schoolIdByName = new Map(schoolOptions.value.map(o => [o.label, o.value]));
+  const deriveSchool = (d: { deptId: unknown; ancestors?: string; deptName: string }) => {
+    const topId = (d.ancestors ?? '').split(',').filter(x => x !== '0')[0] ?? String(d.deptId);
+    const topName = topId === String(d.deptId) ? d.deptName : nameById.get(topId);
+    const sid = topName ? schoolIdByName.get(topName) : undefined;
+    return { schoolId: sid ?? '0', schoolName: sid ? topName : '' };
+  };
   const flat = all.map(d => ({
     ...d,
     deptId: String(d.deptId),
     parentName: nameById.get(String(d.parentId ?? '')) ?? '—',
+    ...deriveSchool(d),
     children: [] as Record<string, unknown>[]
   }));
   return { list: flat, total: flat.length };
@@ -569,6 +588,8 @@ const columns = computed<Col[]>(() => {
         { prop: 'deptName', label: '院系名称', link: true },
         { prop: 'deptId', label: '编号', align: 'center' },
         { prop: 'parentName', label: '上级院系' },
+        // D1 纯数据方案推导出的归属（schoolName 空串=顶级不是学校节点，显示 —）
+        { prop: 'schoolName', label: '所属学校', render: r => (r.schoolName ? String(r.schoolName) : '—') },
         { prop: 'status', label: '状态', badge: r => statusCls(r.status), render: r => statusLabel(r.status) }
       ];
     case 'major':
@@ -611,6 +632,8 @@ const columns = computed<Col[]>(() => {
         { prop: 'nickName', label: '姓名', link: true },
         { prop: 'email', label: '邮箱' },
         { prop: 'deptName', label: '所属院系' },
+        // 后端沿 dept 树推导的归属（schoolId='0' ⇒ 未挂学校，显示 —）
+        { prop: 'schoolName', label: '所属学校', render: r => (r.schoolName ? String(r.schoolName) : '—') },
         { prop: 'createTime', label: '创建时间' }
       ];
     case 'student':
@@ -619,6 +642,7 @@ const columns = computed<Col[]>(() => {
         { prop: 'nickName', label: '姓名', link: true },
         { prop: 'email', label: '邮箱' },
         { prop: 'deptName', label: '所属院系' },
+        { prop: 'schoolName', label: '所属学校', render: r => (r.schoolName ? String(r.schoolName) : '—') },
         { prop: 'createTime', label: '创建时间' }
       ];
     default:
