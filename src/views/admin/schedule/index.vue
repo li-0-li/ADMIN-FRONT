@@ -2497,8 +2497,20 @@ function openAuto() {
   autoVisible.value = true;
 }
 
-/** 这张签能沿用到的班级：放回签（lesson-{id}）= 原课次 clazzName；整门新课（course-{id}）= 弹窗所选 */
+/**
+ * 每条签单独指定的班级（2026-11-02）：一个老师常带多个班的课，同一批待排里往往混着不同班级，
+ * 用弹窗的「默认班级」一刀切会把班级归属写错。会话级状态，key = PoolEntry.key（与 poolParity 同款）。
+ */
+const poolClazz = reactive<Record<string, string>>({});
+
+/**
+ * 这张签实际写入的班级，优先级：签上显式指定 > 放回签的原课次班级 > 弹窗的默认班级。
+ * 三处都要读到同一套口径（硬约束 clazzBusy、同班分天、写入的 targetClass），否则会出现
+ * 「按 A 班排、写成 B 班」这种对不上的情况。
+ */
 function entryClass(entry: PoolEntry) {
+  const explicit = (poolClazz[entry.key] ?? '').trim();
+  if (explicit) return explicit;
   if (entry.key.startsWith('lesson-')) {
     const src = returnedCells.value.find(r => String(r.scheduleId) === entry.key.slice(7));
     const own = (src?.clazzName ?? '').trim();
@@ -4211,16 +4223,43 @@ watch(
         <span class="detail-k">预警</span>
         <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">
           这 {{ autoClassGap.total }} 条里 <b>{{ autoClassGap.miss.length }}</b> 条没带班级（课程本身不带班级，放回签也可能没有）。
-          在下面选一个班级，否则这些课排出来是空班级——课表按班级查不到，同学时段的班级冲突也不会判。
+          在下面选一个默认班级，或逐条指定；都没填的会排成空班级——课表按班级查不到，同学时段的班级冲突也不会判。
         </div>
       </div>
       <!-- 班级（2026-10-22 丙）：课程接口不出班级字段，不选就排成"未填班级"的课次（按班级筛选看不到） -->
       <div class="detail-row">
-        <span class="detail-k">班级</span>
+        <span class="detail-k">默认班级</span>
         <div style="flex: 1; min-width: 0">
-          <el-select v-model="autoClass" placeholder="不指定（放回的课次自动沿用原班级）" clearable filterable style="width: 100%">
+          <el-select v-model="autoClass" placeholder="未逐条指定时用这个班（放回签仍沿用原班级）" clearable filterable style="width: 100%">
             <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
           </el-select>
+        </div>
+      </div>
+      <!-- 逐条指定班级（2026-11-02）：一位老师常带多个班，整批一刀切会把班级归属写错 -->
+      <div v-if="autoEntries.length" class="detail-row">
+        <span class="detail-k">逐条班级</span>
+        <div style="flex: 1; min-width: 0; max-height: 168px; overflow-y: auto">
+          <div
+            v-for="e in autoEntries"
+            :key="'cl-' + e.key"
+            style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px"
+          >
+            <span
+              class="small"
+              :title="`${e.courseName}${e.teacherName ? ' · ' + e.teacherName : ''}`"
+              style="flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap"
+            >{{ e.courseName }}</span>
+            <el-select
+              v-model="poolClazz[e.key]"
+              size="small"
+              clearable
+              filterable
+              placeholder="未指定"
+              style="width: 148px; flex: none"
+            >
+              <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
+            </el-select>
+          </div>
         </div>
       </div>
       <p v-if="autoProgress" class="small" style="margin: 12px 0 0">
