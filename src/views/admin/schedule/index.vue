@@ -4195,6 +4195,13 @@ watch(
   <el-dialog v-model="autoVisible" title="自动排课" width="560px" :close-on-click-modal="!autoRunning">
     <template v-if="!autoReport && !autoPlan">
       <p class="small" style="margin-top: 0">把「待排课程」池里的课自动排进空位；<b>课表上已有的课一律不动</b>。</p>
+      <!-- 排课规则说明（2026-11-02，第四版）：第一版「在教师空闲时段里挑最优格…」被判模糊（候选其实是
+           25 格全枚举、教室不是硬约束）；二版逐条列权重被判罗嗦；三版照同类产品收成人话，但仍是一句
+           分号长链、还夹在「范围」和「预警」中间打断了信息流。本版拆成三句、紧跟开场说明，
+           权重仍在 title 里（绑常量，改权重自动同步）。 -->
+      <p class="small muted" :title="autoWeightTip" style="margin: 6px 0 2px; line-height: 1.75">
+        先生成一份方案：可选时段最少的课先排，其余逐门挑时段和教室。排的时候让同班分天、课时摊匀、老师连堂，教室按人数配最合适的一间。排不下的单独列出原因，确认后才写入课表。
+      </p>
       <!-- P0-A 护栏（2026-10-30）：池里会有「课程已在课表」的放回残留签（软删行一直成签），
            它们默认不参与排课，否则每排一次就把那门课重排一遍。这里如实报数，不静默跳。
            2026-11-02 起再加一层「用户自己勾掉」的条数，两者分开报，不混成一句「已跳过」。 -->
@@ -4236,18 +4243,13 @@ watch(
           </div>
         </div>
       </div>
+      <!-- 排课规则说明已上移到弹窗开头（紧跟「把待排课程…」那句）：夹在「范围」与「预警」中间会打断信息流 -->
       <!-- 重复口径在待排池每条签上单独标（2026-10-29）：每周/单周/双周点胶囊切换；原弹窗内
            的「重复」下拉在口径与 runAuto 解耦后已是摆设，换成隔周汇总与锚定警告 -->
       <div v-if="poolParitySummary" class="detail-row">
         <span class="detail-k">隔周</span>
         <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">{{ poolParitySummary }}</div>
       </div>
-      <!-- 排课规则说明（2026-11-02，三轮定稿）：一版「在教师空闲时段里挑最优格…」被判模糊（候选其实是
-           25 格全枚举、教室不是硬约束）；二版逐条列权重被判罗嗦；三版照同类产品的写法收成人话——
-           只讲「先排什么、尽量做到什么、排不下怎么办」，权重挪到 title 悬停里（取常量，改权重自动同步）。 -->
-      <p class="small muted" :title="autoWeightTip" style="margin: 10px 0 0">
-        先生成一份排课方案：可选时段最少的课先排，其余逐门挑时段和教室；同班分天、课时摊匀、老师连堂，教室按人数配最合适的那间。排不下的单独列出来，确认后才写入课表。
-      </p>
       <!-- 班级缺口（2026-11-02）：课程不带班级、放回签也没原班级时，不选班级就会排成空班级课次 -->
       <div v-if="autoClassGap" class="detail-row">
         <span class="detail-k">预警</span>
@@ -4268,16 +4270,20 @@ watch(
       <!-- 逐条参与 + 班级（2026-11-02）：勾选框决定这轮排不排这门课（业主需求），右侧下拉逐条指定班级
            （一位老师常带多个班，用「默认班级」一刀切会把班级归属写错）。取消勾选的行置灰但保留班级值，
            重新勾上即恢复，不用再填一遍。 -->
-      <div v-if="autoEntries.length" class="detail-row">
+      <div v-if="autoEntries.length" class="detail-row pick-row">
         <span class="detail-k">参与排课</span>
         <div style="flex: 1; min-width: 0">
-          <div style="display: flex; align-items: center; gap: 4px; margin-bottom: 6px">
-            <span class="small muted" style="flex: 1; min-width: 0">
+          <div class="pick-head">
+            <span class="pick-head-l">
               已选 <b>{{ autoSelected.length }}</b> / {{ autoEntries.length }} 条
-              <span v-if="autoUnpicked">（这 {{ autoUnpicked }} 条本轮不排，也不会写入课表）</span>
+              <span v-if="autoUnpicked">· 未选 {{ autoUnpicked }}</span>
             </span>
-            <el-button link size="small" @click="pickAllEntries(true)">全选</el-button>
-            <el-button link size="small" @click="pickAllEntries(false)">全不选</el-button>
+            <span class="pick-head-r">
+              <el-button link size="small" :disabled="autoSelected.length === autoEntries.length" @click="pickAllEntries(true)">
+                全选
+              </el-button>
+              <el-button link size="small" :disabled="!autoSelected.length" @click="pickAllEntries(false)">清空</el-button>
+            </span>
           </div>
           <div style="max-height: 168px; overflow-y: auto">
             <div
@@ -5334,6 +5340,37 @@ watch(
   width: 56px;
   color: var(--ink-500);
   flex: none;
+}
+/* 参与排课列表头（2026-11-02）：计数靠左、全选/清空靠右，用一条虚线跟列表分开。
+   原来两个文字按钮直接跟在计数文本后面，一旦有「未选 N 条」就把按钮挤到第二行。 */
+.pick-row {
+  /* 列表比标签高得多，居中对齐会让「参与排课」四个字浮在中间，改为顶对齐 */
+  align-items: flex-start;
+}
+.pick-row > .detail-k {
+  padding-top: 3px;
+}
+.pick-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed var(--border);
+}
+.pick-head-l {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--ink-500);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pick-head-r {
+  flex: none;
+  display: flex;
+  align-items: center;
 }
 .gap-hint {
   display: flex;
