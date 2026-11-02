@@ -2478,6 +2478,27 @@ const autoEntries = computed(() =>
 const autoSkippedInSchedule = computed(() =>
   autoIncludeScheduled.value ? 0 : poolEntries.value.filter(e => e.inSchedule).length
 );
+/**
+ * 本次要排哪些课（2026-11-02 业主需求）：勾选粒度 = 一张签（= 一节课）。
+ * 会话级状态，key = PoolEntry.key；未登记的按「参与」处理，显式取消才置 false
+ * （这样新增的签、切「连已在课表的也重排」后多出来的签，默认都是参与）。
+ * 与上方护栏的分工：护栏是「这门课其实还在课表上」的安全判断，这里是业务选择
+ * （这一轮只想排其中几门），两者独立计数、分开报数，不混成一句「已跳过」。
+ */
+const poolPick = reactive<Record<string, boolean>>({});
+/** 真正参与排课的签：过了护栏 + 用户没取消勾选 */
+const autoSelected = computed(() => autoEntries.value.filter(e => poolPick[e.key] !== false));
+/** 用户手动取消的条数（与护栏跳过分开统计） */
+const autoUnpicked = computed(() => autoEntries.value.length - autoSelected.value.length);
+
+function resetPoolPick() {
+  for (const k of Object.keys(poolPick)) delete poolPick[k];
+  for (const e of autoEntries.value) poolPick[e.key] = true;
+}
+
+function pickAllEntries(v: boolean) {
+  for (const e of autoEntries.value) poolPick[e.key] = v;
+}
 
 function openAuto() {
   if (!poolEntries.value.length) {
@@ -2486,6 +2507,8 @@ function openAuto() {
   }
   // 安全默认：每次打开都回到「跳过已在课表的签」，避免上一次勾选遗留成隐性重复排课
   autoIncludeScheduled.value = false;
+  // 勾选状态也每次重置为「全选」：上一轮手动取消的课不该悄悄影响这一轮
+  resetPoolPick();
   if (!autoEntries.value.length) {
     ElMessage.warning('待排池里的签都对应「课程已在课表上」的放回记录，没有需要排的课；若要整门重排，先把该课全部节次放回');
     return;
@@ -2558,10 +2581,10 @@ function cycleParity(e: PoolEntry) {
   const cur = parityOf(e);
   poolParity[e.key] = cur === 'all' ? 'odd' : cur === 'odd' ? 'even' : 'all';
 }
-/** 自动排课弹窗的隔周汇总与锚定说明（存在非每周口径的课才显示）；口径按**实际参与集**统计，不按全池 */
+/** 自动排课弹窗的隔周汇总与锚定说明（存在非每周口径的课才显示）；口径按**勾选参与集**统计，不按全池 */
 const poolParitySummary = computed(() => {
-  const odd = autoEntries.value.filter(e => parityOf(e) === 'odd').length;
-  const even = autoEntries.value.filter(e => parityOf(e) === 'even').length;
+  const odd = autoSelected.value.filter(e => parityOf(e) === 'odd').length;
+  const even = autoSelected.value.filter(e => parityOf(e) === 'even').length;
   if (!odd && !even) return '';
   const anchorNote = termAnchorMonday.value
     ? `隔周按学期起点锚定（学期始于 ${termStartDateLabel.value}，单周=第 1、3、5…周）`
@@ -2817,9 +2840,9 @@ function freeAutoSlots(ctx: AutoCtx, entry: PoolEntry): number {
 /** 构造一个完整方案（纯内存，不写库）：动态饱和度选课 → 打分选格 → 失败时单层腾挪 → 罚分汇总 */
 function buildPlanOnce(ctxBase: AutoCtx, roomCandidates: Classroom[], rng: () => number): AutoPlan {
   const ctx = cloneAutoCtx(ctxBase);
-  // ★ 只取 autoEntries（默认剔除 inSchedule 的签）：直接读全池会把放回留下的软删行
-  //   当成「待排的新课」再铺满一学期 —— 10-29 那次 126 条重复排课就是这么产生的（P0-A 护栏）。
-  const remaining = autoEntries.value.slice();
+  // ★ 只取 autoSelected（= 过了 inSchedule 护栏 + 用户在弹窗里勾选的签）：直接读全池会把放回留下的
+  //   软删行当成「待排的新课」再铺满一学期（10-29 那次 126 条重复排课就是这么产生的，P0-A 护栏）。
+  const remaining = autoSelected.value.slice();
   const items: PlannedItem[] = [];
   const failures: AutoPlan['failures'] = [];
   let penalty = 0;
@@ -2900,7 +2923,7 @@ const autoPlan = ref<AutoPlan | null>(null);
  */
 const autoFeasibility = computed(() => {
   if (!autoVisible.value) return null;
-  const entries = autoEntries.value;
+  const entries = autoSelected.value;
   if (!entries.length) return null;
   const ctx = buildAutoCtx();
   const blocked = entries
@@ -2917,7 +2940,7 @@ const autoFeasibility = computed(() => {
  */
 const autoClassGap = computed(() => {
   if (!autoVisible.value) return null;
-  const entries = autoEntries.value;
+  const entries = autoSelected.value;
   if (!entries.length) return null;
   const miss = entries.filter(e => !entryClass(e).trim());
   return miss.length ? { total: entries.length, miss } : null;
@@ -2951,7 +2974,12 @@ const autoWeightTip = computed(
 
 /** 阶段一「生成排课方案」：纯内存规划（毫秒级），产出预览；一条数据都不写（P2） */
 function runAuto() {
-  if (autoRunning.value || !autoEntries.value.length) return;
+  if (autoRunning.value) return;
+  // 一条都没勾时明确提示，别让人对着「可排 0 门」的预览发呆
+  if (!autoSelected.value.length) {
+    ElMessage.warning(autoEntries.value.length ? '一门课都没勾选，先在「参与排课」里勾上要排的课' : '没有可排的课');
+    return;
+  }
   const ctxBase = buildAutoCtx();
   const roomCandidates = classroomsAll.value.filter(r => (r.status ?? 'active') !== 'inactive');
   // P4 随机重启：同分随机破平跑 N 个方案取罚分最低
@@ -4168,11 +4196,13 @@ watch(
     <template v-if="!autoReport && !autoPlan">
       <p class="small" style="margin-top: 0">把「待排课程」池里的课自动排进空位；<b>课表上已有的课一律不动</b>。</p>
       <!-- P0-A 护栏（2026-10-30）：池里会有「课程已在课表」的放回残留签（软删行一直成签），
-           它们默认不参与排课，否则每排一次就把那门课重排一遍。这里如实报数，不静默跳。 -->
-      <div v-if="autoSkippedInSchedule || autoIncludeScheduled" class="detail-row">
+           它们默认不参与排课，否则每排一次就把那门课重排一遍。这里如实报数，不静默跳。
+           2026-11-02 起再加一层「用户自己勾掉」的条数，两者分开报，不混成一句「已跳过」。 -->
+      <div v-if="autoSkippedInSchedule || autoIncludeScheduled || autoUnpicked" class="detail-row">
         <span class="detail-k">参与</span>
         <div class="small" style="flex: 1; min-width: 0">
-          本次排 <b>{{ autoEntries.length }}</b> 条
+          本次排 <b>{{ autoSelected.length }}</b> 条
+          <span v-if="autoUnpicked" class="muted"> · 手动取消 <b>{{ autoUnpicked }}</b> 条（下面可重新勾上）</span>
           <span v-if="autoSkippedInSchedule" class="muted">
             · 已跳过 <b>{{ autoSkippedInSchedule }}</b> 条「课程已在课表」的放回记录（避免重复排课）
           </span>
@@ -4235,30 +4265,58 @@ watch(
           </el-select>
         </div>
       </div>
-      <!-- 逐条指定班级（2026-11-02）：一位老师常带多个班，整批一刀切会把班级归属写错 -->
+      <!-- 逐条参与 + 班级（2026-11-02）：勾选框决定这轮排不排这门课（业主需求），右侧下拉逐条指定班级
+           （一位老师常带多个班，用「默认班级」一刀切会把班级归属写错）。取消勾选的行置灰但保留班级值，
+           重新勾上即恢复，不用再填一遍。 -->
       <div v-if="autoEntries.length" class="detail-row">
-        <span class="detail-k">逐条班级</span>
-        <div style="flex: 1; min-width: 0; max-height: 168px; overflow-y: auto">
-          <div
-            v-for="e in autoEntries"
-            :key="'cl-' + e.key"
-            style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px"
-          >
-            <span
-              class="small"
-              :title="`${e.courseName}${e.teacherName ? ' · ' + e.teacherName : ''}`"
-              style="flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap"
-            >{{ e.courseName }}</span>
-            <el-select
-              v-model="poolClazz[e.key]"
-              size="small"
-              clearable
-              filterable
-              placeholder="未指定"
-              style="width: 148px; flex: none"
+        <span class="detail-k">参与排课</span>
+        <div style="flex: 1; min-width: 0">
+          <div style="display: flex; align-items: center; gap: 4px; margin-bottom: 6px">
+            <span class="small muted" style="flex: 1; min-width: 0">
+              已选 <b>{{ autoSelected.length }}</b> / {{ autoEntries.length }} 条
+              <span v-if="autoUnpicked">（这 {{ autoUnpicked }} 条本轮不排，也不会写入课表）</span>
+            </span>
+            <el-button link size="small" @click="pickAllEntries(true)">全选</el-button>
+            <el-button link size="small" @click="pickAllEntries(false)">全不选</el-button>
+          </div>
+          <div style="max-height: 168px; overflow-y: auto">
+            <div
+              v-for="e in autoEntries"
+              :key="'pk-' + e.key"
+              style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px"
             >
-              <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
-            </el-select>
+              <el-checkbox
+                :model-value="poolPick[e.key] !== false"
+                size="small"
+                style="flex: none"
+                @change="poolPick[e.key] = !!$event"
+              />
+              <span
+                class="small"
+                :title="`${e.courseName}${e.teacherName ? ' · ' + e.teacherName : ''}${e.inSchedule ? ' · 课程已在课表（勾选会重复排课）' : ''}`"
+                :style="{
+                  flex: '1 1 auto',
+                  minWidth: 0,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  opacity: poolPick[e.key] === false ? 0.4 : 1,
+                  textDecoration: poolPick[e.key] === false ? 'line-through' : 'none'
+                }"
+              >{{ e.courseName }}</span>
+              <span v-if="e.inSchedule" class="badge badge-warning" style="flex: none">已在课表</span>
+              <el-select
+                v-model="poolClazz[e.key]"
+                size="small"
+                clearable
+                filterable
+                placeholder="未指定"
+                :disabled="poolPick[e.key] === false"
+                style="width: 148px; flex: none"
+              >
+                <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
+              </el-select>
+            </div>
           </div>
         </div>
       </div>
@@ -4278,6 +4336,9 @@ watch(
       </p>
       <p v-if="autoSkippedInSchedule" class="small muted" style="margin: 0 0 8px">
         另有 {{ autoSkippedInSchedule }} 条「课程已在课表」的放回记录已跳过，不会重复排课。
+      </p>
+      <p v-if="autoUnpicked" class="small muted" style="margin: 0 0 8px">
+        本轮只排勾选的 {{ autoSelected.length }} 条；未勾选的 {{ autoUnpicked }} 条不参与，也不会写入课表。
       </p>
       <p class="small muted" style="margin: 0 0 8px">
         已按「最紧的课先占位、排不进的尝试腾挪让位、多方案取最优」在本地算好；点「确认写入课表」才真正保存。
@@ -4325,7 +4386,7 @@ watch(
       </span>
       <span v-else>
         <el-button :disabled="autoRunning" @click="autoVisible = false">取消</el-button>
-        <el-button type="primary" @click="runAuto">生成排课方案</el-button>
+        <el-button type="primary" :disabled="!autoSelected.length" @click="runAuto">生成排课方案</el-button>
       </span>
     </template>
   </el-dialog>
