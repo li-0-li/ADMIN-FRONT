@@ -79,65 +79,165 @@ const DEPT_STATUS_OPTIONS = [
   { value: '1', label: '停用' }
 ];
 
+/* ---------------- 筛选（用户 11-02 拍板：前端全量本地过滤 + 下拉 + chips） ----------------
+ * 后端 BasicDataQueryBo 只认 keyword，状态/关联筛选要等 B2 ⇒ 各域量级实测个位数~几十条，
+ * 进 tab 拉一次全量（pageSize=1000）在本地过滤，分页也本地切。数据涨到千级再切服务端。
+ * school 保持服务端分页（用户明确不加筛选）；teacher/student 是账号接口（量大），同样不开放。 */
+const FILTER_TABS: TabKey[] = ['dept', 'major', 'clazz', 'term', 'room'];
+
+type FilterDef = { prop: string; label: string; optionsKey?: 'majors' | 'schools' | 'depts'; options?: { value: string; label: string }[] };
+const FILTER_FIELDS: Partial<Record<TabKey, FilterDef[]>> = {
+  dept: [{ prop: 'status', label: '状态', options: DEPT_STATUS_OPTIONS }],
+  major: [
+    { prop: 'deptId', label: '所属院系', optionsKey: 'depts' },
+    { prop: 'status', label: '状态', options: STATUS_OPTIONS }
+  ],
+  clazz: [
+    { prop: 'schoolId', label: '学校', optionsKey: 'schools' },
+    { prop: 'majorId', label: '所属专业', optionsKey: 'majors' },
+    { prop: 'gradeYear', label: '年级' /* options 由全量数据派生（fetchList 里填 gradeOptions） */ },
+    { prop: 'status', label: '状态', options: STATUS_OPTIONS }
+  ],
+  term: [
+    { prop: 'schoolId', label: '学校', optionsKey: 'schools' },
+    { prop: 'isCurrent', label: '当前学期', options: [{ value: '1', label: '是' }, { value: '0', label: '否' }] },
+    { prop: 'status', label: '状态', options: STATUS_OPTIONS }
+  ],
+  room: [
+    { prop: 'schoolId', label: '学校', optionsKey: 'schools' },
+    { prop: 'status', label: '状态', options: STATUS_OPTIONS }
+  ]
+};
+
+const gradeOptions = ref<{ value: string; label: string }[]>([]);
+/** 每个 tab 独立记忆筛选（切 tab 不清，回来还在；会话级，不落 localStorage） */
+const filters = reactive<Partial<Record<TabKey, Record<string, string>>>>({});
+
+function setFilter(prop: string, v: string) {
+  const cur = filters[active.value] ?? (filters[active.value] = {});
+  if (v) cur[prop] = v;
+  else delete cur[prop];
+  query.page = 1;
+  fetchList();
+}
+function clearFilters() {
+  filters[active.value] = {};
+  query.page = 1;
+  fetchList();
+}
+
+const activeFilterDefs = computed<FilterDef[]>(() => FILTER_FIELDS[active.value] ?? []);
+const filterOptions = (d: FilterDef) => d.options ?? (d.optionsKey ? dynamicOptions(d.optionsKey) : []);
+const activeChips = computed(() =>
+  activeFilterDefs.value
+    .map(d => {
+      const v = filters[active.value]?.[d.prop] ?? '';
+      if (!v) return null;
+      const opt = filterOptions(d).find(o => o.value === v);
+      return { prop: d.prop, label: d.label, text: opt?.label ?? v };
+    })
+    .filter((x): x is { prop: string; label: string; text: string } => x !== null)
+);
+const hasActiveFilters = computed(() => activeChips.value.length > 0);
+
+/** 筛选下拉的关联数据（depts/majors/schools）进 tab 就备好，不等首次点开 */
+function ensureFilterOptions() {
+  (FILTER_FIELDS[active.value] ?? []).forEach(d => {
+    if (d.optionsKey) OPTION_LOADERS[d.optionsKey]();
+  });
+}
+
 /** 各 tab 拉全量（导出用 pageSize=1000；院系走树接口，本地按关键词过滤） */
 async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<string, unknown>[]; total: number }> {
   if (tab === 'school') {
     const r = await listSchools(q);
     return { list: asRows(r?.list), total: r?.total ?? 0 };
   }
-  if (tab === 'major') {
-    const r = await listMajors(q);
-    return { list: asRows(r?.list), total: r?.total ?? 0 };
-  }
-  if (tab === 'clazz') {
-    const r = await listClasses(q);
-    return { list: asRows(r?.list), total: r?.total ?? 0 };
-  }
-  if (tab === 'term') {
-    const r = await listTerms(q);
-    return { list: asRows(r?.list), total: r?.total ?? 0 };
-  }
-  if (tab === 'room') {
-    const r = await listClassrooms(q);
-    return { list: asRows(r?.list), total: r?.total ?? 0 };
+  if (tab === 'major' || tab === 'clazz' || tab === 'term' || tab === 'room') {
+    // 全量拉取（筛选/关键词/分页全在本地，见 applyLocalFilters；fetchList 传 page=1&pageSize=1000）
+    const loaders = { major: listMajors, clazz: listClasses, term: listTerms, room: listClassrooms } as const;
+    const r = await loaders[tab]({ page: 1, pageSize: 1000 });
+    const list = asRows(r?.list);
+    return { list, total: list.length };
   }
   if (tab === 'teacher' || tab === 'student') {
-    // 教师 / 学生复用账号接口，按角色键过滤
+    // 教师 / 学生复用账号接口，按角色键过滤（量大，保持服务端分页，不开放本地筛选）
     const r = await listUsers({ page: q.page, pageSize: q.pageSize, keyword: q.keyword, roleKey: tab });
     return { list: asRows(r?.list), total: r?.total ?? 0 };
   }
   // dept：若依原生院系树。行里**保留原生全字段**（parentId/orderNum/leader/phone/email），
   // 编辑回显与保存都要用；parentName 只是展示用的派生列。
-  // 无关键词 → 按 parentId 组树（el-table tree-props 展示组织架构层级）；
-  // 有关键词 → 拍平只留命中行（树形下命中行的父级未必命中，拍平更直观）。
+  // 这里只出平铺全量：关键词/状态过滤与树形组装统一在 fetchList 做（导出与列表共用同一过滤口径）。
   const res = await listDeptTree();
   if (!res.ok) return { list: [], total: 0 };
   const all = res.list.filter(d => d.delFlag !== '2');
   const nameById = new Map(all.map(d => [String(d.deptId), d.deptName]));
-  const kw = (q.keyword ?? '').trim();
-  const flat = all
-    .map(d => ({ ...d, deptId: String(d.deptId), parentName: nameById.get(String(d.parentId ?? '')) ?? '—', children: [] as Record<string, unknown>[] }))
-    .filter(d => !kw || d.deptName.includes(kw));
-  if (kw) return { list: flat, total: flat.length };
-  const byId = new Map(flat.map(d => [d.deptId, d]));
-  const roots: Record<string, unknown>[] = [];
-  flat.forEach(d => {
-    const parent = byId.get(String(d.parentId ?? ''));
-    if (parent && parent !== d) parent.children!.push(d);
-    else roots.push(d);
+  const flat = all.map(d => ({
+    ...d,
+    deptId: String(d.deptId),
+    parentName: nameById.get(String(d.parentId ?? '')) ?? '—',
+    children: [] as Record<string, unknown>[]
+  }));
+  return { list: flat, total: flat.length };
+}
+
+/** 本地过滤（FILTER_TABS 共用口径：列表分页与 CSV 导出同一份结果）。
+ *  关键词匹配业务名/编码；筛选项 String 归一比较（isCurrent 1/0、状态 active 与 '0' 口径不同，各自匹配） */
+function applyLocalFilters(list: Record<string, unknown>[]): Record<string, unknown>[] {
+  const kw = (query.keyword ?? '').trim();
+  const f = filters[active.value] ?? {};
+  return list.filter(row => {
+    if (kw) {
+      const hay = [row.name, row.deptName, row.clazzName, row.code, row.clazzCode, row.majorCode].filter(Boolean).join(' ');
+      if (!hay.includes(kw)) return false;
+    }
+    for (const [k, v] of Object.entries(f)) {
+      if (!v) continue;
+      if (String(row[k] ?? '') !== String(v)) return false;
+    }
+    return true;
   });
-  return { list: roots, total: flat.length };
 }
 
 async function fetchList() {
   loading.value = true;
   try {
-    const q: BasicDataQuery = { ...query };
-    const r = await fetchTab(active.value, q);
-    // 院系是无分页本地过滤：整表给表格；其余域直接用后端分页结果
-    // 院系走树形全量展示（关键词过滤时也是拍平全量），不分页
-    rows.value = r.list;
-    total.value = r.total;
+    const tab = active.value;
+    const serverPaginated = !FILTER_TABS.includes(tab);
+    const r = await fetchTab(tab, { ...query, ...(serverPaginated ? {} : { page: 1, pageSize: 1000, keyword: '' }) });
+    if (serverPaginated) {
+      rows.value = r.list;
+      total.value = r.total;
+      return;
+    }
+    if (tab === 'clazz') {
+      // 年级筛选项从全量数据派生（年级取值随录入变化，不写死）
+      gradeOptions.value = [...new Set(r.list.map(x => x.gradeYear).filter(v => v !== undefined && v !== null && v !== ''))]
+        .map(v => ({ value: String(v), label: `${v} 级` }))
+        .sort((a, b) => Number(a.value) - Number(b.value));
+    }
+    const filtered = applyLocalFilters(r.list);
+    total.value = filtered.length;
+    if (tab === 'dept') {
+      const treeMode = !(query.keyword ?? '').trim() && !Object.values(filters[tab] ?? {}).some(Boolean);
+      if (treeMode) {
+        // 树形：只把根交给表格，子级挂 children（total 用平铺计数，上方已设）
+        const byId = new Map(filtered.map(d => [String(d.deptId), d]));
+        const roots: Record<string, unknown>[] = [];
+        filtered.forEach(d => {
+          const parent = byId.get(String(d.parentId ?? ''));
+          if (parent && parent !== d) (parent.children as unknown[]).push(d);
+          else roots.push(d);
+        });
+        rows.value = roots;
+      } else {
+        // 过滤态平铺：命中行的父级未必命中，树形会断链；剥掉空 children 防无意义展开箭头
+        rows.value = filtered.map(({ children: _c, ...rest }) => rest);
+      }
+      return;
+    }
+    const start = ((query.page ?? 1) - 1) * (query.pageSize ?? 10);
+    rows.value = filtered.slice(start, start + (query.pageSize ?? 10));
   } finally {
     loading.value = false;
   }
@@ -147,6 +247,7 @@ function switchTab(key: TabKey) {
   active.value = key;
   query.page = 1;
   query.keyword = '';
+  ensureFilterOptions();
   fetchList();
 }
 
@@ -162,7 +263,10 @@ function resetQuery() {
   fetchList();
 }
 
-onMounted(fetchList);
+onMounted(() => {
+  ensureFilterOptions();
+  fetchList();
+});
 
 /* ---------------- 增删改（只对有接口的 tab 开放；院系只读） ---------------- */
 const CRUD_TABS: TabKey[] = ['school', 'dept', 'major', 'clazz', 'term', 'room'];
@@ -554,10 +658,13 @@ function csvCell(v: unknown): string {
 async function exportCsv() {
   exporting.value = true;
   try {
-    const r = await fetchTab(active.value, { ...query, page: 1, pageSize: 1000 });
+    // 与列表同口径：FILTER_TABS 走「全量 + 本地关键词/筛选」，school/teacher/student 走服务端
+    const local = FILTER_TABS.includes(active.value);
+    const r = await fetchTab(active.value, { ...query, ...(local ? { page: 1, pageSize: 1000, keyword: '' } : {}) });
+    const list = local ? applyLocalFilters(r.list) : r.list;
     const cols = columns.value;
     const head = cols.map(c => csvCell(c.label)).join(',');
-    const body = r.list.map(row => cols.map(c => csvCell(c.render ? c.render(row) : (row[c.prop] ?? ''))).join(','));
+    const body = list.map(row => cols.map(c => csvCell(c.render ? c.render(row) : (row[c.prop] ?? ''))).join(','));
     const csv = '\uFEFF' + [head, ...body].join('\r\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
@@ -566,7 +673,7 @@ async function exportCsv() {
     a.download = `基础数据-${tabLabel}-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(a.href);
-    ElMessage.success(`已导出 ${r.list.length} 条（关键词「${query.keyword || '全部'}」，上限 1000）`);
+    ElMessage.success(`已导出 ${list.length} 条（含当前关键词与筛选条件，上限 1000）`);
   } finally {
     exporting.value = false;
   }
@@ -629,6 +736,32 @@ async function exportCsv() {
     </div>
   </div>
 
+  <!-- 筛选条（FILTER_TABS 前端本地过滤；school/教师/学生不开放。改任意下拉即查询并回第一页） -->
+  <div v-if="activeFilterDefs.length" class="filter-bar">
+    <span class="small muted">筛选</span>
+    <el-select
+      v-for="d in activeFilterDefs"
+      :key="d.prop"
+      :model-value="filters[active]?.[d.prop] ?? ''"
+      :placeholder="'全部' + d.label"
+      clearable
+      style="width: 132px"
+      @change="(v: unknown) => setFilter(d.prop, String(v ?? ''))"
+    >
+      <el-option v-for="o in filterOptions(d)" :key="o.value" :label="o.label" :value="o.value" />
+    </el-select>
+  </div>
+
+  <!-- 已生效的筛选条件 chips（课程总览页同款交互）：可逐个移除，「清空全部」一键重置 -->
+  <div v-if="activeChips.length" class="filter-chips">
+    <span class="chips-label">已筛选</span>
+    <span v-for="c in activeChips" :key="c.prop" class="chip">
+      {{ c.label }}：{{ c.text }}
+      <a class="chip-x" href="javascript:void(0)" title="移除该条件" @click="setFilter(c.prop, '')">×</a>
+    </span>
+    <a class="chips-clear" href="javascript:void(0)" @click="clearFilters">清空全部</a>
+  </div>
+
   <!-- 旧运行包警示：主键被 JSON.parse 截断，写路径不可用（能力检测，换包后自动消失） -->
   <div v-if="idsCorrupted" class="ids-warn">
     <strong>编辑 / 删除暂不可用：</strong>当前运行包（10-26）返回的 19 位主键已被截断，直接操作会定位到错误记录。需发布线换新包（10-28 之后的构建）后自动恢复，列表查看不受影响。
@@ -665,7 +798,7 @@ async function exportCsv() {
       <template #empty>
         <div class="muted small" style="padding: 18px 0">
           <template v-if="active === 'teacher' || active === 'student'">暂无数据（数据源＝账号接口按角色过滤）</template>
-          <template v-else-if="query.keyword">没有匹配「{{ query.keyword }}」的记录</template>
+          <template v-else-if="query.keyword || hasActiveFilters">没有匹配当前{{ query.keyword ? '关键词' : '筛选条件' }}的记录</template>
           <template v-else>
             暂无数据
             <el-button v-if="canCrud" text type="primary" size="small" @click="openCreate">去新增</el-button>
@@ -676,7 +809,7 @@ async function exportCsv() {
 
     <div class="between" style="padding: 12px 16px">
       <span class="small muted">
-        共 {{ total }} 条记录
+        共 {{ total }} 条记录<template v-if="hasActiveFilters || query.keyword">（已按当前条件过滤）</template>
         <span v-if="active === 'teacher' || active === 'student'">（数据来自账号接口，按角色过滤）</span>
         <span v-else-if="active === 'dept'">（来自若依组织架构 sys_dept，删除前须先清空该院系下的用户）</span>
       </span>
@@ -801,6 +934,59 @@ async function exportCsv() {
 .detail-item > span:last-child {
   color: var(--ink-900);
   word-break: break-all;
+}
+
+/* 筛选条（FILTER_TABS 前端本地过滤） */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+/* 已生效筛选 chips（与课程总览页同款视觉） */
+.filter-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -6px 0 12px;
+  padding: 0 2px;
+}
+.chips-label {
+  font-size: 12px;
+  color: var(--ink-400);
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--brand-200);
+  border-radius: 999px;
+  background: var(--brand-50);
+  color: var(--brand-700);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.chip-x {
+  color: var(--brand-600);
+  text-decoration: none;
+  font-size: 13px;
+  line-height: 1;
+}
+.chip-x:hover {
+  color: var(--error);
+}
+.chips-clear {
+  font-size: 12px;
+  color: var(--ink-500);
+  text-decoration: none;
+}
+.chips-clear:hover {
+  color: var(--brand-600);
+  text-decoration: underline;
 }
 
 /* 列设置弹层 */
