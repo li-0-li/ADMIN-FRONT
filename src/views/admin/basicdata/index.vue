@@ -92,6 +92,8 @@ const FILTER_FIELDS: Partial<Record<TabKey, FilterDef[]>> = {
     { prop: 'status', label: '状态', options: DEPT_STATUS_OPTIONS }
   ],
   major: [
+    // 专业表无 school_id，归属经「专业→院系→学校」链推导（fetchTab major 分支挂行）
+    { prop: 'schoolId', label: '学校', optionsKey: 'schools' },
     { prop: 'deptId', label: '所属院系', optionsKey: 'depts' },
     { prop: 'status', label: '状态', options: STATUS_OPTIONS }
   ],
@@ -182,6 +184,30 @@ function ensureFilterOptions() {
 }
 
 /** 各 tab 拉全量（导出用 pageSize=1000；院系走树接口，本地按关键词过滤） */
+/**
+ * 构建「dept 顶级节点 → 学校」归属推导器（院系/专业共用）。
+ * 权威口径（D1，be-admin 8e3f933）：school.dept_root_id 关联 dept 树根，出参带 deptRootId 时按 id 匹配；
+ * 旧包无该字段则按「顶级节点名称 = school 名称」回退（改名不同步会断链，仅过渡）。
+ * 入参是「顶级节点 id + 顶级节点名称」，由调用方从 ancestors 链解析。
+ */
+async function buildSchoolDeriver() {
+  await OPTION_LOADERS.schools();
+  const schoolRows = asRows((await listSchools({ page: 1, pageSize: 500 }))?.list);
+  const schoolIdByRoot = new Map<string, { id: string; name: string }>();
+  const schoolIdByName = new Map<string, { id: string; name: string }>();
+  for (const sc of schoolRows) {
+    const entry = { id: String(sc.schoolId), name: String(sc.name ?? '') };
+    if (sc.deptRootId !== undefined && sc.deptRootId !== null) schoolIdByRoot.set(String(sc.deptRootId), entry);
+    schoolIdByName.set(entry.name, entry);
+  }
+  return (topId: string, topName: string | undefined) => {
+    const byRoot = schoolIdByRoot.get(topId);
+    if (byRoot) return { schoolId: byRoot.id, schoolName: byRoot.name };
+    const byName = topName ? schoolIdByName.get(topName) : undefined;
+    return byName ? { schoolId: byName.id, schoolName: byName.name } : { schoolId: '0', schoolName: '' };
+  };
+}
+
 async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<string, unknown>[]; total: number }> {
   if (tab === 'school') {
     const r = await listSchools(q);
@@ -192,7 +218,25 @@ async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<
     const loaders = { major: listMajors, clazz: listClasses, term: listTerms, room: listClassrooms } as const;
     const r = await loaders[tab]({ page: 1, pageSize: 1000 });
     const list = asRows(r?.list);
-    return { list, total: list.length };
+    if (tab !== 'major') return { list, total: list.length };
+    // 专业的学校归属 = 所属院系（节点或其顶级）的归属：major 表无 school_id，
+    // 走「专业→dept→顶级→school.dept_root_id/名称」链推导；deptId 挂空/挂不存在节点 ⇒ '0'
+    const dres = await listDeptTree();
+    const deptAll = dres.ok ? dres.list.filter(d => d.delFlag !== '2') : [];
+    const deptById = new Map(deptAll.map(d => [String(d.deptId), d]));
+    const deptNameById = new Map(deptAll.map(d => [String(d.deptId), d.deptName]));
+    const deriver = await buildSchoolDeriver();
+    const enriched = list.map(m => {
+      const dept = deptById.get(String(m.deptId ?? ''));
+      let school = { schoolId: '0', schoolName: '' };
+      if (dept) {
+        const topId = (dept.ancestors ?? '').split(',').filter(x => x !== '0')[0] ?? String(dept.deptId);
+        const topName = topId === String(dept.deptId) ? dept.deptName : deptNameById.get(topId);
+        school = deriver(topId, topName);
+      }
+      return { ...m, schoolId: school.schoolId, schoolName: school.schoolName };
+    });
+    return { list: enriched, total: enriched.length };
   }
   if (tab === 'teacher' || tab === 'student') {
     // 教师 / 学生复用账号接口按角色过滤。账号量级小（实测 12 条）⇒ 与五域同口径拉全量，
@@ -214,34 +258,18 @@ async function fetchTab(tab: TabKey, q: BasicDataQuery): Promise<{ list: Record<
   if (!res.ok) return { list: [], total: 0 };
   const all = res.list.filter(d => d.delFlag !== '2');
   const nameById = new Map(all.map(d => [String(d.deptId), d.deptName]));
-  // 学校归属推导：行的归属 = ancestors 链顶级节点。
-  // 权威口径（D1 已落地 be-admin 8e3f933）：school.dept_root_id 关联 dept 树根，
-  // 出参带 deptRootId 时按 id 匹配；旧包无该字段则按「顶级节点名称=school 名称」回退
-  // （名称匹配脆弱：dept 改名与 school 表不同步会断链，仅作旧包过渡）。
-  await OPTION_LOADERS.schools();
-  const schoolRows = asRows((await listSchools({ page: 1, pageSize: 500 }))?.list);
-  const schoolIdByRoot = new Map<string, { id: string; name: string }>();
-  const schoolIdByName = new Map<string, { id: string; name: string }>();
-  for (const sc of schoolRows) {
-    const entry = { id: String(sc.schoolId), name: String(sc.name ?? '') };
-    if (sc.deptRootId !== undefined && sc.deptRootId !== null) schoolIdByRoot.set(String(sc.deptRootId), entry);
-    schoolIdByName.set(entry.name, entry);
-  }
-  const deriveSchool = (d: { deptId: unknown; ancestors?: string; deptName: string }) => {
+  const deriver = await buildSchoolDeriver();
+  const flat = all.map(d => {
     const topId = (d.ancestors ?? '').split(',').filter(x => x !== '0')[0] ?? String(d.deptId);
-    const byRoot = schoolIdByRoot.get(topId);
-    if (byRoot) return { schoolId: byRoot.id, schoolName: byRoot.name };
     const topName = topId === String(d.deptId) ? d.deptName : nameById.get(topId);
-    const byName = topName ? schoolIdByName.get(topName) : undefined;
-    return byName ? { schoolId: byName.id, schoolName: byName.name } : { schoolId: '0', schoolName: '' };
-  };
-  const flat = all.map(d => ({
-    ...d,
-    deptId: String(d.deptId),
-    parentName: nameById.get(String(d.parentId ?? '')) ?? '—',
-    ...deriveSchool(d),
-    children: [] as Record<string, unknown>[]
-  }));
+    return {
+      ...d,
+      deptId: String(d.deptId),
+      parentName: nameById.get(String(d.parentId ?? '')) ?? '—',
+      ...deriver(topId, topName),
+      children: [] as Record<string, unknown>[]
+    };
+  });
   return { list: flat, total: flat.length };
 }
 
@@ -634,6 +662,8 @@ const columns = computed<Col[]>(() => {
       return [
         { prop: 'name', label: '专业名称', link: true },
         { prop: 'majorCode', label: '专业编码' },
+        // 经院系链推导的归属（deptId 挂空或不存在节点显示 —）
+        { prop: 'schoolName', label: '所属学校', render: r => (r.schoolName ? String(r.schoolName) : '—') },
         { prop: 'sortNo', label: '排序号', align: 'right' },
         { prop: 'status', label: '状态', badge: r => statusCls(r.status), render: r => statusLabel(r.status) }
       ];
