@@ -55,7 +55,9 @@ export function resetUserPassword(userId: string) {
 /** B-7 导出账号 Excel（按当前筛选；返回文件流）
  *  后端 AdminAccountServiceImpl.buildExportRows 收的是与列表同一个 UserQueryBo，
  *  并在内部强制 page=1 / pageSize=1000 ⇒ 这里只传筛选项，分页参数发过去也会被覆盖。 */
-export function exportUsers(query: UserQuery) {
+export function exportUsers(
+  query: UserQuery & { schoolId?: string; majorId?: string; clazzId?: string }
+) {
   return requestBlob({ url: `${BASE}/export`, method: 'post', data: query });
 }
 

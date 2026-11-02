@@ -575,12 +575,17 @@ async function onExport() {
       ElMessage.info('当前筛选条件下没有可导出的账号');
       return;
     }
-    // 导出与列表同一套筛选（后端复用 UserQueryBo），否则页面筛完导出的行数对不上眼前所见
+    // 导出与列表同一套筛选（后端复用 UserQueryBo），否则页面筛完导出的行数对不上眼前所见。
+    // ★ 导出是显式挑字段不是整体透传 ⇒ 新增筛选维度必须同步补这里（11-02 实证：漏补时
+    //    命中数预检走 fetchList 带了 clazzId，导出却没带，会出现「预检 3 条、导出 50 条」的错位）。
     const blob = await exportUsers({
       keyword: query.keyword || undefined,
       roleKey: query.roleKey || undefined,
       status: query.status || undefined,
-      deptId: query.deptId
+      deptId: query.deptId,
+      schoolId: query.schoolId,
+      majorId: query.majorId,
+      clazzId: query.clazzId
     });
     saveBlob(blob, `账号数据_${new Date().toISOString().slice(0, 10)}.xlsx`);
     if (hit > EXPORT_MAX_ROWS) {
