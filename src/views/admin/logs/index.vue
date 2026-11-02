@@ -989,4 +989,12 @@ onMounted(() => {
   line-height: 1.7;
   color: var(--ink-500);
 }
+
+/* 编号 68 同根因（基础数据页 2026-10-30 定性）：EP 分页器「当前页」两层规则叠加
+   （background: --el-color-primary + color: --el-pagination-hover-color 又指回 primary）
+   ⇒ brand-600 字压 brand-600 底 = 1.0，当前页数字隐形。覆盖为 --brand-700 底 + 白字（5.48:1 AA）。 */
+:deep(.el-pagination .el-pager li.is-active) {
+  background-color: var(--brand-700);
+  color: #fff;
+}
 </style>
