@@ -2909,6 +2909,17 @@ const autoTermRangeLabel = computed(() => {
 /** 隔周课在本学期实际要写的次数（设置视图明示用；与 autoRepeatTimes('odd'|'even') 同值） */
 const autoOddEvenTimes = computed(() => Math.ceil(termWeekCount.value / 2));
 
+/**
+ * 弹窗说明的悬停细则（2026-11-02）：正文改成用户视角的短句后，权重不再占版面，
+ * 但「为什么排成这样」仍要能查到——挂在说明文字的 title 上，且数字取常量，改权重自动同步。
+ */
+const autoWeightTip = computed(
+  () =>
+    `同班同天每节 +${AUTO_W.sameClassDay}，当天负载每节 +${AUTO_W.dayLoad}；` +
+    `其余：连排 ×${AUTO_W.teacherGap}、无教室 +${AUTO_W.noRoom}、教室空座 ×${AUTO_W.roomSlack}、节次 ×${AUTO_W.period}；` +
+    `共跑 ${AUTO_RESTARTS} 遍取最优，每门排不进扣 ${AUTO_FAIL_PENALTY.toLocaleString()} 分`
+);
+
 /** 阶段一「生成排课方案」：纯内存规划（毫秒级），产出预览；一条数据都不写（P2） */
 function runAuto() {
   if (autoRunning.value || !autoEntries.value.length) return;
@@ -4172,27 +4183,12 @@ watch(
         <span class="detail-k">隔周</span>
         <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">{{ poolParitySummary }}</div>
       </div>
-      <!-- 排课规则说明（2026-11-02，两轮）：第一版是「在教师空闲时段里挑最优格（同班级分天、五天拉平、
-           同人连着上），教室按容量最贴自动配…」——把候选范围（其实是 25 格全枚举、教室不是硬约束）和
-           六项力度都说错了，业主判「太模糊」；第二版把六项权重逐一列出，业主判「太罗嗦」。
-           现版：每条一句、只留决定性的 100 / 6 与失败重罚，其余四项括注在「微调」里。
-           数字仍绑 AUTO_W / AUTO_RESTARTS / AUTO_FAIL_PENALTY，改权重文案自动同步。 -->
-      <p class="small" style="margin: 12px 0 4px">
-        <b>怎么排</b><span class="muted">（本地内存算，不写库）</span>
+      <!-- 排课规则说明（2026-11-02，三轮定稿）：一版「在教师空闲时段里挑最优格…」被判模糊（候选其实是
+           25 格全枚举、教室不是硬约束）；二版逐条列权重被判罗嗦；三版照同类产品的写法收成人话——
+           只讲「先排什么、尽量做到什么、排不下怎么办」，权重挪到 title 悬停里（取常量，改权重自动同步）。 -->
+      <p class="small muted" :title="autoWeightTip" style="margin: 10px 0 0">
+        先生成一份排课方案：可选时段最少的课先排，其余逐门挑时段和教室；同班分天、课时摊匀、老师连堂，教室按人数配最合适的那间。排不下的单独列出来，确认后才写入课表。
       </p>
-      <ul class="small muted" style="margin: 0; padding-left: 18px; line-height: 1.8">
-        <li><b>排序</b>：最紧的先排——教师与班级同时空的格越少，越先占位。</li>
-        <li>
-          <b>选格</b>：25 格里取分最低。同班同天每节 +{{ AUTO_W.sameClassDay }}（最重）、当天负载每节
-          +{{ AUTO_W.dayLoad }}，其余（连排 ×{{ AUTO_W.teacherGap }}、无教室 +{{ AUTO_W.noRoom }}、空座
-          ×{{ AUTO_W.roomSlack }}、节次 ×{{ AUTO_W.period }}）只做微调。
-        </li>
-        <li><b>教室</b>：取容量最小且够用的那间；没有就留空，标「无教室」。</li>
-        <li>
-          <b>排不进</b>：先挪别课让位，仍不行就整批列出（教师满 / 班级满 / 无共同空档）。整套跑
-          {{ AUTO_RESTARTS }} 遍取最优，每门失败扣 {{ AUTO_FAIL_PENALTY.toLocaleString() }} 分。
-        </li>
-      </ul>
       <!-- 班级（2026-10-22 丙）：课程接口不出班级字段，不选就排成"未填班级"的课次（按班级筛选看不到） -->
       <div class="detail-row">
         <span class="detail-k">班级</span>
