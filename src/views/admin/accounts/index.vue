@@ -902,23 +902,6 @@ async function openFootprint(row: AdminUserVo) {
       </el-tooltip>
     </div>
     <div class="right">
-      <!-- 搜索整体单元（与课程审核页同款）：占位文案用覆盖层，物理杜绝选中复制 -->
-      <div class="search-unit">
-        <ZkIcon name="search" :size="14" class="su-icon" />
-        <div class="su-field">
-          <input
-            v-model="query.keyword"
-            class="su-input"
-            aria-label="搜索登录账号 / 姓名 / 手机号 / 工号学号"
-            @keyup.enter="onSearch"
-          />
-          <span v-if="!query.keyword" class="su-ph">搜索登录账号 / 姓名 / 手机号 / 工号学号</span>
-        </div>
-        <button v-if="query.keyword" class="su-clear" title="清空" aria-label="清空搜索" @click="clearKeyword">
-          <ZkIcon name="x" :size="13" />
-        </button>
-        <button class="su-btn" @click="onSearch">搜索</button>
-      </div>
       <!-- placeholder 必须显式写：三个下拉的「全部」项值都是空串，EP 对空值显示 placeholder
            而不是 option 的 label ⇒ 不写就会一起显示默认的「请选择」，看不出这是筛选器。
            （原此处有「角色筛选」小字标签，2026-10-22 用户要求删除；placeholder 已自带语义，不补别的标签。）
@@ -932,12 +915,6 @@ async function openFootprint(row: AdminUserVo) {
           @click="toggleFilterPanel"
         >筛选{{ filterCount ? `（${filterCount}）` : '' }}</el-button>
         <div class="filter-panel">
-          <el-select v-model="query.roleKey" filterable clearable style="width: 130px" placeholder="全部角色" @change="onSearch">
-            <el-option v-for="o in ROLE_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
-          </el-select>
-          <el-select v-model="query.status" filterable clearable style="width: 110px" placeholder="全部状态" @change="onSearch">
-            <el-option v-for="o in STATUS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
-          </el-select>
           <!-- 院系候选 = 若依原生 /system/dept/list 里「学校根子树」的全量节点（编号 23，10-26 换掉原来的账号去重快照）。
                范围与基础数据页同一口径；筛出 0 条是「该院系下确实没有账号」，不是候选缺项。 -->
           <el-select v-model="query.deptId" filterable clearable style="width: 160px" placeholder="全部院系" @change="onDeptFilterChange">
@@ -987,10 +964,35 @@ async function openFootprint(row: AdminUserVo) {
               <el-option v-for="c in clazzChoices" :key="c.clazzId" :label="c.clazzName" :value="String(c.clazzId)" />
             </el-select>
           </template>
-          <div v-else-if="advFilterSupported === false" class="small muted" style="width: 100%">
+          <el-select v-model="query.roleKey" filterable clearable style="width: 130px" placeholder="全部角色" @change="onSearch">
+            <el-option v-for="o in ROLE_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+          </el-select>
+          <el-select v-model="query.status" filterable clearable style="width: 110px" placeholder="全部状态" @change="onSearch">
+            <el-option v-for="o in STATUS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+          </el-select>
+          <!-- 原 v-else-if 紧邻 advFilterSupported 的 template v-if；11-03 重排后角色/状态插到中间，
+               v-else-if 断链 ⇒ 改独立 v-if（与 template 的 v-if 条件互斥，逻辑等价） -->
+          <div v-if="advFilterSupported === false" class="small muted" style="width: 100%">
             学校/专业/班级筛选暂不可用：当前后端运行包还没有这三个筛选维度（参数会被忽略，为免「选了却不筛」已隐藏）。后端换包后自动出现，无需改前端。
           </div>
         </div>
+      </div>
+      <!-- 搜索整体单元（与课程审核页同款）：占位文案用覆盖层，物理杜绝选中复制 -->
+      <div class="search-unit">
+        <ZkIcon name="search" :size="14" class="su-icon" />
+        <div class="su-field">
+          <input
+            v-model="query.keyword"
+            class="su-input"
+            aria-label="搜索登录账号 / 姓名 / 手机号 / 工号学号"
+            @keyup.enter="onSearch"
+          />
+          <span v-if="!query.keyword" class="su-ph">搜索登录账号 / 姓名 / 手机号 / 工号学号</span>
+        </div>
+        <button v-if="query.keyword" class="su-clear" title="清空" aria-label="清空搜索" @click="clearKeyword">
+          <ZkIcon name="x" :size="13" />
+        </button>
+        <button class="su-btn" @click="onSearch">搜索</button>
       </div>
       <el-button text @click="resetQuery">重置</el-button>
     </div>
