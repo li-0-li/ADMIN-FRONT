@@ -994,7 +994,12 @@ async function openFootprint(row: AdminUserVo) {
         </button>
         <button class="su-btn" @click="onSearch">搜索</button>
       </div>
-      <el-button text @click="resetQuery">重置</el-button>
+      <!-- 重置：带描边的次级按钮（课程总览页 10-29 业主反馈后打磨的同款）。
+           原先是无边框 text 按钮，夹在带边框的下拉和搜索单元之间视觉上缺一块（11-03 反馈格格不入）；
+           前一个兄弟是 .search-unit 不是 el-button，EP 的 margin-left:12px 不会叠加，间距仍走 .right 的 gap。 -->
+      <el-button class="reset-btn" @click="resetQuery">
+        <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />重置
+      </el-button>
     </div>
   </div>
 
@@ -1324,8 +1329,8 @@ async function openFootprint(row: AdminUserVo) {
    真页面实测（同源 iframe 造视口，10-23）：左组固有宽 425 + 右组 878 + 间距 12 + 内边距 32 = 单行需 1347px，
    加侧栏 224 与主区内边距 56 ⇒ 视口要到 ~1627px 才容得下单行；1366 可用 1069、1440 可用 1143 ⇒ 都会折成两行（实测高 102px）。
    折行只压纵向高度、不裁内容（实测溢出 0、搜索单元仍 380），所以保留 wrap 兜底；
-   ≤1679px 另走「筛选」浮层：右组缩成 搜索 380 + 开关 58~94 + 重置 46 + 两处间距 20 = 504~540，
-   与左组 425 相加 973~1009 ≤ 1069 ⇒ 1366 起回到单行（开关带计数时最宽 540，仍放得下）。
+   ≤1679px 另走「筛选」浮层：右组缩成 搜索 380 + 开关 58~94 + 重置 ~80（11-03 改描边按钮后变宽，原 46）+ 两处间距 20 = 538~574，
+   与左组 425 相加 963~999 ≤ 1069 ⇒ 1366 起回到单行（开关带计数时最宽 574，仍放得下）。
    .right 也要能换行：只给 .toolbar 换行时，1024 视口下右组 878 > 可用 711，仍溢出 151px。
    只改本页作用域（scoped 选择器带 data-v，不影响其它页面的 .toolbar），共享 theme.css 不动。 */
 .toolbar {
@@ -1333,6 +1338,21 @@ async function openFootprint(row: AdminUserVo) {
 }
 .toolbar .right {
   flex-wrap: wrap;
+}
+
+/* 重置按钮（11-03）：与课程总览页同款次级按钮 —— 实描边 + 品牌色 hover，与左侧带边框的
+   下拉/搜索单元同一视觉重量；高度 32px 与 el-select 齐平（搜索单元 30px，差 2px 是它本来的口径） */
+.reset-btn {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border-color: var(--border-strong);
+  color: var(--ink-700);
+}
+.reset-btn:hover {
+  border-color: var(--brand-400);
+  color: var(--brand-600);
+  background: var(--brand-50);
 }
 
 /* 筛选组：宽视口就地平铺（.right 的直接子项换成这一个组，项间距仍按 theme.css .right 的 10px，
