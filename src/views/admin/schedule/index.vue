@@ -724,12 +724,16 @@ const grid = computed(() =>
  */
 /**
  * 课程池行 = `AdminCourseVo`（`GET /api/v1/admin/courses`）。
- * ★ 这里比共享类型 `CourseBrief` 多声明一个 `major`（2026-11-03）：后端**实测 21/21 行都在下发**
- *   （见 `api/admin/courses.ts` 的 AdminCourseVo.major），只是共享类型没写。
- *   不改 `src/types/admin.ts`（归综合线）——就地加宽，避免跨界动共享契约。
- *   `major` 是「专业筛选能真正落到待排池」的唯一依据：课程**没有**班级/教室字段。
+ * ★ 这里比共享类型 `CourseBrief` 多声明两个字段（2026-11-03），后端都已下发、只是共享类型没写；
+ *   不改 `src/types/admin.ts`（归综合线）——就地加宽，避免跨界动共享契约：
+ *   - `major`：实测 21/21 行都有值，「专业」筛选能真正落到待排池的唯一依据；
+ *   - `targetClasses`：后端 `5058079` 起下发（数据源 `course.target_classes`，json 数组，班级名，
+ *     与 `schedule.target_class` 同口径，**无班级时返回 `[]` 而不是 null**）。
+ *     它是「整门没排过的课」唯一可能知道自己属于哪个班的信息来源。
+ *     ⚠️ 本机 8080 运行包**尚未换到 5058079**，实测响应里没有这个 key ⇒ 读取处一律做
+ *     `Array.isArray()` 能力探测，旧包下自动退化为「未知」，不报错、不误判。
  */
-type PoolCourse = CourseBrief & { major?: string };
+type PoolCourse = CourseBrief & { major?: string; targetClasses?: string[] };
 const poolCourses = ref<PoolCourse[]>([]);
 
 /* ---------- 三重认证门槛（2026-10-29 需求）：只有通过三重认证的课才能排课 ----------
@@ -763,6 +767,8 @@ interface PoolEntry extends CourseBrief {
   key: string;
   /** 专业（来自课程行，见 `PoolCourse`）：外层「专业」筛选靠它落到池子上 */
   major?: string;
+  /** 课程登记的面向班级（来自课程行，见 `PoolCourse`）：整门没排过的课靠它参与「按班级筛课」 */
+  targetClasses?: string[];
   /**
    * 该课程在本学期已有活跃课次 ⇒ 这张签是**重复排课入口**（2026-10-30 P0-A）。
    * 成因：放回=软删课次行，而软删行会一直留在池里成签（后端列表仍返回 deleted 行）；
@@ -817,9 +823,10 @@ function buildPoolEntries(): PoolEntry[] {
  *
  * ★ 筛选能落到哪一层，取决于**数据在哪个粒度上真的存在**：
  *   - 课程（courseId）✔ / 教师（teacherId）✔ / 专业（major）✔ —— 课程行上就有（`AdminCourseVo`）；
- *   - 班级（clazzName）◐ —— 课程行没有，但**放回签自带原课次的班级**，可以精确筛；
- *     整门没排过的课（`course-*` 签）没有任何班级信息 ⇒ 按业主 11-03 口径**保留并报数**，
- *     不假装判断过（见 `poolClazzUnknown`），否则筛一次班级就把新课全灭掉；
+ *   - 班级（clazzName）◐ —— 两种来源（见 `declaredClazzesOf`）：
+ *       放回签用原课次的 `clazzName`（真课次，最准）；
+ *       整门没排过的课用课程行登记的 `targetClasses`（后端 5058079 起下发）；
+ *     两边都没有的签**判断不了归属** ⇒ 保留并单独报数，不假装判过（业主 11-03 口径）；
  *   - 教室（classroomId）✘ —— 不参与候选过滤，改成自动排课的**落点硬锁**（见 `autoLockRoomId`）。
  *     教室是排课结果不是课程属性，用它筛"要排哪些课"在语义上说不通。
  * ★ 学期（termId）走的是 `buildPoolEntries` 里的 scope 口径（判定哪些课次算「已排」），不在这里重复过滤。
@@ -833,10 +840,10 @@ const poolEntries = computed<PoolEntry[]>(() => {
     if (teacherId && String(c.teacherId) !== teacherId) return false;
     // 专业为空的课程在「按专业筛」时按排除处理：宁可少排，不把不明归属的课塞进某个专业批次
     if (major && String(c.major ?? '') !== major) return false;
-    // 班级：只在「这张签知道自己的班级」时才判；不知道的留给 poolClazzUnknown 报数（业主 11-03 定：保留）
+    // 班级：只有**明确登记了别的班**才排除；一条都没登记（未知）的留给 poolClazzUnknown 报数
     if (clazzName) {
-      const own = sourceClazzOf(c);
-      if (own && own !== clazzName) return false;
+      const declared = declaredClazzesOf(c);
+      if (declared && !declared.includes(clazzName)) return false;
     }
     return true;
   });
@@ -850,13 +857,39 @@ const poolFilterExcluded = computed(() => {
 
 /**
  * 按班级筛时「没法判断归属」的签数（业主 11-03 口径：保留在候选里，但必须报出来）。
- * 这些是整门没排过的课——课程上没有班级字段，历史课次也没有，谁都说不准它属不属于这个班。
- * 不报数就等于悄悄按"它属于"处理了，用户会以为筛选是干净的。
+ * 成因有两类，对用户都是同一件事「这条课没登记班级」：
+ *   ① 整门没排过的课，且课程行的 `targetClasses` 为空（数据缺失）；
+ *   ② 本机运行包还没换到 5058079，字段根本不下发（能力探测失败的退化路径）。
+ * 不报数就等于悄悄按"它属于该班"处理了，用户会以为筛选是干净的。
  */
 const poolClazzUnknown = computed(() => {
   if (!filters.clazzName) return 0;
-  return poolEntries.value.filter(c => !sourceClazzOf(c)).length;
+  return poolEntries.value.filter(c => !declaredClazzesOf(c)).length;
 });
+
+/**
+ * 按班级筛时**确实不属于**所选班级、被真筛掉的签数（只按班级这一维统计，与 `poolFilterExcluded` 不混）。
+ * ★ 与 `poolClazzUnknown` 分开报数的原因（审查线 11-03 派单 §4.4）：
+ *   一个是「课程没登记班级」（数据缺失，课上没录），一个是「登记了、但确实不是这个班」（筛对了被排除）。
+ *   混成一个数，用户无法判断到底是该去补数据，还是筛选真的在生效。
+ */
+const poolClazzMismatch = computed(() => {
+  const clz = filters.clazzName;
+  if (!clz) return 0;
+  return buildPoolEntries().filter(c => {
+    const declared = declaredClazzesOf(c);
+    return !!declared && !declared.includes(clz);
+  }).length;
+});
+
+/**
+ * 只有「班级」一个维度在筛候选课（课程/教师/专业都空）。
+ * 用途：避免同一屏把同一个数字报两遍——「筛选」行报总排除数、「班级」行又报"登记别的班级已排除 N 条"，
+ * 两条数字相同而说法不同，用户会以为是两批课。只筛班级时，数字交给「班级」行解释。
+ */
+const onlyClazzFiltering = computed(() =>
+  !!filters.clazzName && !filters.courseId && !filters.teacherId && !filters.major
+);
 
 /* ---------- 待排课程展开浮层（非模态可拖动；内含搜索与教师筛选） ---------- */
 const poolPanelVisible = ref(false);
@@ -2613,15 +2646,38 @@ const poolClazz = reactive<Record<string, string>>({});
 
 /**
  * 这张签**自带的**班级（= 它源自的那条放回课次的班级）。
- * 只有 `lesson-*` 签有：整门没排过的课（`course-*`）在课程粒度上没有班级字段，返回 undefined。
- * ★ 与 `entryClass` 的分工：这里只回答「签自己知道什么」，不做兜底；`entryClass` 才是写入口径
- *   （显式指定 > 自带 > 弹窗默认班级）。班级筛选必须用这个，不能用 entryClass——
- *   否则默认班级会被当成"这门课就属于 A 班"，把筛选变成自证。
+ * 只有 `lesson-*` 签有：整门没排过的课（`course-*`）没有真实课次，返回 undefined。
+ * ★ 只给 `entryClass`（写入口径）用，**不要拿它做班级筛选**——筛选用 `declaredClazzesOf`，
+ *   后者对整门课还会读课程登记的 `targetClasses`。
+ * ★ 也不要把 `targetClasses` 塞进这里：一门课可能登记了多个班，而一条课次只能写一个 `target_class`，
+ *   拿数组第一项当写入值等于替用户瞎猜。
  */
 function sourceClazzOf(entry: PoolEntry): string | undefined {
   if (!entry.key.startsWith('lesson-')) return undefined;
   const src = returnedCells.value.find(r => String(r.scheduleId) === entry.key.slice(7));
   return (src?.clazzName ?? '').trim() || undefined;
+}
+
+/**
+ * 这张签**登记过**的班级集合 —— 只用于「按班级筛课」，不用于写入（写入仍走 `entryClass`）。
+ * 来源按可信度排序：
+ *   ① `lesson-*` 放回签：原课次的 `clazzName`（真实课次，最准，且只有一个）；
+ *   ② `course-*` 整门课：课程行的 `targetClasses`（后端 5058079 起下发，`List<String>`，无班级时 `[]`）。
+ * 返回 `undefined` = **不知道它属于哪个班**（不是"不属于"），调用方必须按"未知"处理并报数，
+ * 绝不能当空数组处理后排除掉——那会让用户以为课丢了（审查线派单 §3 明确要求）。
+ *
+ * ★ `Array.isArray` 是刻意做成能力探测的：本机 8080 运行包还没换到 5058079，
+ *   响应里**没有这个 key**。旧包下返回 undefined ⇒ 走"未知"分支 ⇒ 行为与接入前完全一致，
+ *   既不报错也不误判。换包后自动生效，前端不用改第二次。
+ */
+function declaredClazzesOf(entry: PoolEntry): string[] | undefined {
+  const own = sourceClazzOf(entry);
+  if (own) return [own];
+  if (!entry.key.startsWith('course-')) return undefined;
+  const list = entry.targetClasses;
+  if (!Array.isArray(list)) return undefined;
+  const cleaned = list.map(x => String(x ?? '').trim()).filter(Boolean);
+  return cleaned.length ? cleaned : undefined;
 }
 
 /**
@@ -4376,18 +4432,19 @@ watch(
       <div v-if="poolFilterExcluded || filters.clazzName || filters.classroomId" class="detail-row">
         <span class="detail-k">筛选</span>
         <div class="small" style="flex: 1; min-width: 0; line-height: 1.7">
-          <template v-if="poolFilterExcluded">页面筛选生效中：本次候选 <b>{{ poolEntries.length }}</b> 条，另有 <b>{{ poolFilterExcluded }}</b> 条被筛选排除，<b>不参与这次排课</b>。</template>
+          <template v-if="poolFilterExcluded && !onlyClazzFiltering">页面筛选生效中：本次候选 <b>{{ poolEntries.length }}</b> 条，另有 <b>{{ poolFilterExcluded }}</b> 条被筛选排除，<b>不参与这次排课</b>。</template>
           <template v-else>页面筛选生效中（{{ filters.clazzName ? '班级' : '' }}{{ filters.clazzName && filters.classroomId ? '、' : '' }}{{ filters.classroomId ? '教室' : '' }}）。</template>
           <el-button link size="small" type="primary" @click="clearFiltersForAuto">清掉筛选</el-button>
         </div>
       </div>
-      <!-- 班级筛选的「不知道」部分（2026-11-03 业主口径：保留并报数）。
-           放回签自带原班级、可以精确筛；整门没排过的课课程上没有班级字段，谁都判断不了归属。
-           保留是业主定的（排除会把新课全灭），但必须报出来——不报就等于默认"它属于这个班"。 -->
-      <div v-if="poolClazzUnknown" class="detail-row">
-        <span class="detail-k">说明</span>
+      <!-- 班级筛选的两类计数（2026-11-03 审查线派单 §4.4：必须分开报）。
+           ①「登记了、但确实是别的班」= 筛对了被排除 —— poolClazzMismatch；
+           ②「课程没登记面向班级」= 数据缺失、判断不了，保留在候选里 —— poolClazzUnknown。
+           混成一个数，用户分不清该去补课程数据，还是筛选真的在生效。 -->
+      <div v-if="poolClazzMismatch || poolClazzUnknown" class="detail-row">
+        <span class="detail-k">班级</span>
         <div class="small muted" style="flex: 1; min-width: 0; line-height: 1.7">
-          这 {{ poolEntries.length }} 条里有 <b>{{ poolClazzUnknown }}</b> 条是整门没排过的课，课程上没有班级字段，判断不了属不属于「{{ filters.clazzName }}」，已保留在候选里。
+          按「{{ filters.clazzName }}」筛：<template v-if="poolClazzMismatch"><b>{{ poolClazzMismatch }}</b> 条登记的是别的班级，已排除；</template><template v-if="poolClazzUnknown"><b>{{ poolClazzUnknown }}</b> 条课程未登记面向班级，判断不了，已保留在候选里。</template>
         </div>
       </div>
       <!-- 教室筛选 = 落点硬锁（2026-11-03 业主口径）：教室是排课结果不是课程属性，做不了「筛课」 -->
