@@ -404,9 +404,13 @@ function majorOf(clazzName?: string): string | undefined {
   if (!prefix) return undefined;
   return MAJOR_ABBR[prefix] || majorNames.value.find(n => n.startsWith(prefix)) || prefix;
 }
-/** 专业选项 = **专业主表全量**（listMajors）∪ 本周课次班级推导出的专业。
+/** 专业选项 = **专业主表全量**（listMajors）∪ 本周课次班级推导出的专业 ∪ **课程池里出现的专业**。
  *  ⛔ 只从课次推导的旧口径有致命缺陷：本周课次没登记班级（target_class 空）时下拉直接空——
- *  「全部专业」本就该列出所有可选专业，与本周有没有对应课无关。 */
+ *  「全部专业」本就该列出所有可选专业，与本周有没有对应课无关。
+ *  ★ 2026-11-03 补第三路来源（课程池）：实测本机库 `majors` 表 **0 条**，而课程行 21/21 都带
+ *    `major`（10 个专业名）。不并进来就会出现「专业筛选下拉空着、池子却被静默过滤」——
+ *    用户既筛不动，也不知道自己正在漏课。并进来之后，「能筛的专业」= 「真有课的专业」。
+ */
 const majorOptions = computed(() => {
   const m = new Map<string, string>();
   for (const n of majorNames.value) {
@@ -414,6 +418,10 @@ const majorOptions = computed(() => {
   }
   for (const r of allCells.value) {
     const major = majorOf(r.clazzName);
+    if (major && !m.has(major)) m.set(major, major);
+  }
+  for (const c of poolCourses.value) {
+    const major = (c.major ?? '').trim();
     if (major && !m.has(major)) m.set(major, major);
   }
   return Array.from(m, ([value, label]) => ({ value, label }));
@@ -714,7 +722,15 @@ const grid = computed(() =>
  * ⛔ 仍不接后端端点：`/schedules/auto`（自动排课走页内本地实现，见下方 runAuto）
  *   ✔ 已实现并真发请求：`publishSchedules()`（发布课表，`:2215`）、`deleteSchedule()`（删除课次，`:1294` / `:1300` / `:1475`）
  */
-const poolCourses = ref<CourseBrief[]>([]);
+/**
+ * 课程池行 = `AdminCourseVo`（`GET /api/v1/admin/courses`）。
+ * ★ 这里比共享类型 `CourseBrief` 多声明一个 `major`（2026-11-03）：后端**实测 21/21 行都在下发**
+ *   （见 `api/admin/courses.ts` 的 AdminCourseVo.major），只是共享类型没写。
+ *   不改 `src/types/admin.ts`（归综合线）——就地加宽，避免跨界动共享契约。
+ *   `major` 是「专业筛选能真正落到待排池」的唯一依据：课程**没有**班级/教室字段。
+ */
+type PoolCourse = CourseBrief & { major?: string };
+const poolCourses = ref<PoolCourse[]>([]);
 
 /* ---------- 三重认证门槛（2026-10-29 需求）：只有通过三重认证的课才能排课 ----------
  * 口径：course.status === 'active'。课程审核（C-15）三项材料全过后，后端把 course.status
@@ -745,6 +761,8 @@ const currentTermId = ref('');
 interface PoolEntry extends CourseBrief {
   /** 唯一键：lesson-{scheduleId} / course-{courseId} */
   key: string;
+  /** 专业（来自课程行，见 `PoolCourse`）：外层「专业」筛选靠它落到池子上 */
+  major?: string;
   /**
    * 该课程在本学期已有活跃课次 ⇒ 这张签是**重复排课入口**（2026-10-30 P0-A）。
    * 成因：放回=软删课次行，而软删行会一直留在池里成签（后端列表仍返回 deleted 行）；
@@ -756,12 +774,12 @@ interface PoolEntry extends CourseBrief {
 }
 
 /**
- * 待排池（2026-10-18 改版：1 节课 1 张签，每张可拖 1 次）。
- * ★ 口径一（学期）：「已排」判定锁定学期（选中学期；全部学期按当前学期），否则全部学期视图池恒空。
- * ★ 口径二（放回即回池，10-16 拍板）：本周每条软删课次 = 1 张签，拖一次后端消费一条
- *   （防重复排课堆积），签随刷新逐张消失；本周完全未排的课程仍按课程出 1 张签。
+ * 待排池**全集**：只过三重认证，不叠外层筛选。
+ * 抽成独立函数（2026-11-03）是为了能算出「被外层筛选排除了多少条」——
+ * 不抽出来的话，弹窗只能显示剩下几条，用户看不出还有多少课被筛选挡住了。
+ * 只依赖响应式数据、无副作用，被两个 computed 各调用一次（数据量 ~20 门课，不必优化）。
  */
-const poolEntries = computed<PoolEntry[]>(() => {
+function buildPoolEntries(): PoolEntry[] {
   const scope = filters.termId || currentTermId.value;
   // termId 为 NULL 的课次（演示数据课程未关联学期）按「在范围内」处理，否则选中学期后池子误判全未排
   const inScope = scope
@@ -790,13 +808,37 @@ const poolEntries = computed<PoolEntry[]>(() => {
       out.push({ ...c, key: `course-${c.courseId}`, inSchedule: false });
     }
   }
-  return out.filter(c => {
-    // 三重认证门槛（2026-10-29）：未过认证的课程连签都不出——放回的课次签同拦，防止绕道重排
-    if (!certPassed(c.courseId)) return false;
-    if (filters.courseId && String(c.courseId) !== filters.courseId) return false;
-    if (filters.teacherId && String(c.teacherId) !== filters.teacherId) return false;
+  // 三重认证门槛（2026-10-29）：未过认证的课程连签都不出——放回的课次签同拦，防止绕道重排
+  return out.filter(c => certPassed(c.courseId));
+}
+
+/**
+ * 待排池 = 全集 ∩ 外层筛选（2026-11-03 业主需求：被筛选排除在外的课不参与自动排课）。
+ *
+ * ★ 能落到池子上的筛选只有三个，判断依据是**课程行上真的有没有这个字段**：
+ *   - 课程（courseId）✔ / 教师（teacherId）✔ / 专业（major）✔ —— 都在 `AdminCourseVo` 上；
+ *   - 班级、教室 ✘ —— 它们是**课次**属性（`ScheduleCell.clazzName/classroomId`），
+ *     而待排的课恰恰还没有课次，所以课程粒度上取不到，硬做只能全部误伤成「不参与」。
+ *     班级筛选的作用改到「自动排课默认写入班级」上（见 `openAuto`），语义才不丢。
+ * ★ 学期（termId）走的是 `buildPoolEntries` 里的 scope 口径（判定哪些课次算「已排」），不在这里重复过滤。
+ */
+const poolEntries = computed<PoolEntry[]>(() => {
+  const all = buildPoolEntries();
+  const { courseId, teacherId, major } = filters;
+  if (!courseId && !teacherId && !major) return all;
+  return all.filter(c => {
+    if (courseId && String(c.courseId) !== courseId) return false;
+    if (teacherId && String(c.teacherId) !== teacherId) return false;
+    // 专业为空的课程在「按专业筛」时按排除处理：宁可少排，不把不明归属的课塞进某个专业批次
+    if (major && String(c.major ?? '') !== major) return false;
     return true;
   });
+});
+
+/** 被外层筛选排除的签数（弹窗里必须显示，否则用户以为池子本来就这么多） */
+const poolFilterExcluded = computed(() => {
+  const all = buildPoolEntries().length;
+  return all > poolEntries.value.length ? all - poolEntries.value.length : 0;
 });
 
 /* ---------- 待排课程展开浮层（非模态可拖动；内含搜索与教师筛选） ---------- */
@@ -2502,7 +2544,12 @@ function pickAllEntries(v: boolean) {
 
 function openAuto() {
   if (!poolEntries.value.length) {
-    ElMessage.info('待排课程为空，没有可自动排课的课程');
+    // 池子空有两因：真的没课 / 全被外层筛选挡掉。分开提示，否则用户会以为库里没课。
+    if (poolFilterExcluded.value > 0) {
+      ElMessage.warning(`当前筛选下没有可排的课（有 ${poolFilterExcluded.value} 条被页面筛选排除），先清掉筛选再试`);
+    } else {
+      ElMessage.info('待排课程为空，没有可自动排课的课程');
+    }
     return;
   }
   // 安全默认：每次打开都回到「跳过已在课表的签」，避免上一次勾选遗留成隐性重复排课
@@ -2516,8 +2563,24 @@ function openAuto() {
   autoReport.value = null;
   autoPlan.value = null;
   autoProgress.value = '';
-  autoClass.value = '';
+  // 默认写入班级跟随外层「班级」筛选（2026-11-03）：班级不是课程属性，没法用它筛候选课，
+  // 但它恰好是「排给哪个班」的答案——用户筛了「计科2301」，就该默认排进这个班，而不是让他再选一次。
+  autoClass.value = filters.clazzName || '';
   autoVisible.value = true;
+}
+
+/**
+ * 弹窗内一键清掉外层筛选（2026-11-03）。
+ * ★ 为什么需要：外层筛了某门课/某位老师后，候选课可能只剩 1~2 条，用户在弹窗里看到的是
+ *   「就这么点课」，不知道自己正漏排。给一个就地的出口，比让他关弹窗、找工具栏、再重开省事。
+ * ★ 清的是**会筛掉候选课**的三个维度（课程/教师/专业）；学期保留（它决定「已排」判定范围，
+ *   清掉等于换视界，与「把课放回来」不是一回事）。清完池子变大，勾选态必须重置为全选。
+ */
+function clearFiltersForAuto() {
+  filters.courseId = '';
+  filters.teacherId = '';
+  filters.major = '';
+  resetPoolPick();
 }
 
 /**
@@ -3388,7 +3451,11 @@ watch(
     </span>
     <div class="pool-head">
       <span class="card-title"><ZkIcon name="list-checks" :size="16" />待排课程</span>
-      <span class="small muted">共 {{ poolEntries.length }} 条待排（1 条 = 1 节课）—— 拖到下方课表格子完成排课</span>
+      <span class="small muted">
+        共 {{ poolEntries.length }} 条待排（1 条 = 1 节课）
+        <template v-if="poolFilterExcluded">· 另有 {{ poolFilterExcluded }} 条被筛选排除</template>
+        —— 拖到下方课表格子完成排课
+      </span>
       <span class="spacer" style="flex: 1"></span>
       <button class="btn btn-outline btn-sm" title="展开全部待排课程（可搜索筛选、可拖动）" @click="openPoolPanel">
         <ZkIcon name="eye" :size="13" style="margin-right: 4px" />展开
@@ -3863,7 +3930,7 @@ watch(
           filterable
           style="flex: 1; min-width: 0"
         >
-          <el-option v-for="m in majorNames" :key="m" :label="m" :value="m" />
+          <el-option v-for="o in majorOptions" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
       </div>
       <div class="detail-row">
@@ -4203,6 +4270,24 @@ watch(
       <p class="small muted" :title="autoWeightTip" style="margin: 6px 0 2px; line-height: 1.75">
         时段最少的课先排，其余逐门找空档。尽量同班分天、课时摊匀、老师连堂，教室按人数挑。排不下的列出原因，确认后才写入课表。
       </p>
+      <!-- 外层筛选对候选课的作用（2026-11-03 业主需求：被筛选排除的课不参与自动排课）。
+           必须显式报数：筛了某门课/某位老师后候选只剩 1~2 条，不提示会以为要排的课本来就这么少，
+           排完就当排完了。这里同时给一个就地清筛选的出口。 -->
+      <div v-if="poolFilterExcluded" class="detail-row">
+        <span class="detail-k">筛选</span>
+        <div class="small" style="flex: 1; min-width: 0; line-height: 1.7">
+          页面筛选生效中：本次候选 <b>{{ poolEntries.length }}</b> 条，另有 <b>{{ poolFilterExcluded }}</b> 条被筛选排除，<b>不参与这次排课</b>。
+          <el-button link size="small" type="primary" @click="clearFiltersForAuto">清掉筛选</el-button>
+        </div>
+      </div>
+      <!-- 班级/教室筛选为什么不动候选课：课程行上没有这两个字段（它们属于「课次」），
+           而待排的课恰恰还没有课次。不做说明就是「静默不生效」，用户会以为筛了班就只排这个班。 -->
+      <div v-if="filters.clazzName || filters.classroomId" class="detail-row">
+        <span class="detail-k">说明</span>
+        <div class="small muted" style="flex: 1; min-width: 0; line-height: 1.7">
+          班级、教室是课次的属性，课程上没有，所以这两个筛选不改变候选课；<span v-if="filters.clazzName">已把「{{ filters.clazzName }}」填成下方的默认班级。</span>
+        </div>
+      </div>
       <!-- P0-A 护栏（2026-10-30）：池里会有「课程已在课表」的放回残留签（软删行一直成签），
            它们默认不参与排课，否则每排一次就把那门课重排一遍。这里如实报数，不静默跳。
            2026-11-02 起再加一层「用户自己勾掉」的条数，两者分开报，不混成一句「已跳过」。 -->
