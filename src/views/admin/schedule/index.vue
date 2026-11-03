@@ -815,22 +815,29 @@ function buildPoolEntries(): PoolEntry[] {
 /**
  * 待排池 = 全集 ∩ 外层筛选（2026-11-03 业主需求：被筛选排除在外的课不参与自动排课）。
  *
- * ★ 能落到池子上的筛选只有三个，判断依据是**课程行上真的有没有这个字段**：
- *   - 课程（courseId）✔ / 教师（teacherId）✔ / 专业（major）✔ —— 都在 `AdminCourseVo` 上；
- *   - 班级、教室 ✘ —— 它们是**课次**属性（`ScheduleCell.clazzName/classroomId`），
- *     而待排的课恰恰还没有课次，所以课程粒度上取不到，硬做只能全部误伤成「不参与」。
- *     班级筛选的作用改到「自动排课默认写入班级」上（见 `openAuto`），语义才不丢。
+ * ★ 筛选能落到哪一层，取决于**数据在哪个粒度上真的存在**：
+ *   - 课程（courseId）✔ / 教师（teacherId）✔ / 专业（major）✔ —— 课程行上就有（`AdminCourseVo`）；
+ *   - 班级（clazzName）◐ —— 课程行没有，但**放回签自带原课次的班级**，可以精确筛；
+ *     整门没排过的课（`course-*` 签）没有任何班级信息 ⇒ 按业主 11-03 口径**保留并报数**，
+ *     不假装判断过（见 `poolClazzUnknown`），否则筛一次班级就把新课全灭掉；
+ *   - 教室（classroomId）✘ —— 不参与候选过滤，改成自动排课的**落点硬锁**（见 `autoLockRoomId`）。
+ *     教室是排课结果不是课程属性，用它筛"要排哪些课"在语义上说不通。
  * ★ 学期（termId）走的是 `buildPoolEntries` 里的 scope 口径（判定哪些课次算「已排」），不在这里重复过滤。
  */
 const poolEntries = computed<PoolEntry[]>(() => {
   const all = buildPoolEntries();
-  const { courseId, teacherId, major } = filters;
-  if (!courseId && !teacherId && !major) return all;
+  const { courseId, teacherId, major, clazzName } = filters;
+  if (!courseId && !teacherId && !major && !clazzName) return all;
   return all.filter(c => {
     if (courseId && String(c.courseId) !== courseId) return false;
     if (teacherId && String(c.teacherId) !== teacherId) return false;
     // 专业为空的课程在「按专业筛」时按排除处理：宁可少排，不把不明归属的课塞进某个专业批次
     if (major && String(c.major ?? '') !== major) return false;
+    // 班级：只在「这张签知道自己的班级」时才判；不知道的留给 poolClazzUnknown 报数（业主 11-03 定：保留）
+    if (clazzName) {
+      const own = sourceClazzOf(c);
+      if (own && own !== clazzName) return false;
+    }
     return true;
   });
 });
@@ -839,6 +846,16 @@ const poolEntries = computed<PoolEntry[]>(() => {
 const poolFilterExcluded = computed(() => {
   const all = buildPoolEntries().length;
   return all > poolEntries.value.length ? all - poolEntries.value.length : 0;
+});
+
+/**
+ * 按班级筛时「没法判断归属」的签数（业主 11-03 口径：保留在候选里，但必须报出来）。
+ * 这些是整门没排过的课——课程上没有班级字段，历史课次也没有，谁都说不准它属不属于这个班。
+ * 不报数就等于悄悄按"它属于"处理了，用户会以为筛选是干净的。
+ */
+const poolClazzUnknown = computed(() => {
+  if (!filters.clazzName) return 0;
+  return poolEntries.value.filter(c => !sourceClazzOf(c)).length;
 });
 
 /* ---------- 待排课程展开浮层（非模态可拖动；内含搜索与教师筛选） ---------- */
@@ -2563,8 +2580,8 @@ function openAuto() {
   autoReport.value = null;
   autoPlan.value = null;
   autoProgress.value = '';
-  // 默认写入班级跟随外层「班级」筛选（2026-11-03）：班级不是课程属性，没法用它筛候选课，
-  // 但它恰好是「排给哪个班」的答案——用户筛了「计科2301」，就该默认排进这个班，而不是让他再选一次。
+  // 默认写入班级跟随外层「班级」筛选（2026-11-03）：班级筛选已经能精确筛掉"知道班级"的放回签，
+  // 但整门没排过的课筛不了，所以它同时还是「排给哪个班」的答案——筛了「计科2301」就默认排进这个班。
   autoClass.value = filters.clazzName || '';
   autoVisible.value = true;
 }
@@ -2573,13 +2590,18 @@ function openAuto() {
  * 弹窗内一键清掉外层筛选（2026-11-03）。
  * ★ 为什么需要：外层筛了某门课/某位老师后，候选课可能只剩 1~2 条，用户在弹窗里看到的是
  *   「就这么点课」，不知道自己正漏排。给一个就地的出口，比让他关弹窗、找工具栏、再重开省事。
- * ★ 清的是**会筛掉候选课**的三个维度（课程/教师/专业）；学期保留（它决定「已排」判定范围，
- *   清掉等于换视界，与「把课放回来」不是一回事）。清完池子变大，勾选态必须重置为全选。
+ * ★ 清五个：课程 / 教师 / 专业 / 班级（这三+班级 会筛掉候选）+ 教室（会锁死落点）。
+ *   学期不清——它决定「已排」判定范围，清掉等于换视界，与「把课放回来」不是一回事。
+ *   清完池子变大，勾选态必须重置为全选。
+ * ★ `autoClass`（默认班级）**故意不清**：它已经显示在界面上了，用户看得见也能自己改；
+ *   跟着筛选一起消失反而会让人以为"排出来不用写班级了"。
  */
 function clearFiltersForAuto() {
   filters.courseId = '';
   filters.teacherId = '';
   filters.major = '';
+  filters.clazzName = '';
+  filters.classroomId = '';
   resetPoolPick();
 }
 
@@ -2590,6 +2612,19 @@ function clearFiltersForAuto() {
 const poolClazz = reactive<Record<string, string>>({});
 
 /**
+ * 这张签**自带的**班级（= 它源自的那条放回课次的班级）。
+ * 只有 `lesson-*` 签有：整门没排过的课（`course-*`）在课程粒度上没有班级字段，返回 undefined。
+ * ★ 与 `entryClass` 的分工：这里只回答「签自己知道什么」，不做兜底；`entryClass` 才是写入口径
+ *   （显式指定 > 自带 > 弹窗默认班级）。班级筛选必须用这个，不能用 entryClass——
+ *   否则默认班级会被当成"这门课就属于 A 班"，把筛选变成自证。
+ */
+function sourceClazzOf(entry: PoolEntry): string | undefined {
+  if (!entry.key.startsWith('lesson-')) return undefined;
+  const src = returnedCells.value.find(r => String(r.scheduleId) === entry.key.slice(7));
+  return (src?.clazzName ?? '').trim() || undefined;
+}
+
+/**
  * 这张签实际写入的班级，优先级：签上显式指定 > 放回签的原课次班级 > 弹窗的默认班级。
  * 三处都要读到同一套口径（硬约束 clazzBusy、同班分天、写入的 targetClass），否则会出现
  * 「按 A 班排、写成 B 班」这种对不上的情况。
@@ -2597,11 +2632,8 @@ const poolClazz = reactive<Record<string, string>>({});
 function entryClass(entry: PoolEntry) {
   const explicit = (poolClazz[entry.key] ?? '').trim();
   if (explicit) return explicit;
-  if (entry.key.startsWith('lesson-')) {
-    const src = returnedCells.value.find(r => String(r.scheduleId) === entry.key.slice(7));
-    const own = (src?.clazzName ?? '').trim();
-    if (own) return own;
-  }
+  const own = sourceClazzOf(entry);
+  if (own) return own;
   return autoClass.value.trim();
 }
 
@@ -2792,6 +2824,47 @@ function ctxUnplace(ctx: AutoCtx, teacherId: string | number, clazz: string, slo
   }
 }
 
+/**
+ * 自动排课锁定的教室（外层「教室」筛选，2026-11-03 业主口径：**硬锁，排不进就报**）。
+ * ★ 教室是排课的**落点**、不是课程属性，所以它做不了「筛掉哪些课」，只能约束「排到哪儿」。
+ *   筛了 101 教室 ⇒ 每节课都必须真占到 101，占不到就算排不进（进报告），绝不偷偷换到别的教室。
+ * ★ 空值 = 不锁，仍按容量最贴自动配（原行为）。
+ */
+const autoLockRoomId = computed(() => filters.classroomId || '');
+
+/** 锁定教室对应的记录（弹窗文案与容量判断共用） */
+const autoLockRoom = computed(() =>
+  autoLockRoomId.value ? classroomsAll.value.find(r => String(r.classroomId) === autoLockRoomId.value) : undefined
+);
+
+/**
+ * 同时满足「教师空 + 班级空 + 锁定教室空」的格数。
+ * 不锁定教室时返回 null（调用方回落到只看教师/班级的口径）。
+ * ★ 必须把教室算进自由度：否则一门课看起来还剩 20 格，实际锁定的那个教室全被占了，
+ *   饱和度排序会先排它、然后排不进，把腾挪预算浪费在必然失败的课上。
+ */
+function freeSlotsWithLockedRoom(ctx: AutoCtx, entry: PoolEntry): number | null {
+  const lock = autoLockRoomId.value;
+  if (!lock) return null;
+  const clz = entryClass(entry).trim();
+  // ★ 容量先卡一道（2026-11-03 实测踩到）：锁定教室装不下这门课的学生数时，25 个格**一个都用不了**。
+  //   不算这一条，归因会认为"还有空档"从而提前 return null，用户只看到
+  //   「无可用格（规划期未定位到具体原因）」——最该说清楚的"教室太小"反而丢了。
+  const room = autoLockRoom?.value;
+  const need = entry.studentCount ?? 0;
+  if (room && need && (room.capacity ?? 0) < need) return 0;
+  let n = 0;
+  for (const wd of [1, 2, 3, 4, 5]) {
+    for (const pn of [1, 2, 3, 4, 5]) {
+      if (entry.teacherId && ctx.teacherBusy.has(`${wd}-${pn}-${entry.teacherId}`)) continue;
+      if (clz && ctx.clazzBusy.has(`${wd}-${pn}-${clz}`)) continue;
+      if (ctx.roomBusy.has(`${wd}-${pn}-${lock}`)) continue;
+      n++;
+    }
+  }
+  return n;
+}
+
 /** 单格评估：过硬约束（教师/班级）→ 配容量最贴的空闲教室 → 按 AUTO_W 打分；违反硬约束返回 null */
 function evalAutoSlot(
   ctx: AutoCtx,
@@ -2810,6 +2883,9 @@ function evalAutoSlot(
     if ((r.capacity ?? 0) < need) continue;
     if (!best || (r.capacity ?? 0) < (best.capacity ?? 0)) best = r;
   }
+  // 锁了教室就必须真占到它：占不到（被占/容量不够）就是这格排不进，
+  // 不许退化成「无教室」——那是软约束的行为，和业主定的硬锁相反。
+  if (!best && autoLockRoomId.value) return null;
   const slot: AutoSlot = { weekday: wd, periodNo: pn, classroomId: best?.classroomId, capacity: best?.capacity };
   const used = ctx.teacherPeriods[`${teacherId}|${wd}`] ?? [];
   const score = scoreAutoSlot(slot, {
@@ -2881,7 +2957,9 @@ function noSlotReason(ctx: AutoCtx, entry: PoolEntry): string | null {
     return '课程未指定授课教师，自动排课要求先定教师；可让该课程的授课教师先完成三重认证，或在签上拖拽手动指定';
   }
   const f = slotFreedom(ctx, entry);
-  if (f.common > 0) return null;
+  // 锁了教室时，「有空档」必须是教师+班级+该教室三者同时空，否则会报成"没有共同空档"（误导）
+  const lockedFree = freeSlotsWithLockedRoom(ctx, entry);
+  if (f.common > 0 && (lockedFree === null || lockedFree > 0)) return null;
   const who = entry.teacherName || String(entry.teacherId);
   if (f.freeTeacher === 0) {
     return `教师「${who}」本周 25 个格已排满，排不到任何时间；可换一位该课程教师，或先把这位老师的部分课次放回待排`;
@@ -2890,12 +2968,25 @@ function noSlotReason(ctx: AutoCtx, entry: PoolEntry): string | null {
   if (clz && f.freeClazz === 0) {
     return `班级「${clz}」本周 25 个格已排满，换教师也排不进；可先放回该班级的几节课，或换班级`;
   }
+  // 教室锁定造成的排不进要单独说清楚，否则用户只会看到"没有共同空档"，永远想不到是教室卡住
+  if (autoLockRoomId.value && lockedFree === 0) {
+    const name = autoLockRoom?.value?.name || '所选教室';
+    const cap = autoLockRoom?.value?.capacity ?? 0;
+    const need = entry.studentCount ?? 0;
+    if (cap && need && cap < need) {
+      return `教室筛选已锁定「${name}」（${cap} 人），装不下这门课的 ${need} 人；换个大教室，或先取消教室筛选`;
+    }
+    return `教室筛选已锁定「${name}」，它本周 25 个格已被占满，排不进；可先放回该教室的几节课，或取消教室筛选`;
+  }
   return `教师还剩 ${f.freeTeacher} 格、班级还剩 ${f.freeClazz} 格，但没有共同的空档；把其中一方的一节课挪开就能腾出位置`;
 }
 
 /** 饱和度（Brelaz 1979）：教师×班级当前还剩多少可并存格；缺教师的课返回 ∞ 不参与排序（反正要跳过） */
 function freeAutoSlots(ctx: AutoCtx, entry: PoolEntry): number {
   if (!entry.teacherId) return Number.POSITIVE_INFINITY;
+  // 锁了教室时，教室也是硬约束，自由度要把教室算进去（与 noSlotReason 同一口径）
+  const locked = freeSlotsWithLockedRoom(ctx, entry);
+  if (locked !== null) return locked;
   // 与 noSlotReason 共用 slotFreedom 一处口径：排序与诊断必须看到同一组数字
   return slotFreedom(ctx, entry).common;
 }
@@ -3044,7 +3135,14 @@ function runAuto() {
     return;
   }
   const ctxBase = buildAutoCtx();
-  const roomCandidates = classroomsAll.value.filter(r => (r.status ?? 'active') !== 'inactive');
+  // 教室候选：外层「教室」筛选有值时**硬锁**到该教室（2026-11-03 业主口径）。
+  // 锁定时候选只剩这一间 ⇒ evalAutoSlot 里占不到它就是这格排不进，不会退化成「无教室」。
+  const lock = autoLockRoomId.value;
+  const roomCandidates = classroomsAll.value.filter(r => {
+    if ((r.status ?? 'active') === 'inactive') return false;
+    if (lock && String(r.classroomId) !== lock) return false;
+    return true;
+  });
   // P4 随机重启：同分随机破平跑 N 个方案取罚分最低
   let best: AutoPlan | null = null;
   for (let i = 0; i < AUTO_RESTARTS; i++) {
@@ -4272,20 +4370,31 @@ watch(
       </p>
       <!-- 外层筛选对候选课的作用（2026-11-03 业主需求：被筛选排除的课不参与自动排课）。
            必须显式报数：筛了某门课/某位老师后候选只剩 1~2 条，不提示会以为要排的课本来就这么少，
-           排完就当排完了。这里同时给一个就地清筛选的出口。 -->
-      <div v-if="poolFilterExcluded" class="detail-row">
+           排完就当排完了。这里同时给一个就地清筛选的出口。
+           ★ 显示条件不能只看「有课被排除」：班级/教室筛选可能一条都没排除（新课保留、教室只锁落点），
+             那时按钮会整个消失，用户想清也清不掉（2026-11-03 探针 C1 踩到）。 -->
+      <div v-if="poolFilterExcluded || filters.clazzName || filters.classroomId" class="detail-row">
         <span class="detail-k">筛选</span>
         <div class="small" style="flex: 1; min-width: 0; line-height: 1.7">
-          页面筛选生效中：本次候选 <b>{{ poolEntries.length }}</b> 条，另有 <b>{{ poolFilterExcluded }}</b> 条被筛选排除，<b>不参与这次排课</b>。
+          <template v-if="poolFilterExcluded">页面筛选生效中：本次候选 <b>{{ poolEntries.length }}</b> 条，另有 <b>{{ poolFilterExcluded }}</b> 条被筛选排除，<b>不参与这次排课</b>。</template>
+          <template v-else>页面筛选生效中（{{ filters.clazzName ? '班级' : '' }}{{ filters.clazzName && filters.classroomId ? '、' : '' }}{{ filters.classroomId ? '教室' : '' }}）。</template>
           <el-button link size="small" type="primary" @click="clearFiltersForAuto">清掉筛选</el-button>
         </div>
       </div>
-      <!-- 班级/教室筛选为什么不动候选课：课程行上没有这两个字段（它们属于「课次」），
-           而待排的课恰恰还没有课次。不做说明就是「静默不生效」，用户会以为筛了班就只排这个班。 -->
-      <div v-if="filters.clazzName || filters.classroomId" class="detail-row">
+      <!-- 班级筛选的「不知道」部分（2026-11-03 业主口径：保留并报数）。
+           放回签自带原班级、可以精确筛；整门没排过的课课程上没有班级字段，谁都判断不了归属。
+           保留是业主定的（排除会把新课全灭），但必须报出来——不报就等于默认"它属于这个班"。 -->
+      <div v-if="poolClazzUnknown" class="detail-row">
         <span class="detail-k">说明</span>
         <div class="small muted" style="flex: 1; min-width: 0; line-height: 1.7">
-          班级、教室是课次的属性，课程上没有，所以这两个筛选不改变候选课；<span v-if="filters.clazzName">已把「{{ filters.clazzName }}」填成下方的默认班级。</span>
+          这 {{ poolEntries.length }} 条里有 <b>{{ poolClazzUnknown }}</b> 条是整门没排过的课，课程上没有班级字段，判断不了属不属于「{{ filters.clazzName }}」，已保留在候选里。
+        </div>
+      </div>
+      <!-- 教室筛选 = 落点硬锁（2026-11-03 业主口径）：教室是排课结果不是课程属性，做不了「筛课」 -->
+      <div v-if="autoLockRoomId" class="detail-row">
+        <span class="detail-k">教室</span>
+        <div class="small" style="flex: 1; min-width: 0; line-height: 1.7">
+          已锁定「{{ autoLockRoom?.name || autoLockRoomId }}」：每节课都会排进这个教室，占不到就算排不进并列出原因；想自动配教室就先清掉教室筛选。
         </div>
       </div>
       <!-- P0-A 护栏（2026-10-30）：池里会有「课程已在课表」的放回残留签（软删行一直成签），
