@@ -733,24 +733,46 @@ const grid = computed(() =>
  *     ⚠️ 本机 8080 运行包**尚未换到 5058079**，实测响应里没有这个 key ⇒ 读取处一律做
  *     `Array.isArray()` 能力探测，旧包下自动退化为「未知」，不报错、不误判。
  */
-type PoolCourse = CourseBrief & { major?: string; targetClasses?: string[] };
+type PoolCourse = CourseBrief & {
+  major?: string;
+  targetClasses?: string[];
+  /**
+   * 三项认证是否全过（后端 AdminCourseVo.certPassed，2026-11-05 新增）。
+   * ★ 可选：旧包不下发该字段，certPassed() 里有回退分支，不能按必填用。
+   */
+  certPassed?: boolean;
+};
 const poolCourses = ref<PoolCourse[]>([]);
 
 /* ---------- 三重认证门槛（2026-10-29 需求）：只有通过三重认证的课才能排课 ----------
- * 口径：course.status === 'active'。课程审核（C-15）三项材料全过后，后端把 course.status
- * 置为 active（见 api/admin/certifications.ts 注释与 schema_v9 的 creating/certifying/active/archived）。
+ * 口径（2026-11-05 修正）：后端 AdminCourseVo.certPassed —— certification 表 video/plan/schedule
+ * 三项均 approved。原先用 course.status === 'active'，但该字段不是审核状态：教师端建课可直接写入
+ * active，且审核驳回后不回退，导致未过审的课混进待排池。详见 certPassed() 注释。
  * 作用面：待排池（含自动排课，二者同源）、新增课次的课程下拉、网格内存量课次（标灰 + 角标 + 禁拖）。
  */
 /** courseId -> 课程池记录：认证判定与教师回显共用一张表 */
 const courseById = computed(() => {
-  const m = new Map<string, CourseBrief>();
+  const m = new Map<string, PoolCourse>();
   for (const c of poolCourses.value) m.set(String(c.courseId), c);
   return m;
 });
-/** 该课程是否已通过三重认证。课程池里查不到的课次（历史/脏数据）按未认证处理——宁可多拦，不放未认证的进来。 */
+/**
+ * 该课程是否已通过三重认证。课程池里查不到的课次（历史/脏数据）按未认证处理——宁可多拦，不放未认证的进来。
+ *
+ * ★ 2026-11-05 修正：**不再以 `status === 'active'` 作为过审判据**。
+ *   `course.status` 是开课状态，有两条写入路径：
+ *   ① 三项材料全 approved 时由后端置 active；② 教师端建课直接传 status=active 即写入，不经审核。
+ *   且该状态只升不降——材料事后被驳回也不回退。
+ *   故 active ≠ 已过审，池子曾因此放进一批未过审课程。
+ *   现优先读后端 `certPassed`（certification 表三项 approved，见 AdminCourseVo）。
+ *   旧包（字段不下发）回退到 status 判定：回退值是「旧口径的上限」，不会比现在更宽。
+ */
 function certPassed(courseId: string | number | undefined | null): boolean {
   if (courseId === undefined || courseId === null) return false;
-  return courseById.value.get(String(courseId))?.status === 'active';
+  const c = courseById.value.get(String(courseId));
+  if (!c) return false;
+  if (typeof c.certPassed === 'boolean') return c.certPassed;
+  return c.status === 'active';
 }
 
 /** 本周被「放回待排」的课次（软删行全集）：每条 = 待排池里的一张签 */
@@ -769,6 +791,13 @@ interface PoolEntry extends CourseBrief {
   major?: string;
   /** 课程登记的面向班级（来自课程行，见 `PoolCourse`）：整门没排过的课靠它参与「按班级筛课」 */
   targetClasses?: string[];
+  /**
+   * 放回签的原课次时间坐标（2026-11-05）：只有 key 以 `lesson-` 开头的签才有。
+   * ★ 一门课整周 5 节一次性放回时，池子里是 5 张同名卡；只显示课程名会像「重复数据」，
+   *   带上「原 周X 第N节」才能分辨这一张是哪一节要重排。
+   */
+  fromWeekday?: number;
+  fromPeriodNo?: number;
   /**
    * 该课程在本学期已有活跃课次 ⇒ 这张签是**重复排课入口**（2026-10-30 P0-A）。
    * 成因：放回=软删课次行，而软删行会一直留在池里成签（后端列表仍返回 deleted 行）；
@@ -808,7 +837,14 @@ function buildPoolEntries(): PoolEntry[] {
     if (rows?.length) {
       // 放回即回池：每条放回课次 1 张签（拖一次排回一节）
       for (const r of rows) {
-        out.push({ ...c, key: `lesson-${r.scheduleId}`, inSchedule: used.has(String(r.courseId)) });
+        out.push({
+          ...c,
+          key: `lesson-${r.scheduleId}`,
+          inSchedule: used.has(String(r.courseId)),
+          // 2026-11-05：带上原课次时间坐标，供池子卡片区分「同一门课的哪一节」
+          fromWeekday: r.weekday,
+          fromPeriodNo: r.periodNo
+        });
       }
     } else if (!used.has(String(c.courseId))) {
       out.push({ ...c, key: `course-${c.courseId}`, inSchedule: false });
@@ -2681,6 +2717,29 @@ function declaredClazzesOf(entry: PoolEntry): string[] | undefined {
 }
 
 /**
+ * 池子卡片第二行的区分信息（2026-11-05）：同名课程（高等数学/大学英语）并排时，
+ * 卡片只显示课程名 + 教师名，同一位老师开两个学期就会看起来"完全重复"。
+ *
+ * ★ 不改数据、不合并：`course` 表是「开课记录」粒度（uk_course_code 唯一、course_name 无唯一约束、
+ *   teacher_id/semester 均 NOT NULL），一门课多教师/多学期各一条是正常的多教学班。
+ *   这里只把「学期 · 面向班级」显示出来，让用户一眼分辨哪条是哪条。
+ */
+function poolSubLabel(entry: PoolEntry): string {
+  const parts: string[] = [];
+  // 放回签优先显示原课次时间：一门课整周 5 节全放回时，5 张卡靠「原 周X 第N节」区分
+  if (entry.key.startsWith('lesson-') && entry.fromWeekday && entry.fromPeriodNo) {
+    const wd = CN[entry.fromWeekday - 1] ?? '';
+    const label = PERIODS.find(x => x.seq === entry.fromPeriodNo)?.label ?? `${entry.fromPeriodNo} 节`;
+    parts.push(`原 周${wd} ${label}`);
+  }
+  const sem = (entry.semester ?? '').trim();
+  if (sem) parts.push(sem);
+  const clazzes = declaredClazzesOf(entry);
+  if (clazzes?.length) parts.push(clazzes.join('、'));
+  return parts.join(' · ');
+}
+
+/**
  * 这张签实际写入的班级，优先级：签上显式指定 > 放回签的原课次班级 > 弹窗的默认班级。
  * 三处都要读到同一套口径（硬约束 clazzBusy、同班分天、写入的 targetClass），否则会出现
  * 「按 A 班排、写成 B 班」这种对不上的情况。
@@ -3638,6 +3697,9 @@ watch(
         <ZkIcon name="grip-vertical" :size="13" class="grip" />
         <b>{{ c.courseName }}</b>
         <span class="small muted">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
+        <!-- 同名课程区分（2026-11-05）：course 表是开课记录粒度，一师一学期一条，
+             只显示课程名会让多教学班看起来像重复数据；这里补「学期 · 面向班级」。 -->
+        <span v-if="poolSubLabel(c)" class="small muted pool-sub" :title="poolSubLabel(c)">{{ poolSubLabel(c) }}</span>
         <!-- 重复排课入口的可视化（2026-10-30 P0-A）：这门课还在课表上，这张签是放回留下的软删记录 -->
         <span
           v-if="c.inSchedule"
@@ -5471,6 +5533,15 @@ watch(
 .pool-chip:hover {
   transform: translateY(-1px);
   box-shadow: var(--sh-1);
+}
+/* 同名课程区分信息（2026-11-05）：学期 · 面向班级，比教师名更淡；
+   限宽省略，避免多教学班并排时把池子横向拉得过长 */
+.pool-sub {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  opacity: 0.72;
 }
 /* 自动排课口径胶囊（2026-10-29）：默认淡灰示「每周」，切成隔周后亮品牌色提示这是非默认口径 */
 .chip-parity {
