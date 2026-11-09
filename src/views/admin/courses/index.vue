@@ -4,29 +4,27 @@ import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import type { TableInstance } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
-import { deleteCourse, exportCourses, listCourses } from '@/api/admin/courses';
+import { changeCourseStatus, deleteCourse, exportCourses, getCourse, listCourses } from '@/api/admin/courses';
 import type { AdminCourseOrderBy, AdminCourseVo } from '@/api/admin/courses';
 import { getCertDetail, reviewCertification } from '@/api/admin/certifications';
 import { listSchedules } from '@/api/admin/schedules';
 import { listTerms } from '@/api/admin/basicdata';
 import { useUserStore } from '@/store/user';
-import type { CertDetail } from '@/types/admin';
+import type { AdminCourseDetailVo, CertDetail } from '@/types/admin';
+import CreateCourseDialog from './CreateCourseDialog.vue';
 
 /**
- * 课程总览（2026-10-29 新增）
+ * 课程总览（2026-10-29 新增；T-01 基础课程口径改造，2026-11-06）
  * ============================================================================
- * 定位：**审核已通过的课程**在这里，课程审核页只放待审队列。
- * 两页的边界靠状态字段切：审核通过后后端把 course.status 置为 active（C-15 裁决的副作用），
- * 本页固定查 status=active —— 数据源与审核页完全分离，不需要前端搬数据。
- *
- * ★ 为什么不用 /api/v1/certifications?status=approved 当数据源：
- *   实测（10-29）该接口传 status=rejected 返回的却是 approved 记录 ⇒ status 参数只可靠识别
- *   pending，不能按 approved 精确筛；而且它返回的是"认证聚合行"，没有学期/选课人数/课程代码。
- *   课程列表 C-12 的 status 过滤实测可靠（active 10 / 全集 11），所以本页用它。
+ * ★ T-01 起本页是【基础课程口径】：一门课可开 N 个学期/N 个老师，
+ * 课程代码/教师/学期/人数四列从行上移除（开课明细在详情抽屉的「开课记录」区块，
+ * 数据源 GET /courses/{id} 的 offerings[]）；新增课程编号/开课数两列。
+ * 新建课程走两步向导（CreateCourseDialog：① 基础课程 → ② 开课）。
+ * 状态词表：active 启用 / disabled 已停用（T-01 起管理端只写这两值），
+ * creating/certifying 是课程审核状态、不再出现在本页。
  *
  * ★ 认证材料不是本页主数据：C-14 详情按 courseId 取，历史课程可能没有认证记录
- *   （演示库 10 门 active 课里只有 2 门有 approved 认证）⇒ 详情失败只降级成一句说明，
- *   不弹红条、不阻塞列表——这是"可选信息"，不是"页面必需数据"。
+ *   ⇒ 详情失败只降级成一句说明，不弹红条、不阻塞列表——这是"可选信息"，不是"页面必需数据"。
  */
 
 const loading = ref(false);
@@ -38,6 +36,56 @@ const total = ref(0);
 const loadError = ref('');
 const router = useRouter();
 const userStore = useUserStore();
+/** 新建课程（两步向导）：按钮显隐跟着权限走，与导出同思路 */
+const canAdd = computed(() => userStore.hasPermi('admin:courses:add'));
+/** G5 的另一半：下线用停用不用删（权限 admin:courses:disable） */
+const canDisable = computed(() => userStore.hasPermi('admin:courses:disable'));
+/** 详情抽屉「为这门课开课」：建课第二步权限 */
+const canOffer = computed(() => userStore.hasPermi('admin:offerings:add'));
+
+/* ---------------- 两步建课向导 ---------------- */
+const dialogVisible = ref(false);
+/** 传给向导的起点：null = 从第 1 步开始；有值 = 直接进第 2 步（为已有课程开课） */
+const dialogCourse = ref<{ courseId: string; courseName: string } | null>(null);
+
+function openCreate() {
+  dialogCourse.value = null;
+  dialogVisible.value = true;
+}
+
+function openOfferFor(course: { courseId: string; courseName: string }) {
+  dialogCourse.value = course;
+  dialogVisible.value = true;
+}
+
+/** 停用 / 启用（幂等；后端不级联动开课记录与课次） */
+const toggling = ref('');
+async function toggleStatus(row: AdminCourseVo) {
+  const toDisable = row.status === 'active';
+  const verb = toDisable ? '停用' : '启用';
+  try {
+    await ElMessageBox.confirm(
+      toDisable
+        ? `确定停用课程「${row.courseName}」？停用后不能再为它开新课次/新课；已开的开课记录与课次不受影响。`
+        : `确定启用课程「${row.courseName}」？`,
+      `${verb}课程`,
+      { type: 'warning', confirmButtonText: `确认${verb}`, cancelButtonText: '取消' }
+    );
+  } catch {
+    return;
+  }
+  toggling.value = row.courseId;
+  try {
+    await changeCourseStatus(row.courseId, toDisable ? 'disabled' : 'active');
+    ElMessage.success(`已${verb}课程「${row.courseName}」`);
+    await fetchList();
+  } catch {
+    /* request.ts 已弹后端原话 */
+  } finally {
+    toggling.value = '';
+  }
+}
+
 /**
  * 导出按钮的显示条件是「真有这个权限」，不是「后端换了包」：
  * admin:courses:export 目前既没建菜单也没授角色（10-29 实测 /system/menu/list 里无此 perms），
@@ -50,21 +98,26 @@ const query = reactive<{
   page: number;
   pageSize: number;
   keyword: string;
-  semester: string;
+  /** 学期筛选（term.term_id，T-01 换口径：命中"该学期有开课记录"的课程） */
+  termId: string;
+  /** 状态筛选（T-01：active/disabled；'' = 全部，不再固定 active） */
+  status: string;
   scheduleState: string;
   orderBy: AdminCourseOrderBy | '';
   orderDir: 'asc' | 'desc' | '';
-}>({ page: 1, pageSize: 10, keyword: '', semester: '', scheduleState: '', orderBy: '', orderDir: '' });
+}>({ page: 1, pageSize: 10, keyword: '', termId: '', status: '', scheduleState: '', orderBy: '', orderDir: '' });
 /** 排课筛选下的补充说明（例如全量没拉完），空串=无话可说 */
 const filterNote = ref('');
 /** 是否存在任一筛选条件：决定空态给「清空筛选」还是「去课程审核」 */
-const hasFilter = computed(() => !!query.keyword.trim() || !!query.semester || !!query.scheduleState);
+const hasFilter = computed(
+  () => !!query.keyword.trim() || !!query.termId || !!query.status || !!query.scheduleState
+);
 
-const terms = ref<{ termId: number; name: string }[]>([]);
+const terms = ref<{ termId: string; name: string; code: string }[]>([]);
 const termOptionsReady = computed(() => terms.value.length > 0);
 
-const STATUS_LABEL: Record<string, string> = { active: '已通过', creating: '创建中' };
-const STATUS_BADGE: Record<string, string> = { active: 'badge-success', creating: 'badge-neutral' };
+const STATUS_LABEL: Record<string, string> = { active: '启用', disabled: '已停用' };
+const STATUS_BADGE: Record<string, string> = { active: 'badge-success', disabled: 'badge-neutral' };
 const statusLabel = (s: string) => STATUS_LABEL[s] ?? s ?? '—';
 const statusBadge = (s: string) => STATUS_BADGE[s] ?? 'badge-neutral';
 
@@ -158,8 +211,13 @@ async function loadTerms() {
     // ★ listTerms 的形参必填（BasicDataQuery），不传会类型报错；这里给一页足够用的量
     const res = await listTerms({ page: 1, pageSize: 50 });
     terms.value = (res?.list ?? [])
-      .filter(t => t.name)
-      .map(t => ({ termId: Number(t.termId ?? 0), name: String(t.name) }));
+      .filter((t) => t.name || t.code)
+      .map((t) => ({
+        // ★ 主键一律字符串（19 位雪花 id 过 Number 会丢精度）；筛选值也用 termId 而不是学期名
+        termId: String(t.termId ?? ''),
+        name: String(t.name ?? t.code ?? ''),
+        code: String(t.code ?? '')
+      }));
   } catch {
     /* 学期下拉是辅助筛选，拉不到不影响列表（可按关键词搜）；不打扰用户 */
     terms.value = [];
@@ -183,10 +241,12 @@ const SCHEDULE_FILTER_FETCH_LIMIT = 500;
 async function fetchList() {
   loading.value = true;
   try {
+    // ★ T-01：status 不再固定 active（状态下拉筛选，默认全部）；
+    //   semester 文本筛选换 termId（命中"该学期有开课记录"的课程）
     const base = {
       keyword: query.keyword.trim() || undefined,
-      semester: query.semester || undefined,
-      status: 'active' as const,
+      termId: query.termId || undefined,
+      status: query.status || undefined,
       // 排序：白名单外的值后端会静默回退 courseId desc，所以这里只在有值时才传
       orderBy: query.orderBy || undefined,
       orderDir: query.orderDir || undefined
@@ -270,7 +330,8 @@ function onSearch() {
 
 function resetQuery() {
   query.keyword = '';
-  query.semester = '';
+  query.termId = '';
+  query.status = '';
   query.scheduleState = '';
   query.orderBy = '';
   query.orderDir = '';
@@ -303,16 +364,19 @@ interface ColumnDef {
   label: string;
   locked?: boolean;
 }
+/**
+ * T-01 基础课程口径：删 课程代码/教师/学期/人数 四列（开课属性，一行不再有唯一值），
+ * 加 课程编号/开课数 两列。列设置 storage key 同步换名 —— 旧 key 里存的偏好结构
+ * 是旧列集合，直接复用会读到不存在的列名，换 key 等于一次性作废旧脏数据。
+ */
 const COLUMN_DEFS: ColumnDef[] = [
-  { key: 'courseCode', label: '课程代码' },
+  { key: 'courseNo', label: '课程编号' },
   { key: 'courseName', label: '课程名称', locked: true },
-  { key: 'teacherName', label: '授课教师' },
-  { key: 'semester', label: '学期' },
-  { key: 'studentCount', label: '选课人数' },
   { key: 'status', label: '状态' },
+  { key: 'offeringCount', label: '开课数' },
   { key: 'scheduleCount', label: '排课情况' }
 ];
-const COLUMN_STORAGE_KEY = 'zk_courses_columns';
+const COLUMN_STORAGE_KEY = 'zk_courses_columns_t01';
 const columnVisible = reactive<Record<string, boolean>>({});
 COLUMN_DEFS.forEach((c) => { columnVisible[c.key] = true; });
 const visibleColumnCount = computed(() => COLUMN_DEFS.filter((c) => columnVisible[c.key]).length);
@@ -344,7 +408,7 @@ loadColumnPrefs();
  * 筛完只剩几条时，用户最容易怀疑"数据是不是丢了"。把已生效条件摆成可逐个删除的 chip，
  * 一眼就知道"为什么少"。这是通用数据表规范里最常被提的一条。
  */
-type FilterKey = 'keyword' | 'semester' | 'scheduleState';
+type FilterKey = 'keyword' | 'termId' | 'status' | 'scheduleState';
 interface FilterChip {
   key: FilterKey;
   label: string;
@@ -354,7 +418,11 @@ const SCHEDULE_STATE_TEXT: Record<string, string> = { scheduled: '已排课', un
 const activeFilterChips = computed<FilterChip[]>(() => {
   const chips: FilterChip[] = [];
   if (query.keyword.trim()) chips.push({ key: 'keyword', label: '关键词', text: query.keyword.trim() });
-  if (query.semester) chips.push({ key: 'semester', label: '学期', text: query.semester });
+  if (query.termId) {
+    const term = terms.value.find((t) => t.termId === query.termId);
+    chips.push({ key: 'termId', label: '学期', text: term ? `${term.name}（${term.code}）` : query.termId });
+  }
+  if (query.status) chips.push({ key: 'status', label: '状态', text: statusLabel(query.status) });
   if (query.scheduleState) {
     chips.push({ key: 'scheduleState', label: '排课情况', text: SCHEDULE_STATE_TEXT[query.scheduleState] ?? query.scheduleState });
   }
@@ -373,8 +441,8 @@ function removeFilter(key: FilterKey) {
  * 否则每点一次搜索整张表闪成骨架，比转圈更晃眼。
  */
 const showSkeleton = computed(() => loading.value && rows.value.length === 0 && !loadError.value);
-/** 骨架条的宽度比例，大致对应真实列宽（code/name/teacher/semester/status） */
-const SKELETON_WIDTHS = ['9%', '24%', '13%', '11%', '10%'];
+/** 骨架条的宽度比例，大致对应真实列宽（编号/名称/状态/开课数/排课情况） */
+const SKELETON_WIDTHS = ['11%', '30%', '12%', '13%', '18%'];
 
 /* ================= 筛选视图（B-1）=================
  * 把"关键词 + 学期 + 排课情况 + 排序"存成一个命名视图，下次一键回到这个组合。
@@ -384,13 +452,15 @@ interface FilterView {
   id: string;
   name: string;
   keyword: string;
-  semester: string;
+  termId: string;
+  status: string;
   scheduleState: string;
   orderBy: string;
   orderDir: string;
 }
 const VIEW_STORAGE_KEY = 'zk_courses_views';
-const ORDER_BY_WHITELIST: AdminCourseOrderBy[] = ['semester', 'studentCount', 'scheduleCount'];
+/** T-01 白名单同步：semester/studentCount 列已删，新增 courseNo/offeringCount */
+const ORDER_BY_WHITELIST: AdminCourseOrderBy[] = ['courseNo', 'scheduleCount', 'offeringCount'];
 const savedViews = ref<FilterView[]>([]);
 
 function loadViews() {
@@ -434,7 +504,8 @@ async function saveCurrentView() {
     id: exist?.id ?? String(Date.now()),
     name,
     keyword: query.keyword,
-    semester: query.semester,
+    termId: query.termId,
+    status: query.status,
     scheduleState: query.scheduleState,
     orderBy: query.orderBy,
     orderDir: query.orderDir
@@ -447,7 +518,8 @@ async function saveCurrentView() {
 
 function applyView(v: FilterView) {
   query.keyword = v.keyword ?? '';
-  query.semester = v.semester ?? '';
+  query.termId = v.termId ?? '';
+  query.status = v.status ?? '';
   query.scheduleState = v.scheduleState ?? '';
   // 白名单校验：视图是本地存的，可能来自旧版本或被手改，非法排序字段不能直接发给后端
   query.orderBy = ORDER_BY_WHITELIST.includes(v.orderBy as AdminCourseOrderBy) ? (v.orderBy as AdminCourseOrderBy) : '';
@@ -472,21 +544,21 @@ async function deleteView(v: FilterView) {
 
 /* ================= 批量操作（B-2）=================
  * 规范要求：勾选后才出现批量栏、要显示已选数量，并且**必须说明后果**。
- * ★ 这里曾写错一次（10-29）：原以为后端 C-23 会拒绝删除"名下还有课次"的课程，
- *   于是把这类课程算成"不可删"、按钮直接禁用——而 AdminCourseServiceImpl.deleteCourse
- *   的真实语义是「软删主记录 + 级联软删名下课次」（2026-10-16 起就是这样，10-26 运行包同样），
- *   根本不拒绝。结果演示库 6 门课全都有课次 ⇒ 批量删除永远禁用、功能等于不存在。
- *   现在按真实语义：**全部可删**，但必须提前说清"课次会一起删掉"——
- *   课次是教师端课表的来源，静默级联删除才是真正需要警示的地方。
+ * ★ G5 定案（2026-11-06）改语义：后端不再级联软删课次，而是
+ *   「有开课记录或课次 ⇒ 409 拒绝删除」（业务码 40904，"如需下线请使用停用"）。
+ *   所以批量删除的预期是"部分成功"：无开课记录的正常删、有开课记录的逐条被拒 ——
+ *   确认框和批量栏必须把这两类人数说清，不能再用"课次会一并移除"的旧文案。
  */
 const canRemove = computed(() => userStore.hasPermi('admin:courses:remove'));
 const selectedRows = ref<AdminCourseVo[]>([]);
 const batchDeleting = ref(false);
-/** 勾选里含课次的课程（用于警示"这些课次会被一并移除"，不是"不能删"） */
-const selectedWithSchedule = computed(() => selectedRows.value.filter((r) => (scheduledCount(r) ?? 0) > 0));
-/** 勾选课程的课次总数；统计未取到时按 0 计，文案会退化为"课次（如有）一并移除" */
-const selectedLessonTotal = computed(() =>
-  selectedRows.value.reduce((sum, r) => sum + (scheduledCount(r) ?? 0), 0)
+/** 勾选里可删除的课程（无开课记录且无课次） */
+const selectedDeletable = computed(() =>
+  selectedRows.value.filter((r) => ((r.offeringCount ?? 0) === 0 && (scheduledCount(r) ?? 0) === 0))
+);
+/** 勾选里会被拒绝的课程（有开课记录或课次） */
+const selectedBlocked = computed(() =>
+  selectedRows.value.filter((r) => (r.offeringCount ?? 0) > 0 || (scheduledCount(r) ?? 0) > 0)
 );
 
 function onSelectionChange(sel: AdminCourseVo[]) {
@@ -503,13 +575,13 @@ async function batchDelete() {
     ElMessage.warning('请先勾选要删除的课程');
     return;
   }
-  // 后端不拒删、会级联软删课次 ⇒ 目标是全部勾选项，但确认框必须把课次说清楚
-  const withSched = selectedWithSchedule.value.length;
-  const lessons = selectedLessonTotal.value;
-  const schedTip = withSched
-    ? `；其中 ${withSched} 门名下共 ${lessons} 节课次会一并移除（教师端课表将同步消失）`
-    : '（名下均无课次）';
-  const tip = `将删除 ${targets.length} 门课程${schedTip}。删除为软删，可追溯。确定执行？`;
+  // G5 语义：有开课记录的课会被后端拒绝（40904）—— 提前说清，让用户自己决定要不要试
+  const deletable = selectedDeletable.value.length;
+  const blocked = selectedBlocked.value.length;
+  const tip =
+    `无开课记录的 ${deletable} 门将删除（软删，可追溯）；` +
+    (blocked ? `有开课记录的 ${blocked} 门将被拒绝并逐条提示（如需下线请使用停用）。` : '。') +
+    '确定执行？';
   try {
     await ElMessageBox.confirm(tip, '批量删除', { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' });
   } catch {
@@ -518,7 +590,7 @@ async function batchDelete() {
   batchDeleting.value = true;
   let ok = 0;
   const failures: string[] = [];
-  // 后端只有单条删除接口，逐条发但**逐条收集结果**：一次失败不影响其余
+  // 后端只有单条删除接口，逐条发但**逐条收集结果**：一次失败（40904）不影响其余
   for (const row of targets) {
     try {
       await deleteCourse(row.courseId);
@@ -557,8 +629,8 @@ async function onExport() {
   try {
     const blob = await exportCourses({
       keyword: query.keyword.trim() || undefined,
-      semester: query.semester || undefined,
-      status: 'active',
+      termId: query.termId || undefined,
+      status: query.status || undefined,
       orderBy: query.orderBy || undefined,
       orderDir: query.orderDir || undefined
     });
@@ -566,7 +638,7 @@ async function onExport() {
     saveBlob(blob, `课程清单-${stamp}.xlsx`);
     ElMessage.success(
       query.scheduleState
-        ? '已导出：含当前关键词/学期条件下的全部课程（排课情况筛选不参与导出）'
+        ? '已导出：含当前关键词/学期/状态条件下的全部课程（排课情况筛选不参与导出）'
         : '已导出当前筛选结果'
     );
   } catch {
@@ -594,11 +666,25 @@ const detail = ref<CertDetail | null>(null);
 const detailLoading = ref(false);
 /** 认证材料的缺失原因（历史课程没有认证记录是常态，不是错误） */
 const detailNote = ref('');
+/** T-01：开课记录区块（GET /courses/{id} 的 offerings[]）；拉不到降级为空列表说明 */
+const detailData = ref<AdminCourseDetailVo | null>(null);
+const detailOfferLoading = ref(false);
+
+const COURSE_TYPE_LABEL: Record<string, string> = {
+  required: '必修',
+  elective: '选修',
+  core: '专业核心',
+  public: '公共基础',
+  practice: '实验实践',
+  general: '通识选修'
+};
+const courseTypeLabel = (t?: string | null) => (t ? COURSE_TYPE_LABEL[t] ?? t : '—');
 
 async function openDetail(row: AdminCourseVo) {
   detailCourse.value = row;
   detail.value = null;
   detailNote.value = '';
+  detailData.value = null;
   detailVisible.value = true;
   detailLoading.value = true;
   try {
@@ -608,26 +694,35 @@ async function openDetail(row: AdminCourseVo) {
   } finally {
     detailLoading.value = false;
   }
+  // 开课记录（T-01 新增区块）：失败降级为提示，不阻塞认证材料展示
+  detailOfferLoading.value = true;
+  try {
+    detailData.value = await getCourse(row.courseId);
+  } catch {
+    detailData.value = null;
+  } finally {
+    detailOfferLoading.value = false;
+  }
 }
 
-/* ---------------- 删除课程（C-23）----------------
- * 后端语义（AdminCourseServiceImpl.deleteCourse，2026-10-16 起）：软删主记录，
- * 若名下有课次则**级联软删课次**（scheduleMapper.deleteByCourse），不拒绝。
- * ⇒ 确认框必须提前告知"课次会一起删"，这是不可忽略的连带影响：
- *   课次是教师端课表/学生端课表的来源，删课等于把这门课从所有课表里抹掉。
+/* ---------------- 删除课程（C-23 · G5 定案语义，2026-11-06）----------------
+ * 后端语义（AdminCourseServiceImpl.deleteCourse 重写后）：查开课记录数与课次数，
+ * 任一 > 0 ⇒ 业务码 40904 拒绝（"该课程已有开课记录/课次，不可删除；如需下线请使用停用"）；
+ * 都为 0 ⇒ 软删主记录。
+ * ★ 级联软删课次已移除 —— 确认框不再说"课次会一并移除"，
+ *   而是引导：有开课记录的课走「停用」（详情抽屉的操作按钮）。
  */
 const deleting = ref<string>('');
 
 async function doDelete(row: AdminCourseVo) {
-  const n = scheduledCount(row);
-  const lessonTip =
-    n === null
-      ? '该课程名下的课次（如有）会一并移除'
-      : n > 0
-        ? `该课程名下 ${n} 节课次会一并移除（教师端课表同步消失）`
-        : '该课程名下暂无课次';
+  const blocked = (row.offeringCount ?? 0) > 0 || (scheduledCount(row) ?? 0) > 0;
+  if (blocked) {
+    // 有开课记录/课次：后端必拒（40904）。直接引导去停用，别让用户白点一遍吃 409
+    ElMessage.warning(`「${row.courseName}」已有开课记录或课次，不可删除；如需下线请使用停用`);
+    return;
+  }
   const ok = await ElMessageBox.confirm(
-    `确定删除课程「${row.courseName}」（${row.courseCode}）吗？${lessonTip}。删除为软删（可追溯），课程与课次记录将不再出现在管理端。`,
+    `确定删除课程「${row.courseName}」（${row.courseNo || '未设编号'}）吗？该课程暂无开课记录，删除为软删（可追溯）。`,
     '删除课程',
     { type: 'warning', confirmButtonText: '确定删除' }
   ).catch(() => false);
@@ -640,7 +735,7 @@ async function doDelete(row: AdminCourseVo) {
     if (rows.value.length === 1 && query.page > 1) query.page -= 1;
     await fetchList();
   } catch {
-    /* request.ts 已弹后端原话（如"课程下还有课次，请先移除"），这里不重复 */
+    /* request.ts 已弹后端原话（40904 拒绝 / 404 等），这里不重复 */
   } finally {
     deleting.value = '';
   }
@@ -778,14 +873,15 @@ onMounted(async () => {
     <div class="right" style="gap: 10px">
       <el-input
         v-model="query.keyword"
-        placeholder="课程名称 / 课程代码"
+        placeholder="课程名称 / 课程编号"
         clearable
         style="width: 220px"
         @keyup.enter="onSearch"
         @clear="onSearch"
       />
+      <!-- 学期筛选（T-01 换口径）：值 = term.term_id，命中"该学期有开课记录"的课程 -->
       <el-select
-        v-model="query.semester"
+        v-model="query.termId"
         placeholder="全部学期"
         clearable
         filterable
@@ -793,7 +889,17 @@ onMounted(async () => {
         :disabled="!termOptionsReady"
         @change="onSearch"
       >
-        <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="t.name" />
+        <el-option
+          v-for="t in terms"
+          :key="t.termId"
+          :label="t.code ? `${t.name}（${t.code}）` : t.name"
+          :value="t.termId"
+        />
+      </el-select>
+      <!-- 状态筛选（T-01）：不再固定 active，默认全部 -->
+      <el-select v-model="query.status" placeholder="全部状态" clearable style="width: 120px" @change="onSearch">
+        <el-option label="启用" value="active" />
+        <el-option label="已停用" value="disabled" />
       </el-select>
       <!-- 排课情况筛选（10-29 新增）：与「排课情况」列同源，都基于课次聚合 -->
       <el-select
@@ -856,8 +962,8 @@ onMounted(async () => {
       >
         <!-- 勾选列只对"能删"的人显示：没权限却摆勾选框，用户会以为能批量操作 -->
         <el-table-column v-if="canRemove" type="selection" width="44" fixed="left" />
-        <el-table-column v-if="columnVisible.courseCode" label="课程代码" width="100" prop="courseCode" fixed="left">
-          <template #default="{ row }">{{ row.courseCode || '—' }}</template>
+        <el-table-column v-if="columnVisible.courseNo" label="课程编号" width="110" prop="courseNo" fixed="left">
+          <template #default="{ row }">{{ row.courseNo || '—' }}</template>
         </el-table-column>
         <!-- 名称可能很长（如「小程序教师端测试课程1」）：规范要求超长以 … 省略、悬停看全文 -->
         <el-table-column v-if="columnVisible.courseName" label="课程名称" min-width="170" prop="courseName" show-overflow-tooltip>
@@ -867,32 +973,21 @@ onMounted(async () => {
             <a class="course-link" href="javascript:void(0)" @click="openDetail(row)">{{ row.courseName }}</a>
           </template>
         </el-table-column>
-        <el-table-column v-if="columnVisible.teacherName" label="授课教师" width="110" prop="teacherName">
-          <template #default="{ row }">{{ row.teacherName || '—' }}</template>
-        </el-table-column>
-        <el-table-column
-          v-if="columnVisible.semester"
-          label="学期"
-          width="110"
-          prop="semester"
-          :sortable="canServerSort ? 'custom' : false"
-        >
-          <template #default="{ row }">{{ row.semester || '—' }}</template>
-        </el-table-column>
-        <el-table-column
-          v-if="columnVisible.studentCount"
-          label="选课人数"
-          width="90"
-          align="center"
-          prop="studentCount"
-          :sortable="canServerSort ? 'custom' : false"
-        >
-          <template #default="{ row }">{{ row.studentCount ?? 0 }}</template>
-        </el-table-column>
         <el-table-column v-if="columnVisible.status" label="状态" width="90">
           <template #default="{ row }">
             <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
           </template>
+        </el-table-column>
+        <!-- 开课数（T-01 新列）：0 = 只建了基础课程还没开课（两步建课第一步完成后的合法状态） -->
+        <el-table-column
+          v-if="columnVisible.offeringCount"
+          label="开课数"
+          width="90"
+          align="center"
+          prop="offeringCount"
+          :sortable="canServerSort ? 'custom' : false"
+        >
+          <template #default="{ row }">{{ row.offeringCount ?? '—' }}</template>
         </el-table-column>
         <!-- 排课情况：三种状态必须可辨：— = 统计没拿到 / 未排课 = 真的 0 节 / N 节 = 已排 -->
         <el-table-column
@@ -920,11 +1015,18 @@ onMounted(async () => {
         </el-table-column>
         <!-- 操作列冻结：规范要求"数据列无法一屏展示时操作列默认冻结"，
              否则窗口一窄就只剩半截「查看」（10-29 实测过 1280 下被裁） -->
-        <el-table-column label="操作" width="150" align="right" fixed="right" class-name="courses-op">
+        <el-table-column label="操作" width="210" align="right" fixed="right" class-name="courses-op">
           <template #default="{ row }">
             <el-button text size="small" @click="openDetail(row)">
               <ZkIcon name="eye" :size="14" style="margin-right: 3px" />查看
             </el-button>
+            <el-button
+              v-if="canDisable"
+              text
+              size="small"
+              :loading="toggling === row.courseId"
+              @click="toggleStatus(row)"
+            >{{ row.status === 'active' ? '停用' : '启用' }}</el-button>
             <el-button
               v-if="canRemove"
               text
@@ -935,16 +1037,17 @@ onMounted(async () => {
             >删除</el-button>
           </template>
         </el-table-column>
-        <!-- 空态说明"为什么空 + 去哪看"：本页只列已通过课程，用户最容易误以为课程丢了 -->
+        <!-- 空态说明"为什么空 + 去哪看"：本页列全部基础课程（状态默认全部），
+             用户筛空时最可能是条件问题 -->
         <template #empty>
           <div class="empty-block">
             <ZkIcon name="book-open" :size="26" />
-            <div class="empty-title">{{ loadError ? '数据未取到' : hasFilter ? '当前筛选条件下没有课程' : '还没有审核通过的课程' }}</div>
+            <div class="empty-title">{{ loadError ? '数据未取到' : hasFilter ? '当前筛选条件下没有课程' : '还没有课程' }}</div>
             <div v-if="loadError" class="small muted">原因见上方提示条，也可点下方按钮重试。</div>
             <div v-else-if="hasFilter" class="small muted">
-              已通过审核的课程可能被关键词/学期/排课情况条件排除了，清空条件即可看到全部。
+              课程可能被关键词/学期/状态/排课情况条件排除了，清空条件即可看到全部。
             </div>
-            <div v-else class="small muted">课程在「课程审核」通过后才会出现在这里。</div>
+            <div v-else class="small muted">点右上角「新建课程」创建第一门基础课程。</div>
             <div class="empty-actions">
               <el-button v-if="loadError" size="small" @click="fetchList">
                 <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />重新加载
@@ -954,8 +1057,8 @@ onMounted(async () => {
                   <ZkIcon name="refresh-cw" :size="14" style="margin-right: 4px" />清空筛选
                 </el-button>
               </template>
-              <el-button v-else size="small" type="primary" @click="router.push('/admin/review')">
-                <ZkIcon name="badge-check" :size="14" style="margin-right: 4px" />去课程审核
+              <el-button v-else-if="canAdd" size="small" type="primary" @click="openCreate">
+                <ZkIcon name="plus" :size="14" style="margin-right: 4px" />新建课程
               </el-button>
             </div>
           </div>
@@ -973,14 +1076,13 @@ onMounted(async () => {
       </div>
     </div>
 
-    <!-- 批量操作栏：勾选后才出现。规范要求显示"已选数量"和"哪些有额外影响"。
-         ★ 这里说的是"课次会被一并移除"，不是"不能删"——后端是级联软删，不拒删。 -->
+    <!-- 批量操作栏：勾选后才出现。G5 语义：有开课记录的会被后端拒绝，提前说清两类去向。 -->
     <div v-if="canRemove && selectedRows.length" class="batch-bar">
       <span class="batch-count">已选 <b>{{ selectedRows.length }}</b> 门</span>
-      <span v-if="selectedWithSchedule.length" class="batch-warn">
-        其中 {{ selectedWithSchedule.length }} 门仍有 {{ selectedLessonTotal }} 节课次，删除会一并移除
+      <span class="batch-ok">其中 {{ selectedDeletable.length }} 门无开课记录将删除</span>
+      <span v-if="selectedBlocked.length" class="batch-warn">
+        {{ selectedBlocked.length }} 门有开课记录将被拒绝（如需下线请使用停用）
       </span>
-      <span v-else class="batch-ok">名下均无课次</span>
       <div class="batch-actions">
         <el-button size="small" @click="clearSelection">取消选择</el-button>
         <el-button size="small" type="danger" :loading="batchDeleting" @click="batchDelete">
@@ -992,7 +1094,7 @@ onMounted(async () => {
     <div class="between" style="padding: 12px 16px">
       <span class="small muted">
         <template v-if="loadError">记录数未取到（加载失败）</template>
-        <template v-else>共 {{ total }} 门已通过课程</template>
+        <template v-else>共 {{ total }} 门课程</template>
         <!-- 总数口径说明：按排课筛时 total 是本地过滤后的数，与后端 total 不同，必须写明 -->
         <span v-if="filterNote" class="filter-note">{{ filterNote }}</span>
       </span>
@@ -1010,18 +1112,21 @@ onMounted(async () => {
     </div>
   </div>
 
-  <!-- 详情抽屉：课程基本信息 + 认证材料（材料缺失只降级说明，不当错误） -->
+  <!-- 详情抽屉（T-01 基础口径）：基本信息（编号/专业/学分/学时/类型/状态）
+       + 开课记录区块（offerings[]，第二步回显入口）+ 认证材料（材料缺失只降级说明，不当错误） -->
   <el-drawer v-model="detailVisible" :title="detailCourse?.courseName ?? '课程详情'" size="460px">
     <div v-if="detailCourse" class="stack" style="gap: 14px">
       <div class="pf-grid">
-        <div class="pf-row"><span class="k">课程代码</span><span>{{ detailCourse.courseCode || '—' }}</span></div>
-        <div class="pf-row"><span class="k">授课教师</span><span>{{ detailCourse.teacherName || '—' }}</span></div>
-        <div class="pf-row"><span class="k">学期</span><span>{{ detailCourse.semester || '—' }}</span></div>
-        <div class="pf-row"><span class="k">选课人数</span><span>{{ detailCourse.studentCount ?? 0 }}</span></div>
+        <div class="pf-row"><span class="k">课程编号</span><span>{{ detailCourse.courseNo || '—' }}</span></div>
+        <div class="pf-row"><span class="k">面向专业</span><span>{{ detailCourse.major || '—' }}</span></div>
+        <div class="pf-row"><span class="k">学分</span><span>{{ detailCourse.credit ?? '—' }}</span></div>
+        <div class="pf-row"><span class="k">学时</span><span>{{ detailCourse.hours ?? '—' }}</span></div>
+        <div class="pf-row"><span class="k">课程类型</span><span>{{ courseTypeLabel(detailCourse.courseType) }}</span></div>
         <div class="pf-row">
           <span class="k">状态</span>
           <span class="badge" :class="statusBadge(detailCourse.status)">{{ statusLabel(detailCourse.status) }}</span>
         </div>
+        <div class="pf-row"><span class="k">开课数</span><span>{{ detailCourse.offeringCount ?? '—' }}</span></div>
         <div class="pf-row">
           <span class="k">排课情况</span>
           <span>
@@ -1029,6 +1134,51 @@ onMounted(async () => {
             <template v-else-if="scheduledCount(detailCourse) === 0">未排课</template>
             <template v-else>已排 {{ scheduledCount(detailCourse) }} 节</template>
           </span>
+        </div>
+      </div>
+
+      <!-- 开课记录（T-01 新增）：一门课可开 N 个学期/N 个老师，明细在这里；
+           「为这门课开课」直达两步向导第 2 步 -->
+      <div>
+        <div class="section-title">
+          开课记录
+          <el-button
+            v-if="canOffer"
+            size="small"
+            type="primary"
+            plain
+            style="margin-left: 8px"
+            @click="openOfferFor({ courseId: detailCourse.courseId, courseName: detailCourse.courseName })"
+          >
+            <ZkIcon name="plus" :size="13" style="margin-right: 3px" />为这门课开课
+          </el-button>
+        </div>
+        <div v-loading="detailOfferLoading">
+          <div v-if="(detailData?.offerings ?? []).length" class="stack" style="gap: 8px">
+            <div v-for="o in detailData?.offerings" :key="o.offeringId" class="material-row offering-row">
+              <ZkIcon name="calendar" :size="15" />
+              <div style="min-width: 0">
+                <div style="font-weight: 600">
+                  {{ o.termCode || '—' }}
+                  <span class="badge" :class="o.status === 'active' ? 'badge-success' : 'badge-neutral'" style="margin-left: 6px">
+                    {{ o.status === 'active' ? '进行中' : '已归档' }}
+                  </span>
+                </div>
+                <div class="small muted">
+                  {{ o.teacherName || '教师未知' }}
+                  <template v-if="(o.targetClasses ?? []).length"> · {{ o.targetClasses.join('、') }}</template>
+                  <template v-else-if="o.classKey"> · {{ o.classKey }}</template>
+                </div>
+                <div class="small muted">
+                  加课码 <b>{{ o.joinCode }}</b> · 课次 {{ o.scheduleCount ?? 0 }} 节
+                  <template v-if="o.weekCount"> · {{ o.weekCount }} 教学周</template>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div v-else-if="!detailOfferLoading" class="small muted">
+            该课程还没有开课记录（只建了基础课程）。点上方「为这门课开课」完成第二步。
+          </div>
         </div>
       </div>
 
@@ -1068,6 +1218,10 @@ onMounted(async () => {
       <el-button @click="detailVisible = false">关闭</el-button>
     </template>
   </el-drawer>
+
+  <!-- 两步建课向导（T-01）：page-head「新建课程」从第 1 步进；
+       抽屉「为这门课开课」带 startCourse 直接进第 2 步 -->
+  <CreateCourseDialog v-model:visible="dialogVisible" :start-course="dialogCourse" @created="fetchList" />
 </template>
 
 <style scoped>

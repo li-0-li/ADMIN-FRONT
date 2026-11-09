@@ -1907,7 +1907,11 @@ async function returnToPool(cell: ScheduleCell) {
   }
 }
 
-/* ---------- C-23 删除课程（双重确认）：软删课程主记录 + 级联软删其全部课次 ---------- */
+/* ---------- C-23 删除课程（G5 定案语义，2026-11-06）：
+   有开课记录或课次 ⇒ 后端 409/40904 拒绝（"如需下线请使用停用"）；都为 0 才软删。
+   ★ 级联软删课次已移除 —— 确认文案不再说"课次会一并移除"。
+   ⚠️ 本入口从课次/课表进来，目标课程名下必有课次 ⇒ 大概率被 40904 拒绝：
+      文案如实说明，后端拒绝时 toast 后端原话（request.ts 已处理）。 */
 const deletingCourse = ref(false);
 async function confirmCourseDelete(courseId: string | number, name: string) {
   if (deletingCourse.value) return;
@@ -1917,7 +1921,7 @@ async function confirmCourseDelete(courseId: string | number, name: string) {
   }
   try {
     await ElMessageBox.confirm(
-      `确定要删除课程「${name}」吗？该课程名下的课次也会一并从课表移除。`,
+      `确定要删除课程「${name}」吗？若该课程名下还有开课记录或课次，删除将被拒绝（如需下线请使用停用）。`,
       '删除课程',
       { type: 'warning', confirmButtonText: '继续', cancelButtonText: '取消' }
     );

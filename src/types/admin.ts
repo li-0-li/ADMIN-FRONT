@@ -587,3 +587,78 @@ export interface FootprintVo {
   logins: FootprintLoginItem[];
   opers: FootprintOperItem[];
 }
+
+/* ================= 基础课程层（T-01，2026-11-06） ================= */
+
+/**
+ * 开课记录行（AdminOfferingVo —— T-01 契约底座，T-02 在此扩翻页/编辑/归档/重置加课码，
+ * ★ 字段命名不得再改）。
+ * targetClasses 是班级名【字符串数组】如 ["计科2026-1班"]（业主定案禁对象格式，
+ * 与教师端 replace(replace(...)) 的解析口径一致）。
+ */
+export interface AdminOfferingVo {
+  offeringId: string;
+  termId: string;
+  /** 学期编码（T-00b 统一后如 26-27-1） */
+  termCode: string;
+  teacherId: string;
+  teacherName?: string | null;
+  /** 班级编码组合（clazz_code 按 clazz_id 升序 | 拼接；无班级为空串） */
+  classKey: string;
+  /** 班级名字符串数组；无班级为空数组 */
+  targetClasses: string[];
+  /** 加课码（学生输入加入本开课） */
+  joinCode: string;
+  studentCount: number;
+  /** 该开课名下未删除课次数（走 schedule.offering_id） */
+  scheduleCount: number;
+  /** 教学周数（T-00a 迁移行可能为 null = 还没设过） */
+  weekCount?: number | null;
+  /** active 进行中 / archived 已归档 */
+  status: string;
+  createTime: string;
+}
+
+/** 课程详情出参（GET /api/v1/admin/courses/{courseId}；列表行 + 简介 + 内嵌开课记录） */
+export interface AdminCourseDetailVo {
+  courseId: string;
+  courseNo: string;
+  courseName: string;
+  major?: string | null;
+  credit?: number | null;
+  hours?: number | null;
+  courseType?: string | null;
+  description?: string | null;
+  /** active 启用 / disabled 已停用 */
+  status: string;
+  scheduleCount: number;
+  offeringCount: number;
+  certPassed?: boolean;
+  schoolId: string;
+  createTime?: string;
+  updateTime?: string;
+  offerings: AdminOfferingVo[];
+}
+
+/** 建课第二步入参（POST /api/v1/admin/courses/{courseId}/offerings）。
+ * termCode/classKey/target_classes 由后端派生（termId 反查 term.code；clazzIds 派生
+ * class_key = clazz_code 按 clazz_id 升序 | 拼接、target_classes = 同序班级名字符串数组），
+ * ★ 前端不传这三个字段，传了也被忽略。 */
+export interface OfferingCreateBo {
+  /** 学期（下拉选 GET /admin/terms；后端反查 code） */
+  termId: string;
+  /** 授课教师（教师下拉 GET /admin/users?roleKey=teacher） */
+  teacherId: string;
+  /** 班级多选（GET /admin/classes）；空 = 不绑班级。含停用/跨校班级 ⇒ 422 拒绝 */
+  clazzIds?: string[];
+  /** 加课码（可空；不传自动生成 JM + 6 位）；手填须过正则 + 全局唯一 */
+  joinCode?: string;
+  /** 教学周数（默认 18，1~30，校验在后端） */
+  weekCount?: number;
+  /** 本学期教学大纲（可空） */
+  outline?: string;
+  /** 是否公开课（默认 0） */
+  isPublic?: number;
+  /** 开课级 AI 日配额（可空；空则用全局 sys_config） */
+  aiQuota?: number;
+}
