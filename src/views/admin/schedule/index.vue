@@ -2091,7 +2091,9 @@ async function saveDetail() {
 /* ---------- 新增课次（C-17 真接口） ---------- */
 const createVisible = ref(false);
 const saving = ref(false);
-const form = reactive({ courseId: '', teacherId: '', classroomId: '', clazzName: '', weekday: 1, periodNo: 1 });
+/** termId（2026-11-09 A4）：排课归属学期，必选。放在 form 里而不是直接读页面筛选，
+ *  是因为「排到哪个学期」与「现在看哪个学期」是两件事，用户必须能分别控制。 */
+const form = reactive({ termId: '', courseId: '', teacherId: '', classroomId: '', clazzName: '', weekday: 1, periodNo: 1 });
 const createTitle = ref('新增课次');
 /** 新增课次弹窗里的「上课班级」下拉，@opened 时把焦点直接放到这个必填项 */
 const clazzSelRef = ref<{ focus?: () => void } | null>(null);
@@ -2225,6 +2227,11 @@ async function openCreate(
   form.clazzName = '';
   form.weekday = weekday ?? 1;
   form.periodNo = periodNo ?? 1;
+  // 学期默认取当前浏览学期（省一次点击），用户可改；未选则「确定」不可点（A4：不接受隐式归属）
+  form.termId = String(filters.termId || currentTermId.value || '');
+  // 周次区间默认整学期：起点第 1 周、结束周 = 该学期真实周数（#11 上限跟学期走）
+  repeatForm.weekFrom = 1;
+  repeatForm.weekTo = defaultWeekTo.value;
   // 每周多节：额外节位给个顺手默认（第 2 节默认排到下一工作日、同时段），并同步总节数满额
   for (const s of extraSlots) {
     s.weekday = form.weekday >= 5 ? 1 : form.weekday + 1;
@@ -2254,6 +2261,14 @@ function onCreateOpened() {
 }
 
 async function submitCreate() {
+  if (!form.termId) {
+    ElMessage.warning('请先选择学期');
+    return;
+  }
+  if (createWeekRangeError.value) {
+    ElMessage.warning(createWeekRangeError.value);
+    return;
+  }
   if (!form.courseId) {
     ElMessage.warning('请选择课程');
     return;
@@ -2295,7 +2310,19 @@ async function submitCreate() {
         periodNo: form.periodNo,
         targetClass: form.clazzName.trim() || undefined
       },
-      { slots, capTotal: repeatForm.total }
+      {
+        slots,
+        capTotal: repeatForm.total,
+        // 显式传周次区间：repeatDates 默认读 repeatForm，但这里明确写出「铺哪几周」，
+        // 避免将来 repeatForm 结构变化时被静默带偏（2026-11-09）
+        repeat: { mode: repeatForm.mode, weekFrom: repeatForm.weekFrom, weekTo: repeatForm.weekTo },
+        // 起始周是「学期第 N 周」⇒ 必须锚学期起点；锚点用**弹窗所选学期**，不是页面筛选的学期
+        anchorToTerm: true,
+        ctx: {
+          anchor: createTermAnchorMonday.value,
+          semEnd: parseDateOnly(createTermInfo.value?.endDate)
+        }
+      }
     );
     await load(true);
     const ids = createdIds.length
@@ -2353,10 +2380,15 @@ const REPEAT_TEXT: Record<RepeatMode, string> = {
   even: '双周（隔周上）'
 };
 /** 会话内记忆上次选择：连续排几门课不必每次重设。
+ *  ★ 2026-11-09 会议 #6/#11：`times`（裸周数）换成显式的**起始周 weekFrom / 结束周 weekTo**。
+ *    原因：times 只表达「几周」，起点被隐式固定在学期第 1 周（或当前浏览周），
+ *    用户无法表达「从第 9 周开始排」这种最常见的插班/半学期场景；
+ *    上限也必须跟着所选学期走（#11），而不是写死 25。
  *  weekly = 每周节数（1~5，每节可分别定时间）；total = 总节数（可小于满额，前满后少）。 */
-const repeatForm = reactive<{ mode: RepeatMode; times: number; weekly: number; total: number }>({
+const repeatForm = reactive<{ mode: RepeatMode; weekFrom: number; weekTo: number; weekly: number; total: number }>({
   mode: 'all',
-  times: 18,
+  weekFrom: 1,
+  weekTo: 18,
   weekly: 1,
   total: 18
 });
@@ -2370,44 +2402,127 @@ function parseDateOnly(v?: string | null): Date | null {
   const d = new Date(`${String(v).slice(0, 10).replace(/\//g, '-')}T00:00:00`);
   return Number.isNaN(d.getTime()) ? null : d;
 }
-const currentTermInfo = computed(() => terms.value.find(t => String(t.termId) === String(currentTermId.value)) ?? null);
+/** 按 termId 查学期行：弹窗学期下拉与页面顶部筛选共用同一份 terms。
+ *  统一用 String 比较（主键 19 位雪花字符串化，number 会截断）。 */
+function termInfoOf(termId?: string | number | null) {
+  if (termId === undefined || termId === null || String(termId) === '') return null;
+  return terms.value.find(t => String(t.termId) === String(termId)) ?? null;
+}
 /** 学期第 1 周的周一（学期周中开课也算整第 1 周）；学期没配起点时 = null */
-const termAnchorMonday = computed<Date | null>(() => {
-  const s = parseDateOnly(currentTermInfo.value?.startDate);
+function termAnchorOf(info: { startDate?: string } | null | undefined): Date | null {
+  const s = parseDateOnly(info?.startDate);
   if (!s) return null;
   s.setDate(s.getDate() - ((s.getDay() + 6) % 7));
   return s;
-});
+}
+/** 学期真实周数（起点周一起算、含头尾）；未配起止日期 → 0（由调用方兜底为 25 或 AUTO_WEEKS）。
+ *  clamp 1~30 防脏日期（如 startDate 晚于 endDate、或差了几年）把写入量放大到不可控。 */
+function termWeeksOf(info: { startDate?: string; endDate?: string } | null | undefined): number {
+  const anchor = termAnchorOf(info);
+  const end = parseDateOnly(info?.endDate);
+  if (!anchor || !end) return 0;
+  const days = Math.floor((end.getTime() - anchor.getTime()) / 86400000) + 1;
+  return Math.max(0, Math.min(30, Math.ceil(days / 7)));
+}
+/** 起始周按奇偶口径对齐：单周→区间内首个奇周，双周→首个偶周（学期第 1 周 = 单周）。
+ *  例：weekFrom=2 选双周 ⇒ 仍是第 2 周；weekFrom=3 选双周 ⇒ 顺延到第 4 周。 */
+function alignParityWeek(mode: RepeatMode, weekFrom: number): number {
+  const wf = Math.max(1, Math.round(weekFrom || 1));
+  if (mode === 'odd' && wf % 2 === 0) return wf + 1;
+  if (mode === 'even' && wf % 2 === 1) return wf + 1;
+  return wf;
+}
+
+const currentTermInfo = computed(() => termInfoOf(currentTermId.value));
+const termAnchorMonday = computed<Date | null>(() => termAnchorOf(currentTermInfo.value));
 const termStartDateLabel = computed(() => currentTermInfo.value?.startDate ? String(currentTermInfo.value.startDate).slice(0, 10) : '');
-/** 实际重复次数（once=1，其余 clamp 1~25）——总节数满额 = weekly × 此值。
- *  ★ 学期锚定的隔周：实际次数 = 学期内的单/双周数（times 只是上限），
- *    否则默认 18 次会把满额显示成 18 节而实际学期内只有 9 个单周。 */
+
+/* ---------- 弹窗所属学期（A4）----------
+ * 排课归属学期必须显式选，不用「页面顶部筛选的学期」隐式代入：顶部筛选是查询过滤，
+ * 弹窗学期决定的是**这批课次写进哪个学期**（决定周次锚定与结束周上限），二者语义不同。
+ * 默认值仍取当前浏览学期，省一次点击；但用户必须看得见、可改。 */
+const createTermInfo = computed(() => termInfoOf(form.termId));
+const createTermAnchorMonday = computed<Date | null>(() => termAnchorOf(createTermInfo.value));
+/** 弹窗所选学期的真实周数；0 = 该学期未配起止日期（结束周上限退化为 25 并给橙色提示） */
+const createTermWeeks = computed(() => termWeeksOf(createTermInfo.value));
+/** 结束周上限：学期周数已知取真实周数，未知退 25（与历史 times 上限一致） */
+const createWeekMax = computed(() => (createTermWeeks.value > 0 ? createTermWeeks.value : 25));
+/** 结束周的默认值：学期周数已知 ⇒ 铺满整学期（「排一次 = 整学期都有课」的既有语义）；
+ *  学期未配日期 ⇒ 退回 18（历史默认值），不要拿 25 当默认——那等于默认多排 7 周。 */
+const defaultWeekTo = computed(() => (createTermWeeks.value > 0 ? createTermWeeks.value : 18));
+
+/** 当前浏览的学期（顶部筛选优先，其次是页面认定的当前学期）。
+ *  模板里不能写 currentTermId.value —— ref 在模板中已自动解包，会报 TS2551。 */
+const viewTermId = computed(() => String(filters.termId || currentTermId.value || ''));
+/** 弹窗所选学期与当前浏览学期是否不一致（不一致 ⇒ 保存后当前课表看不到新排的课次） */
+const creatingOtherTerm = computed(() => !!form.termId && form.termId !== viewTermId.value);
+
+/** 弹窗表单的周次区间（已按学期上限收敛；weekTo 不会小于 weekFrom） */
+function weekRange(): { wf: number; wt: number } {
+  const maxW = createWeekMax.value;
+  const wf = Math.max(1, Math.min(maxW, Math.round(repeatForm.weekFrom || 1)));
+  const wt = Math.max(wf, Math.min(maxW, Math.round(repeatForm.weekTo || wf)));
+  return { wf, wt };
+}
+
+/** 实际重复次数（once=1）——总节数满额 = weekly × 此值。
+ *  ★ 学期锚定的隔周：实际次数 = 区间内的单/双周数，否则结束周显示的是「周」而不是「次」。 */
 const effectiveRepeatTimes = computed(() => {
   if (repeatForm.mode === 'once') return 1;
-  const t = Math.max(1, Math.min(25, Math.round(repeatForm.times || 1)));
-  const anchor = termAnchorMonday.value;
-  const end = parseDateOnly(currentTermInfo.value?.endDate);
-  if (anchor && end && (repeatForm.mode === 'odd' || repeatForm.mode === 'even')) {
-    const base = new Date(anchor);
-    base.setDate(base.getDate() + (repeatForm.mode === 'even' ? 7 : 0));
-    let n = 0;
-    for (let i = 0; i < t; i++) {
-      const d = new Date(base);
-      d.setDate(d.getDate() + 14 * i);
-      if (d > new Date(end.getTime() + 86399000)) break;
-      n++;
-    }
-    return Math.max(1, n);
+  const { wf, wt } = weekRange();
+  if (repeatForm.mode === 'odd' || repeatForm.mode === 'even') {
+    const start = alignParityWeek(repeatForm.mode, wf);
+    if (start > wt) return 1; // 区间内无匹配周次：由 createWeekRangeError 拦住提交，这里只保证 UI 不为 0
+    return Math.floor((wt - start) / 2) + 1;
   }
-  return t;
+  return wt - wf + 1;
+});
+
+/** 弹窗可提交性（A4 + #6/#11）：学期必选 + 周起止合法 ⇒ 否则禁用「确定」并给出可读原因。
+ *  校验放在前端而不是靠后端：ScheduleCreateBo 没有 weekFrom 字段，后端根本不知道用户填了什么，
+ *  逐条铺日期是前端完成的 ⇒ 前端不校验就没人校验。 */
+const createWeekRangeError = computed(() => {
+  if (!form.termId) return '请先选择学期';
+  if (repeatForm.mode === 'once') return '';
+  const wf = Math.round(repeatForm.weekFrom || 0);
+  const wt = Math.round(repeatForm.weekTo || 0);
+  if (!Number.isFinite(wf) || wf < 1) return '起始周不能小于 1';
+  if (!Number.isFinite(wt) || wt < wf) return '结束周不能早于起始周';
+  if (createTermWeeks.value > 0 && wt > createTermWeeks.value) {
+    return `结束周不能超过该学期周数（${createTermWeeks.value} 周）`;
+  }
+  if ((repeatForm.mode === 'odd' || repeatForm.mode === 'even') && alignParityWeek(repeatForm.mode, wf) > wt) {
+    return repeatForm.mode === 'odd' ? '该区间内没有单周，请调整起始周' : '该区间内没有双周，请调整起始周';
+  }
+  return '';
 });
 /** 每周第 2~5 节的时间（第 1 节 = 表单里的 星期/节次）；weekly 减小时多余项自动不渲染/不提交 */
 const extraSlots = reactive(Array.from({ length: 4 }, () => ({ weekday: 1, periodNo: 1 })));
 const extraSlotList = computed(() => extraSlots.slice(0, Math.max(0, repeatForm.weekly - 1)));
-/** 每周节数 / 重复周数变化时，总节数回到满额（用户随后可手动改小） */
+/** 每周节数 / 周次区间变化时，总节数回到满额（用户随后可手动改小） */
 function syncRepeatTotal() {
-  repeatForm.total = repeatForm.weekly * effectiveRepeatTimes.value;
+  repeatForm.total = Math.max(1, repeatForm.weekly * effectiveRepeatTimes.value);
 }
+/** 换学期 ⇒ 周次区间重新按新学期收敛（A4 + #11）：学期周数变了，旧的结束周可能越界。
+ *  同时把 anchorToTerm 的锚点隐式换成新学期的（createTermAnchorMonday 是 computed，自动跟随）。 */
+watch(
+  () => form.termId,
+  () => {
+    if (!form.termId) return;
+    repeatForm.weekFrom = 1;
+    repeatForm.weekTo = defaultWeekTo.value;
+    syncRepeatTotal();
+  }
+);
+/** 周起止手动调整后，总节数不能大于新的满额（否则「前满后少」的提示会算错） */
+watch(
+  () => [repeatForm.weekFrom, repeatForm.weekTo, repeatForm.mode] as const,
+  () => {
+    const full = Math.max(1, repeatForm.weekly * effectiveRepeatTimes.value);
+    if (repeatForm.total > full) repeatForm.total = full;
+    if (repeatForm.total < 1) repeatForm.total = 1;
+  }
+);
 /** 本次的全部「节位」：第 1 节 = 表单星期/节次，第 2~weekly 节 = extraSlots 前几项 */
 function buildRepeatSlots(): Array<{ weekday: number; periodNo: number }> {
   const slots = [{ weekday: form.weekday, periodNo: form.periodNo }];
@@ -2416,18 +2531,23 @@ function buildRepeatSlots(): Array<{ weekday: number; periodNo: number }> {
   }
   return slots;
 }
-/** 锚定前缀：每周=当前所在周起；隔周=学期起点（未配则回退当前周） */
+/** 锚定前缀：学期配了开始日期就按学期起点；未配则退化为「当前浏览周 = 第 1 周」 */
 const repeatAnchorLabel = computed(() => {
-  if (repeatForm.mode !== 'all' && termAnchorMonday.value) return '按学期起点锚定';
-  return '以当前所在周为第 1 周';
+  if (createTermAnchorMonday.value) {
+    const name = createTermInfo.value?.name ? `${createTermInfo.value.name} · ` : '';
+    return `按学期起点锚定（${name}第 1 周 = ${fmt(createTermAnchorMonday.value)}）`;
+  }
+  return '学期未配开始日期 · 以当前浏览周为第 1 周';
 });
 const repeatHint = computed(() => {
-  if (repeatForm.mode === 'all') return `每周同一时间上课，共 ${repeatForm.times} 周（如第 1~18 周）`;
-  if (repeatForm.mode === 'odd')
-    return `学期第 1、3、5…周上课${termStartDateLabel.value ? `（学期始于 ${termStartDateLabel.value}）` : ''}，共 ${effectiveRepeatTimes.value} 次`;
-  if (repeatForm.mode === 'even')
-    return `学期第 2、4、6…周上课${termStartDateLabel.value ? `（学期始于 ${termStartDateLabel.value}）` : ''}，共 ${effectiveRepeatTimes.value} 次`;
-  return '';
+  if (repeatForm.mode === 'once') return '';
+  const { wf, wt } = weekRange();
+  const n = effectiveRepeatTimes.value;
+  const span = wf === wt ? `第 ${wf} 周` : `第 ${wf}~${wt} 周`;
+  if (repeatForm.mode === 'all') return `${span}每周同一时间上课，共 ${n} 次`;
+  const first = alignParityWeek(repeatForm.mode, wf);
+  const which = repeatForm.mode === 'odd' ? '单周' : '双周';
+  return `${span}内的${which}（第 ${first}、${first + 2}…周）上课，共 ${n} 次`;
 });
 /** 重复计划展开成的上课日期串（YYYY-MM-DD）。once=1 条；odd/even 隔 14 天；all 隔 7 天。
  *  rp = 重复口径，缺省跟随弹窗表单；自动排课必须传固定口径，否则会被弹窗残留的单双周带偏（2026-10-29 修）。
@@ -2436,28 +2556,48 @@ const repeatHint = computed(() => {
  *    学期没配起点才回退锚定当前浏览周。学期锚定时不出学期结束日。 */
 function repeatDates(
   weekday: number,
-  rp: { mode: RepeatMode; times: number } = repeatForm,
+  rp: { mode: RepeatMode; weekFrom?: number; weekTo?: number; times?: number } = repeatForm,
   /**
    * 自动排课传 true：**无视 mode 一律从学期起点铺到学期末**（2026-10-30 修）。
    * 为什么必须这样：原实现只有隔周（odd/even）才锚定学期，每周（all）是从
    *   `weekStart.value`（当前浏览的那一周）起算 ⇒ 实测 10-30 的库：学期 2026-08-24~2027-01-15，
    *   课次却分布成「8~9 月 0 条、10 月 29、11 月 118、12 月 128、次年 1~2 月 230」——
    *   既漏掉学期前 9 周，又排到学期结束日之后 6 周。自动排课语义就是「给整学期排课」，必须锚学期。
+   * 手动排课（2026-11-09 起）也传 true：起始周是「学期第 N 周」，不锚学期就没法解释这个 N。
    */
-  anchorToTerm = false
+  anchorToTerm = false,
+  /**
+   * 锚定上下文覆盖（2026-11-09，随弹窗学期下拉引入）：
+   * 自动排课不传 ⇒ 沿用页面学期（currentTermInfo / termAnchorMonday）；
+   * 手动排课必须传弹窗所选学期的 anchor/semEnd —— 否则「弹窗选 2026-2027-2、页面在看 2026-2027-1」
+   * 时会把日期铺到错误的学期里。
+   */
+  ctx?: { anchor?: Date | null; semEnd?: Date | null }
 ): string[] {
-  const anchor = termAnchorMonday.value;
-  const semEnd = parseDateOnly(currentTermInfo.value?.endDate);
-  const semesterAnchored = !!anchor && (anchorToTerm || rp.mode === 'odd' || rp.mode === 'even');
-  const base = new Date(semesterAnchored ? anchor! : weekStart.value);
-  base.setDate(base.getDate() + (weekday - 1) + (rp.mode === 'even' ? 7 : 0));
+  const anchor = ctx ? (ctx.anchor ?? null) : termAnchorMonday.value;
+  const semEnd = ctx ? (ctx.semEnd ?? null) : parseDateOnly(currentTermInfo.value?.endDate);
+  // once = 「仅这一次」，永远落当前浏览周，不受学期锚定影响
+  const anchored = rp.mode === 'once' ? false : !!anchor && (anchorToTerm || rp.mode === 'odd' || rp.mode === 'even');
+  const hasRange = typeof rp.weekFrom === 'number' && typeof rp.weekTo === 'number';
+  const wf = Math.max(1, Math.round(rp.weekFrom ?? 1));
+  const wt = Math.max(wf, Math.round(rp.weekTo ?? wf));
+  // 单双周按「学期第 N 周」的奇偶对齐：起始周为偶数但选单周时顺延一周，避免整体错位一周
+  const startWeek = rp.mode === 'odd' || rp.mode === 'even' ? alignParityWeek(rp.mode, wf) : wf;
+  const base = new Date(anchored ? anchor! : weekStart.value);
+  if (anchored) base.setDate(base.getDate() + (startWeek - 1) * 7);
+  base.setDate(base.getDate() + (weekday - 1));
   const step = rp.mode === 'odd' || rp.mode === 'even' ? 14 : 7;
-  const count = rp.mode === 'once' ? 1 : Math.max(1, Math.min(25, Math.round(rp.times || 1)));
+  const count =
+    rp.mode === 'once'
+      ? 1
+      : hasRange
+        ? Math.max(1, Math.floor((wt - startWeek) / (step / 7)) + 1)
+        : Math.max(1, Math.min(25, Math.round(rp.times || 1)));
   const out: string[] = [];
   for (let i = 0; i < count; i++) {
     const d = new Date(base);
     d.setDate(d.getDate() + step * i);
-    if (semesterAnchored && semEnd && d > new Date(semEnd.getTime() + 86399000)) break;
+    if (anchored && semEnd && d > new Date(semEnd.getTime() + 86399000)) break;
     // ★ 每个日期只 push 一次。6329cab 曾误写成连 push 两次 ⇒ 每门课多出一倍「必自我冲突」的
     //   尝试：串行时表现为速度减半 + 报告里「跳过 18 周」；并发下相邻重复日期会同时通过
     //   冲突检查，真的写出重复课次（10-29 16:22 实测 5 门课全部双份）。
@@ -2486,9 +2626,11 @@ async function createBatch(
     slots?: Array<{ weekday: number; periodNo: number }>;
     capTotal?: number;
     /** 重复口径覆盖：自动排课传「每周/隔周 × 学期真实周数」，不跟随弹窗残留的单双周选择（2026-10-29） */
-    repeat?: { mode: RepeatMode; times: number };
+    repeat?: { mode: RepeatMode; weekFrom?: number; weekTo?: number; times?: number };
     /** 铺日期时锚定学期起点（自动排课必传）：见 repeatDates 第三参说明（2026-10-30） */
     anchorToTerm?: boolean;
+    /** 锚定上下文（2026-11-09）：手动排课传弹窗所选学期的 anchor/semEnd，自动排课不传 */
+    ctx?: { anchor?: Date | null; semEnd?: Date | null };
   },
   onProgress?: (done: number, total: number) => void
 ) {
@@ -2496,7 +2638,7 @@ async function createBatch(
   type Plan = { date: string; weekday: number; periodNo: number };
   const plans: Plan[] = [];
   for (const s of slots) {
-    for (const d of repeatDates(s.weekday, opts?.repeat, opts?.anchorToTerm)) plans.push({ date: d, weekday: s.weekday, periodNo: s.periodNo });
+    for (const d of repeatDates(s.weekday, opts?.repeat, opts?.anchorToTerm, opts?.ctx)) plans.push({ date: d, weekday: s.weekday, periodNo: s.periodNo });
   }
   plans.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   const cap = opts?.capTotal;
@@ -2774,7 +2916,7 @@ const termWeekCount = computed(() => {
   const end = parseDateOnly(currentTermInfo.value?.endDate);
   if (!anchor || !end) return AUTO_WEEKS;
   const days = Math.floor((end.getTime() - anchor.getTime()) / 86400000) + 1;
-  // clamp 1~25 与手动排课 repeatForm.times 的上限一致，避免脏日期把写入量放大到不可控
+  // clamp 1~25（自动排课的安全上限，与历史口径一致）；手动排课的结束周上限走 termWeeksOf 的 1~30
   return Math.max(1, Math.min(25, Math.ceil(days / 7)));
 });
 /** 本次自动排课一条课要写的次数：每周=学期周数，隔周=学期内单/双周数 */
@@ -4338,6 +4480,24 @@ watch(
   <!-- 新增课次（C-17 真接口，带冲突检查） -->
   <el-dialog v-model="createVisible" :title="createTitle" width="460px" @opened="onCreateOpened">
     <el-form label-width="92px" label-position="right">
+      <!-- 学期（2026-11-09 A4）：排课归属学期，必选、不接受手填。
+           与页面顶部筛选的学期是两个概念——顶部决定「现在看哪一学期」，这里决定「这批课次写进哪一学期」。
+           选中学期后：用它的 startDate 锚定第 1 周，并用 startDate~endDate 算出结束周上限（#11）。 -->
+      <el-form-item label="学期" required>
+        <el-select v-model="form.termId" placeholder="请选择学期（决定周次锚定与上限）" filterable style="width: 100%">
+          <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="String(t.termId)" />
+        </el-select>
+        <div v-if="!terms.length" class="small" style="color: var(--warning, #b45309); width: 100%">
+          没有可选的学期——请先到「基础数据 → 学期」维护学期，否则无法排课
+        </div>
+        <div v-else-if="form.termId && !createTermWeeks" class="small" style="color: var(--warning, #b45309); width: 100%">
+          该学期未配置起止日期：周次只能以当前浏览周为第 1 周，结束周上限暂用 25——建议先到「基础数据 → 学期」补齐日期
+        </div>
+        <!-- 排到「非当前浏览学期」是合法用法（提前排下学期），但必须提前说清：保存后当前课表看不到 -->
+        <div v-else-if="creatingOtherTerm" class="small muted" style="width: 100%">
+          该学期不是当前浏览的学期：保存后课次不会出现在当前课表，翻到该学期即可查看
+        </div>
+      </el-form-item>
       <el-form-item label="课程" required>
         <el-select v-model="form.courseId" placeholder="请选择课程（仅列已通过三重认证的课）" filterable style="width: 100%">
           <el-option v-for="o in certifiedCourseOptions" :key="o.value" :label="o.label" :value="o.value" />
@@ -4418,14 +4578,34 @@ watch(
           <el-select v-model="repeatForm.mode" style="flex: 1; min-width: 140px">
             <el-option v-for="(t, m) in REPEAT_TEXT" :key="m" :label="t" :value="m" />
           </el-select>
+        </div>
+        <!-- 周起止（2026-11-09 会议 #6）：显式表达「从第 N 周排到第 M 周」，
+             取代原来的裸周数 times —— 后者起点被隐式固定，插班/半学期场景无法表达。
+             上限 = 所选学期的真实周数（#11）；学期未配日期时上限 25 并在上方给橙色提示。 -->
+        <div
+          v-if="repeatForm.mode !== 'once'"
+          style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap; margin-top: 8px"
+        >
+          <span class="small muted">第</span>
           <el-input-number
-            v-if="repeatForm.mode !== 'once'"
-            v-model="repeatForm.times"
+            v-model="repeatForm.weekFrom"
             :min="1"
-            :max="25"
+            :max="createWeekMax"
+            :step="1"
+            step-strictly
             style="width: 110px"
           />
-          <span v-if="repeatForm.mode !== 'once'" class="small muted">周</span>
+          <span class="small muted">周 至 第</span>
+          <el-input-number
+            v-model="repeatForm.weekTo"
+            :min="repeatForm.weekFrom"
+            :max="createWeekMax"
+            :step="1"
+            step-strictly
+            style="width: 110px"
+          />
+          <span class="small muted">周</span>
+          <span class="small muted" style="margin-left: auto">上限 {{ createWeekMax }} 周</span>
         </div>
         <div v-if="repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
           {{ repeatAnchorLabel }} · {{ repeatHint }}
@@ -4435,13 +4615,17 @@ watch(
         <div
           v-if="repeatForm.mode === 'odd' || repeatForm.mode === 'even'"
           class="small"
-          :style="{ color: termAnchorMonday ? 'var(--ink-600, #52525b)' : 'var(--warning, #b45309)', width: '100%' }"
+          :style="{ color: createTermAnchorMonday ? 'var(--ink-600, #52525b)' : 'var(--warning, #b45309)', width: '100%' }"
         >
           {{
-            termAnchorMonday
-              ? `按学期锚定：单周=学期第 1、3、5…周，双周=第 2、4、6…周（学期始于 ${termStartDateLabel}，可在基础数据-学期修改起点）`
-              : '当前学期未配置开始日期，隔周只能锚定当前浏览的周——请先翻到学期第 1 周再保存，或先到基础数据-学期补开始日期'
+            createTermAnchorMonday
+              ? `按学期锚定：单周=学期第 1、3、5…周，双周=第 2、4、6…周（第 1 周起于 ${fmt(createTermAnchorMonday)}，可在基础数据-学期修改起点）`
+              : '该学期未配置开始日期，隔周只能锚定当前浏览的周——请先翻到学期第 1 周再保存，或先到基础数据-学期补开始日期'
           }}
+        </div>
+        <!-- 校验不通过时把原因直接写在表单项里：只把按钮置灰、不说为什么，用户会反复试点 -->
+        <div v-if="createWeekRangeError" class="small" style="color: var(--error, #d92d20); width: 100%">
+          {{ createWeekRangeError }}
         </div>
       </el-form-item>
       <!-- 总节数（2026-10-20）：满额可改小 —— 不够分时从最后一周往前少排（前满后少） -->
@@ -4456,7 +4640,7 @@ watch(
           <span v-if="repeatForm.total < repeatForm.weekly * effectiveRepeatTimes" class="small" style="color: var(--warning, #b45309)">
             不足满额 {{ repeatForm.weekly * effectiveRepeatTimes }} 节：从最后一周往前少排（前满后少）
           </span>
-          <span v-else class="small muted">满额 = 每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 周</span>
+          <span v-else class="small muted">满额 = 每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 次</span>
         </div>
       </el-form-item>
     </el-form>
@@ -4474,7 +4658,15 @@ watch(
         </el-button>
         <span>
           <el-button @click="createVisible = false">取消</el-button>
-          <el-button type="primary" :loading="saving" @click="submitCreate">保存课次</el-button>
+          <!-- 学期未选 / 周次区间非法时禁用（原因已写在「重复」表单项里）。
+               tip 挂在 title：置灰按钮本身不可点，不给悬停解释用户不知道差什么。 -->
+          <el-button
+            type="primary"
+            :loading="saving"
+            :disabled="!!createWeekRangeError"
+            :title="createWeekRangeError || '保存这些课次'"
+            @click="submitCreate"
+          >保存课次</el-button>
         </span>
       </div>
     </template>
