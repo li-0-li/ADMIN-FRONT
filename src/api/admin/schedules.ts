@@ -136,6 +136,22 @@ export async function publishSchedules() {
   return request<{ published: number }>({ url: `${await schedulePath()}/publish`, method: 'post' });
 }
 
+/**
+ * B-7 自动排课（auto-arrange v1，后端 2026-11-09 a9c6a6e）：
+ * 为某条开课记录（course_offering）按其 weekFrom/weekCount 一次性生成全部课次。
+ * ★ 供建课向导 step2 开课成功后「一键重排」调用（会议 #A3：新增的课要重新排一次）。
+ * ★ 8080 实测（2026-11-10）：POST 存在（GET 报 method not supported）；
+ *   offeringId 不存在时报业务错「开课记录不存在或已被删除」。
+ *   出参形状后端未定档，前端按泛型透传，只报成功/失败不解析字段。
+ */
+export async function autoArrange(offeringId: string | number) {
+  return request<Record<string, unknown>>({
+    url: `${await schedulePath()}/auto-arrange`,
+    method: 'post',
+    data: { offeringId: String(offeringId) }
+  });
+}
+
 /** 课程池数据源（拖动排课的「未排课程」来源） */
 export async function listCoursePool(schoolId?: string | number) {
   return request<PageResult<CourseBrief>>({

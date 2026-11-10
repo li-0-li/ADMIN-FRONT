@@ -7,7 +7,7 @@ import ZkIcon from '@/components/ZkIcon.vue';
 import { changeCourseStatus, deleteCourse, exportCourses, getCourse, listCourses } from '@/api/admin/courses';
 import type { AdminCourseOrderBy, AdminCourseVo } from '@/api/admin/courses';
 import { getCertDetail, reviewCertification } from '@/api/admin/certifications';
-import { listSchedules } from '@/api/admin/schedules';
+import { autoArrange, listSchedules } from '@/api/admin/schedules';
 import { listTerms } from '@/api/admin/basicdata';
 import { useUserStore } from '@/store/user';
 import type { AdminCourseDetailVo, CertDetail } from '@/types/admin';
@@ -56,6 +56,38 @@ function openCreate() {
 function openOfferFor(course: { courseId: string; courseName: string }) {
   dialogCourse.value = course;
   dialogVisible.value = true;
+}
+
+/** B-7 重新排课（2026-11-10）：对某条开课记录重跑 auto-arrange。失败不影响既有课次 */
+const rearrangingId = ref('');
+async function onRearrange(o: { offeringId: string; termCode?: string }) {
+  try {
+    await ElMessageBox.confirm(
+      `确定对 ${o.termCode || '该学期'} 的开课记录重新自动排课？已有的课次会被按教学周重新生成。`,
+      '重新排课',
+      { type: 'warning', confirmButtonText: '确认重排', cancelButtonText: '取消' }
+    );
+  } catch {
+    return;
+  }
+  rearrangingId.value = o.offeringId;
+  try {
+    await autoArrange(o.offeringId);
+    ElMessage.success('自动排课完成，可到「智能排课」页查看与微调');
+    // 刷新抽屉里的课次数：openDetail 是按行对象打开的，这里就地重拉 offerings
+    detailOfferLoading.value = true;
+    try {
+      detailData.value = await getCourse(detailCourse.value?.courseId ?? '');
+    } catch {
+      /* 保留旧数据 */
+    } finally {
+      detailOfferLoading.value = false;
+    }
+  } catch {
+    /* request.ts 已弹后端原话 */
+  } finally {
+    rearrangingId.value = '';
+  }
 }
 
 /** 停用 / 启用（幂等；后端不级联动开课记录与课次） */
@@ -1174,6 +1206,18 @@ onMounted(async () => {
                   <template v-if="o.weekCount"> · {{ o.weekCount }} 教学周</template>
                 </div>
               </div>
+              <!-- B-7 重新排课：对进行中的开课记录一键重跑 auto-arrange
+                   （会议 A3"新增的课重新排一次"——除了建课向导，已开的课也随时可重排） -->
+              <el-button
+                v-if="canOffer && o.status === 'active'"
+                size="small"
+                text
+                :loading="rearrangingId === o.offeringId"
+                style="margin-left: auto"
+                @click="onRearrange(o)"
+              >
+                <ZkIcon name="refresh-cw" :size="13" style="margin-right: 3px" />重新排课
+              </el-button>
             </div>
           </div>
           <div v-else-if="!detailOfferLoading" class="small muted">

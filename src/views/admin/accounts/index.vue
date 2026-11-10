@@ -19,6 +19,9 @@ import {
 } from '@/api/admin/users';
 import type { DeptNodeVo } from '@/api/admin/users';
 import { listClasses, listMajors, listSchools } from '@/api/admin/basicdata';
+import { getTeacherCapabilities, saveTeacherCapabilities } from '@/api/admin/capabilities';
+import { listCourses } from '@/api/admin/courses';
+import type { AdminCourseVo } from '@/api/admin/courses';
 import type { AdminUserVo, Clazz, FootprintVo, ImportResultVo, Major, School, UserSaveBo } from '@/types/admin';
 import { useUserStore } from '@/store/user';
 
@@ -765,6 +768,64 @@ function onMoreCommand(cmd: string, row: AdminUserVo) {
   else if (cmd === 'reset') doResetPwd(row);
   else if (cmd === 'toggle') toggleStatus(row);
   else if (cmd === 'delete') doDelete(row);
+  else if (cmd === 'capability') openCapability(row);
+}
+
+/* ---------------- 可授课程（会议 #10 · T-04 capability，2026-11-10） ----------------
+ * 教师能上哪些课 = 智能排课/开课的教师候选约束来源。三口径：教研室默认/教师自设/管理员代设，
+ * 本弹窗是管理员代设入口：读当前集合（GET）→ 勾选 → 整组覆盖保存（POST）。
+ * ★ 只对教师角色行显示入口；权限点后端未定档，暂不做 hasPermi 门禁（见 capabilities.ts 注释）。 */
+const capVisible = ref(false);
+const capSaving = ref(false);
+const capLoading = ref(false);
+const capTeacher = ref<AdminUserVo | null>(null);
+const capCourses = ref<AdminCourseVo[]>([]);
+const capSelected = ref<string[]>([]);
+
+const isTeacherRow = (row: AdminUserVo) => (row.roleKeys ?? []).includes('teacher');
+
+async function openCapability(row: AdminUserVo) {
+  capTeacher.value = row;
+  capSelected.value = [];
+  capCourses.value = [];
+  capVisible.value = true;
+  capLoading.value = true;
+  const jobs: Promise<void>[] = [
+    listCourses({ page: 1, pageSize: 500 })
+      .then((res) => {
+        capCourses.value = res?.list ?? [];
+      })
+      .catch(() => {
+        capCourses.value = [];
+      }),
+    getTeacherCapabilities(row.userId)
+      .then((ids) => {
+        capSelected.value = Array.isArray(ids) ? ids.map(String) : [];
+      })
+      .catch(() => {
+        capSelected.value = [];
+      })
+  ];
+  await Promise.all(jobs);
+  capLoading.value = false;
+}
+
+async function saveCapability() {
+  if (!capTeacher.value) return;
+  capSaving.value = true;
+  try {
+    await saveTeacherCapabilities(capTeacher.value.userId, capSelected.value);
+    ElMessage.success(
+      capSelected.value.length
+        ? `已保存「${capTeacher.value.nickName}」的可授课程（${capSelected.value.length} 门）`
+        : '已清空个人可授课程设置'
+    );
+    capVisible.value = false;
+  } catch {
+    /* request.ts 已弹后端原话 */
+  } finally {
+    capSaving.value = false;
+  }
 }
 
 /* ---------------- 批量启停 / 批量删除（循环调既有单条接口，后端护栏兜底） ---------------- */
@@ -1068,6 +1129,7 @@ async function openFootprint(row: AdminUserVo) {
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item command="footprint">足迹</el-dropdown-item>
+                <el-dropdown-item v-if="isTeacherRow(row)" command="capability">可授课程</el-dropdown-item>
                 <el-dropdown-item command="reset" :disabled="!!resetLockTip(row)">重置密码</el-dropdown-item>
                 <el-dropdown-item command="toggle" :disabled="!!opLockTip(row)">
                   {{ row.status === '0' ? '停用' : '启用' }}
@@ -1194,6 +1256,41 @@ async function openFootprint(row: AdminUserVo) {
     <template #footer>
       <el-button @click="formVisible = false">取消</el-button>
       <el-button type="primary" :loading="saving" @click="submitForm">保存</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- 可授课程（管理员代设，会议 #10）：整组覆盖保存 -->
+  <el-dialog
+    v-model="capVisible"
+    :title="capTeacher ? `可授课程 · ${capTeacher.nickName}（${capTeacher.username}）` : '可授课程'"
+    width="560px"
+    :close-on-click-modal="false"
+  >
+    <div v-loading="capLoading">
+      <el-select
+        v-model="capSelected"
+        multiple
+        filterable
+        clearable
+        placeholder="选择该教师可上的课程，可多选"
+        style="width: 100%"
+      >
+        <el-option
+          v-for="c in capCourses"
+          :key="c.courseId"
+          :label="`${c.courseName}（${c.courseNo}）`"
+          :value="c.courseId"
+          :disabled="c.status !== 'active'"
+        />
+      </el-select>
+      <div class="small muted" style="margin-top: 8px">
+        已停用课程不可选。这里设置的是「管理员代设」口径：与教研室默认、教师自设共同决定该教师能上哪些课，
+        供智能排课与开课选教师时做候选约束（排课侧候选过滤待后端补课程维度端点后接线）。
+      </div>
+    </div>
+    <template #footer>
+      <el-button @click="capVisible = false">取消</el-button>
+      <el-button type="primary" :loading="capSaving" @click="saveCapability">保存</el-button>
     </template>
   </el-dialog>
 

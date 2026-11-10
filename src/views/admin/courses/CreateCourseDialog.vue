@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import {
   checkCourseNo,
@@ -10,6 +10,7 @@ import {
   nextCourseNo
 } from '@/api/admin/courses';
 import type { CourseCreateBo } from '@/api/admin/courses';
+import { autoArrange } from '@/api/admin/schedules';
 import { listClasses, listTerms } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
 import type { Clazz, Term } from '@/types/admin';
@@ -302,6 +303,26 @@ async function submitOffering() {
     offerForm.outline = '';
     joinCodeError.value = '';
     emit('created');
+    // B-7 / 会议 A3（2026-11-10 接线）：开课成功后询问是否立即自动排课。
+    // ★ auto-arrange 失败不影响开课结果（开课已落库，仅提示可去排课页手动处理）；
+    //   排课成功则关窗并引导去智能排课页查看。业主拍板「新增的课给他重新排一次」。
+    try {
+      await ElMessageBox.confirm(
+        `「${created.value.courseName}」已开课（${res.termCode}）。是否立即按教学周自动排课？`,
+        '自动排课',
+        { confirmButtonText: '立即排课', cancelButtonText: '暂不，手动排', type: 'info' }
+      );
+    } catch {
+      return; // 用户选「暂不」：保持弹窗可继续开下一门
+    }
+    try {
+      await autoArrange(res.offeringId);
+      ElMessage.success('自动排课完成，可到「智能排课」页查看与微调');
+      close();
+    } catch {
+      /* request.ts 已弹后端原话；开课不受影响 */
+      ElMessage.warning('开课已保存，但自动排课未完成——可到「智能排课」页手动排课');
+    }
   } catch {
     /* request.ts 已弹后端原话（40902/40903/422 等） */
   } finally {
