@@ -44,6 +44,15 @@ const GROUP_TITLES: Record<string, string> = {
   security: '安全策略',
   system: '系统杂项'
 };
+/**
+ * 组级口径说明（业主 11-10 拍板：保留 ai/quota 两组并加说明，防止再被误认为属于「AI 工作台」页）。
+ * 证据：教师端 AiQuotaService 真实消费 ai.enabled / ai.daily_quota_per_user / ai.course_daily_quota
+ * ——这里是教师端 AI 能力的总开关与配额入口，与占位未开发的 AI 工作台页面无关。
+ */
+const GROUP_SUBTITLES: Record<string, string> = {
+  ai: '教师端 AI 功能的总开关与模型选择——关闭后教师端 AI 能力整体停用；与「AI 工作台」页面无关（该页未开发）。',
+  quota: '教师端 AI 调用的每人 / 每课每日次数上限，超限即拦截（教师端配额服务实时读取）。'
+};
 const groupOrder = ['ai', 'quota', 'cert', 'class', 'security', 'system'];
 const groups = computed(() => {
   const map = new Map<string, ConfigItem[]>();
@@ -139,23 +148,36 @@ function discardAll() {
 
 /* ---------------- 敏感词库 ---------------- */
 const wordsLoading = ref(false);
-const words = ref<SensitiveWordVo[]>([]);
-const wordTotal = ref(0);
-const wordQuery = reactive({ page: 1, pageSize: 10, keyword: '' });
+/**
+ * 全量词表 + 客户端过滤/分页。
+ * 原实现是服务端分页（10 条/页）+ 分类只在当前页过滤 ⇒ 筛「涉政」只看到当前页里的命中，
+ * 其余页的涉政词被静默漏掉（分类筛选越用越错的陷阱）。词库量级小（当前 4 条，增长也是百级），
+ * 一次拉全（pageSize=500）在客户端做分类过滤 + 分页，口径永远全库正确。
+ */
+const allWords = ref<SensitiveWordVo[]>([]);
+const wordPage = ref(1);
+const wordPageSize = ref(10);
+const wordKeyword = ref('');
 /** 后端查询只收 keyword/status；category 是前端过滤 */
 const categoryFilter = ref('');
 const CATEGORY_TEXT: Record<string, string> = { politics: '涉政', abuse: '辱骂', ad: '广告', custom: '自定义' };
 const LEVEL_TEXT: Record<string, string> = { high: '高', mid: '中', low: '低' };
 const HANDLE_TEXT: Record<string, string> = { block: '拦截', replace: '替换', audit: '人工审核' };
 
-const visibleWords = computed(() => (categoryFilter.value ? words.value.filter(w => w.category === categoryFilter.value) : words.value));
+const filteredWords = computed(() => (categoryFilter.value ? allWords.value.filter(w => w.category === categoryFilter.value) : allWords.value));
+const wordTotal = computed(() => filteredWords.value.length);
+const pagedWords = computed(() => filteredWords.value.slice((wordPage.value - 1) * wordPageSize.value, wordPage.value * wordPageSize.value));
 
 async function fetchWords() {
   wordsLoading.value = true;
   try {
-    const r = await listWords({ ...wordQuery });
-    words.value = r?.list ?? [];
-    wordTotal.value = r?.total ?? 0;
+    const r = await listWords({ page: 1, pageSize: 500, keyword: wordKeyword.value });
+    allWords.value = r?.list ?? [];
+    // 防患：词库真长到超单页上限时明说，不静默截断
+    if ((r?.total ?? 0) > 500) ElMessage.warning('敏感词超过 500 条，列表仅显示前 500 条，请联系后端调整');
+    // 当前页越界（删除/过滤后变短）时收敛到最后一页
+    const maxPage = Math.max(1, Math.ceil(wordTotal.value / wordPageSize.value));
+    if (wordPage.value > maxPage) wordPage.value = maxPage;
   } finally {
     wordsLoading.value = false;
   }
@@ -233,8 +255,8 @@ let wordSearchTimer: number | undefined;
 watch(wordSearchInput, v => {
   if (wordSearchTimer !== undefined) window.clearTimeout(wordSearchTimer);
   wordSearchTimer = window.setTimeout(() => {
-    wordQuery.keyword = v.trim();
-    wordQuery.page = 1;
+    wordKeyword.value = v.trim();
+    wordPage.value = 1;
     fetchWords();
   }, 350);
 });
@@ -341,6 +363,7 @@ onUnmounted(() => {
       <div class="grid g2">
         <div v-for="[g, list] in filteredGroups" :id="`cfg-g-${g}`" :key="g" class="card card-pad cfg-section">
           <div class="card-title">{{ GROUP_TITLES[g] ?? g }}<span class="small muted" style="margin-left: 8px; font-weight: 400">{{ list.length }} 项</span></div>
+          <div v-if="GROUP_SUBTITLES[g]" class="small muted cfg-group-sub">{{ GROUP_SUBTITLES[g] }}</div>
       <div v-for="i in list" :key="i.configKey" class="cfg-row">
         <div class="cfg-info">
           <div class="cfg-key">
@@ -388,7 +411,7 @@ onUnmounted(() => {
         <div class="card-title">敏感词库<span class="small muted" style="margin-left: 8px; font-weight: 400">命中后按处置策略作用于聊天/作业文本</span></div>
         <div class="toolbar-right">
           <el-input v-model="wordSearchInput" clearable placeholder="搜索命中词…" style="width: 150px" size="small" />
-          <el-select v-model="categoryFilter" style="width: 120px" @change="() => {}">
+          <el-select v-model="categoryFilter" style="width: 120px" @change="wordPage = 1">
             <el-option label="全部分类" value="" />
             <el-option v-for="(t, k) in CATEGORY_TEXT" :key="k" :label="t" :value="k" />
           </el-select>
@@ -397,7 +420,7 @@ onUnmounted(() => {
           </el-button>
         </div>
       </div>
-      <el-table v-loading="wordsLoading" :data="visibleWords" style="width: 100%">
+      <el-table v-loading="wordsLoading" :data="pagedWords" style="width: 100%">
         <el-table-column type="index" label="#" width="52" align="center" />
         <el-table-column prop="word" label="命中词" min-width="120" />
         <el-table-column label="分类" width="90">
@@ -427,14 +450,14 @@ onUnmounted(() => {
         <template #empty><div class="muted small" style="padding: 18px 0">暂无敏感词</div></template>
       </el-table>
       <div class="between" style="padding: 12px 0 0">
-        <span class="small muted">共 {{ wordTotal }} 条</span>
+        <span class="small muted">共 {{ wordTotal }} 条<template v-if="categoryFilter"> · 按分类全库过滤</template></span>
         <el-pagination
-          v-model:current-page="wordQuery.page"
-          v-model:page-size="wordQuery.pageSize"
+          v-model:current-page="wordPage"
+          v-model:page-size="wordPageSize"
           :total="wordTotal"
           :page-sizes="[10, 20, 50]"
-          layout="prev, pager, next"
-          @current-change="fetchWords"
+          layout="prev, pager, next, sizes"
+          @size-change="wordPage = 1"
         />
       </div>
     </div>
