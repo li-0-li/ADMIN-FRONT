@@ -23,8 +23,15 @@ export interface AdminMenuItem {
 export const ADMIN_MENUS: AdminMenuItem[] = [
   { path: '/admin/dashboard', title: '后台管理', icon: 'layout-dashboard' },
   { path: '/admin/accounts', title: '账号管理', icon: 'users' },
+  // ★ 2026-11-10：师生从「账号管理」里拆出独立页（会议 #19 口径：师生资料并入教师管理/学生管理）。
+  //   两页共享同一套详情组件，但菜单各自独立——教师可写、学生只读，混成一项会让权限语义含糊。
+  { path: '/admin/teachers', title: '教师管理', icon: 'graduation-cap' },
+  { path: '/admin/students', title: '学生管理', icon: 'user' },
   { path: '/admin/review', title: '课程审核', icon: 'badge-check' },
   { path: '/admin/courses', title: '课程总览', icon: 'book-open' },
+  // ★ 2026-11-10：题库 / 知识库都挂在基础课程上（不挂学期），所以紧邻课程总览。
+  { path: '/admin/questions', title: '题库管理', icon: 'file-text' },
+  { path: '/admin/knowledge', title: '知识库管理', icon: 'layers' },
   { path: '/admin/schedule', title: '智能排课', icon: 'calendar-days' },
   { path: '/admin/analytics', title: '全校学情', icon: 'bar-chart-3' },
   { path: '/admin/patrol', title: '课堂巡查', icon: 'list-checks' },
