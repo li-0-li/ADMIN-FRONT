@@ -1,0 +1,1 @@
+import{L as e,d as t,y as n}from"./runtime-core.esm-bundler-CU7julQe.js";import{t as r}from"./PeopleManager-D7S3Y-R5.js";var i=n({__name:`index`,setup(n){return(n,i)=>(e(),t(r,{mode:`student`}))}});export{i as default};
