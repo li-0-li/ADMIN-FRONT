@@ -1333,12 +1333,14 @@ async function openFootprint(row: AdminUserVo) {
     <div class="stack" style="gap: 12px">
       <div class="small muted" style="line-height: 1.7">
         1. 先<span v-if="tplLoading" class="muted">模板生成中，请稍候…</span><span v-else><a href="javascript:void(0)" style="color: var(--brand-600)" @click="onDownloadTemplate">下载导入模板</a></span>，
-        按列头填好（<b>登录账号</b>、<b>角色标识</b>必填；角色标识只能填 <code>teacher</code> / <code>student</code> / <code>admin</code>，
-        与后端白名单逐字一致，填别的值只有该行失败、其余行照常导入）；<br />
-        2. 模板里的「状态」「最近登录」「创建时间」三列是导出留档用的，导入时忽略，填了不生效；<br />
-        3. 新导入的账号一律发默认密码 <b>zk123456</b>，首次登录强制改密，与手工新建口径一致；<br />
-        4. 单次最多 500 行；导入 admin（管理员）角色行需要超级管理员身份；<br />
-        5. 导入的账号统一归入<b>示例大学</b>（模板不含院系列，院系名在校内不唯一、按名称解析必歧义）；需归入具体学院，请导入后用该行的「编辑」改。
+        按列头填好（<b>登录账号</b>、<b>角色标识</b>必填；<b>学生必填「班级」</b>、<b>教师必填「学校」</b>）。
+        角色标识只能填 <code>teacher</code> / <code>student</code> / <code>admin</code>，
+        与后端白名单逐字一致，填别的值只有该行失败、其余行照常导入；<br />
+        2. 「学校」「班级」按<b>名称精确匹配</b>，不做模糊：填了班级就以班级为准，学校与专业自动跟随班级，
+        不用再填；两者都填且互相矛盾时以班级为准。名称命中多条时该行报错、不会替你猜，请改用唯一名称；<br />
+        3. 模板里的「状态」「最近登录」「创建时间」三列是导出留档用的，导入时忽略，填了不生效；<br />
+        4. 新导入的账号一律发默认密码 <b>zk123456</b>，首次登录强制改密，与手工新建口径一致；<br />
+        5. 单次最多 500 行；导入 admin（管理员）角色行需要超级管理员身份。
       </div>
       <label class="imp-file" :class="{ active: importFile }">
         <input type="file" accept=".xlsx,.xls" @change="onFilePick" />
