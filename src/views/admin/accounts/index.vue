@@ -446,6 +446,8 @@ const formRef = ref<FormInstance>();
 const editingAdmin = computed(() => formMode.value === 'edit' && form.userId === SUPER_ADMIN_ID);
 /** 编辑的行原本未入院系 —— 下拉要显式说出来，否则空下拉会被读成「候选没加载出来」 */
 const deptWasEmpty = computed(() => formMode.value === 'edit' && form.deptId == null);
+/** 学生/教师：登录账号 == 学号/工号（后端强校验），表单只留一个输入框 */
+const isStuOrTea = computed(() => form.role === 'student' || form.role === 'teacher');
 
 /* 表单校验（用户拍板 10-19，A3 起 nickName 的中文口径统一为「姓名」，与导入模板列头同词）：
    必填=登录账号/姓名/角色/工号学号；选填但格式校验=邮箱/手机号。错误以内联红字显示在输入框下方。 */
@@ -1212,7 +1214,9 @@ async function openFootprint(row: AdminUserVo) {
     <el-form ref="formRef" :model="form" :rules="rules" label-width="86px" label-position="left">
       <!-- 必填在前（带红星），选填在后；错误内联红字显示。
            ★ 占位文案全部用自绘覆盖层（.fc-ph）：原生 ::placeholder 在部分浏览器可被选中复制 -->
-      <el-form-item label="登录账号" prop="username">
+      <!-- 学生/教师：账号 = 学号/工号，只留「工号学号」一个框，避免两列填出不同值。
+           管理员仍走独立登录账号。 -->
+      <el-form-item v-if="!isStuOrTea" label="登录账号" prop="username">
         <el-input v-model="form.username" :disabled="formMode === 'edit'" />
         <span v-if="formMode === 'create' && !form.username" class="fc-ph">用于登录，创建后不可改</span>
       </el-form-item>
@@ -1236,8 +1240,11 @@ async function openFootprint(row: AdminUserVo) {
         <div v-if="deptWasEmpty" class="small muted" style="margin-top: 2px">该账号当前未入院系；不选则保持不变，选一个院系即归入</div>
       </el-form-item>
       <el-form-item label="工号/学号" prop="userNo">
-        <el-input v-model="form.userNo" />
-        <span v-if="!form.userNo" class="fc-ph">教师填工号，学生填学号</span>
+        <el-input v-model="form.userNo" :disabled="formMode === 'edit' && isStuOrTea" />
+        <span v-if="!form.userNo && !isStuOrTea" class="fc-ph">教师填工号，学生填学号</span>
+        <div v-if="isStuOrTea" class="small muted" style="margin-top: 2px">
+          {{ formMode === 'edit' ? '学号/工号即登录账号，创建后不可修改' : '学生/教师直接用学号/工号当登录账号' }}
+        </div>
       </el-form-item>
       <el-form-item label="手机号" prop="phone">
         <el-input v-model="form.phone" maxlength="11" />
@@ -1333,14 +1340,16 @@ async function openFootprint(row: AdminUserVo) {
     <div class="stack" style="gap: 12px">
       <div class="small muted" style="line-height: 1.7">
         1. 先<span v-if="tplLoading" class="muted">模板生成中，请稍候…</span><span v-else><a href="javascript:void(0)" style="color: var(--brand-600)" @click="onDownloadTemplate">下载导入模板</a></span>，
-        按列头填好（<b>登录账号</b>、<b>角色标识</b>必填；<b>学生必填「班级」</b>、<b>教师必填「学校」</b>）。
+        按列头填好（<b>工号学号</b>、<b>角色标识</b>必填；<b>学生必填「班级」</b>、<b>教师必填「学校」</b>）。
         角色标识只能填 <code>teacher</code> / <code>student</code> / <code>admin</code>，
         与后端白名单逐字一致，填别的值只有该行失败、其余行照常导入；<br />
-        2. 「学校」「班级」按<b>名称精确匹配</b>，不做模糊：填了班级就以班级为准，学校与专业自动跟随班级，
+        2. <b>账号即学号/工号</b>：「登录账号」留空时自动取工号学号；两列都填但不一样，该行报错——学生、教师不允许多套账号；<br />
+        3. 「学校」「班级」「院系」按<b>名称精确匹配</b>，不做模糊：填了班级就以班级为准，学校与专业自动跟随班级，
         不用再填；两者都填且互相矛盾时以班级为准。名称命中多条时该行报错、不会替你猜，请改用唯一名称；<br />
-        3. 模板里的「状态」「最近登录」「创建时间」三列是导出留档用的，导入时忽略，填了不生效；<br />
-        4. 新导入的账号一律发默认密码 <b>zk123456</b>，首次登录强制改密，与手工新建口径一致；<br />
-        5. 单次最多 500 行；导入 admin（管理员）角色行需要超级管理员身份。
+        4. 「院系」选填，只在校内子树里找同名部门（不填则落在学校根部门）；<br />
+        5. 模板里的「状态」「最近登录」「创建时间」三列是导出留档用的，导入时忽略，填了不生效；<br />
+        6. 新导入的账号一律发默认密码 <b>zk123456</b>，首次登录强制改密，与手工新建口径一致；<br />
+        7. 单次最多 500 行；导入 admin（管理员）角色行需要超级管理员身份。
       </div>
       <label class="imp-file" :class="{ active: importFile }">
         <input type="file" accept=".xlsx,.xls" @change="onFilePick" />
