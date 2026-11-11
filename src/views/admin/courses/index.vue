@@ -829,6 +829,76 @@ async function revokeApprove() {
   }
 }
 
+/* ---------------- 待审裁决（P-3：原「课程审核」页并入本抽屉，2026-11-10）----------------
+ * certStatus=pending 且有 certId 时，「认证材料」区显示 通过/驳回 按钮。
+ * 口径与原审核页完全一致：通过前确认"解锁教师备课"；驳回必填原因（C-15 按课程整体裁决）。
+ * 驳回后 course.status 回退 certifying，本页 active 列表查不到它 ⇒ 关抽屉；
+ * 通过后就地刷新认证详情（pending→approved），列表保持可见。
+ */
+const reviewing = ref(false);
+
+async function submitDrawerReview(action: 'approve' | 'reject') {
+  const cert = detail.value;
+  const course = detailCourse.value;
+  if (!cert?.certId || !course) return;
+  let rejectReason: string | undefined;
+  if (action === 'approve') {
+    try {
+      await ElMessageBox.confirm(
+        `确认课程「${course.courseName}」审核通过？通过后教师即可开始备课。`,
+        '审核通过确认',
+        { type: 'warning', confirmButtonText: '确认通过', cancelButtonText: '再想想' }
+      );
+    } catch {
+      return;
+    }
+  } else {
+    try {
+      const { value } = await ElMessageBox.prompt(
+        '将驳回该课程全部三项认证，教师需修改后重新提审。请输入驳回原因：',
+        '驳回认证',
+        {
+          confirmButtonText: '下一步',
+          cancelButtonText: '取消',
+          inputPlaceholder: '驳回原因（必填）',
+          inputValidator: (v: string) => (v && v.trim().length > 0 ? true : '驳回原因不能为空')
+        }
+      );
+      rejectReason = value.trim();
+    } catch {
+      return;
+    }
+  }
+  reviewing.value = true;
+  try {
+    await reviewCertification(cert.certId, { action, rejectReason });
+    ElMessage.success(
+      action === 'approve'
+        ? `已通过：课程「${course.courseName}」审核完成，教师可开始备课`
+        : `已驳回：课程「${course.courseName}」已退回「认证中」`
+    );
+    if (action === 'reject') {
+      detailVisible.value = false;
+      await fetchList();
+    } else {
+      // 就地刷新认证详情（pending→approved），不关抽屉
+      detailLoading.value = true;
+      try {
+        detail.value = await getCertDetail(Number(course.courseId));
+      } catch {
+        /* 保留旧数据 */
+      } finally {
+        detailLoading.value = false;
+      }
+      await fetchList();
+    }
+  } catch {
+    /* request.ts 已提示后端原话 */
+  } finally {
+    reviewing.value = false;
+  }
+}
+
 onMounted(async () => {
   void loadTerms();
   // 先拿列表：首行的 scheduleCount 决定要不要再拉课次聚合。
@@ -841,11 +911,7 @@ onMounted(async () => {
 <template>
   <div class="page-head">
     <h1>课程总览</h1>
-    <div class="actions">
-      <a class="btn btn-outline" href="javascript:void(0)" @click="$router.push('/admin/review')">
-        <ZkIcon name="badge-check" :size="16" />课程审核
-      </a>
-    </div>
+    <!-- P-3（2026-11-10）：「课程审核」页退役，待审课程的通过/驳回在详情抽屉「认证材料」区就地操作 -->
   </div>
 
   <div class="toolbar">
@@ -1232,8 +1298,18 @@ onMounted(async () => {
           <template v-if="detail">
             <!-- C-14 出参只有 certStatus + aiSuggestion（没有逐材料的 aiDecision，那在 materials[].aiResult） -->
             <div class="small muted" style="margin-bottom: 8px">
-              审核结论：{{ detail.certStatus === 'approved' ? '已通过' : detail.certStatus === 'rejected' ? '已驳回' : detail.certStatus || '—' }}
+              审核结论：{{ detail.certStatus === 'approved' ? '已通过' : detail.certStatus === 'rejected' ? '已驳回' : detail.certStatus === 'pending' ? '待审核' : detail.certStatus || '—' }}
               <span v-if="detail.aiSuggestion">　AI 初审：{{ detail.aiSuggestion }}</span>
+            </div>
+            <!-- P-3：原「课程审核」页的裁决操作并入抽屉（2026-11-10）——待审课程就地通过/驳回 -->
+            <div v-if="detail.certStatus === 'pending' && detail.certId" class="stack" style="gap: 8px; margin-bottom: 10px">
+              <el-button type="primary" size="small" :loading="reviewing" @click="submitDrawerReview('approve')">
+                <ZkIcon name="badge-check" :size="14" style="margin-right: 3px" />审核通过
+              </el-button>
+              <el-button type="danger" plain size="small" :loading="reviewing" @click="submitDrawerReview('reject')">
+                <ZkIcon name="x" :size="14" style="margin-right: 3px" />驳回
+              </el-button>
+              <div class="small muted">通过后教师即可开始备课；驳回需填写原因，课程退回「认证中」。</div>
             </div>
             <div v-if="(detail.materials ?? []).length" class="stack" style="gap: 8px">
               <div v-for="m in detail.materials" :key="m.materialId" class="material-row">

@@ -13,13 +13,13 @@ const courses = ref<Record<string, unknown>[]>([]);
 const loading = ref(true);
 
 /**
- * 快捷入口：取菜单里的 8 项。
+ * 快捷入口：取菜单里的 7 项。
  * ★ 2026-11-09 会议 #22 摘掉 AI 工作台后由 9 → 8 项
  *   （原型快捷入口是 8 个按钮；此前多出来的就是 /admin/ai）。
+ * ★ 2026-11-10 P-3 摘掉「课程审核」页（并入课程总览抽屉）后 8 → 7 项。
  */
 const SHORTCUT_PATHS = [
   '/admin/accounts',
-  '/admin/review',
   '/admin/analytics',
   '/admin/patrol',
   '/admin/basicdata',

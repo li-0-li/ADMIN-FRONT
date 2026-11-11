@@ -27,7 +27,8 @@ export const ADMIN_MENUS: AdminMenuItem[] = [
   //   两页共享同一套详情组件，但菜单各自独立——教师可写、学生只读，混成一项会让权限语义含糊。
   { path: '/admin/teachers', title: '教师管理', icon: 'graduation-cap' },
   { path: '/admin/students', title: '学生管理', icon: 'user' },
-  { path: '/admin/review', title: '课程审核', icon: 'badge-check' },
+  // ★ 2026-11-10 P-3：「课程审核」页退役——认证审核并入课程总览详情抽屉「认证材料」区
+  //   （待审课程就地 通过/驳回），菜单与路由随之摘除，review 页目录删除。
   { path: '/admin/courses', title: '课程总览', icon: 'book-open' },
   // ★ 2026-11-10：题库 / 知识库都挂在基础课程上（不挂学期），所以紧邻课程总览。
   { path: '/admin/questions', title: '题库管理', icon: 'file-text' },

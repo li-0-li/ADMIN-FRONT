@@ -11,6 +11,11 @@ export const useUserStore = defineStore('user', () => {
   const nickName = ref<string>(localStorage.getItem(NICK_KEY) ?? '');
   const roles = ref<string[]>([]);
   const permissions = ref<string[]>([]);
+  /**
+   * 编号 67：`/getInfo` 下发的 `user.deptId` 在此保留（原值可能是裸数字或字符串，统一转 string；
+   * 后端没给就是 null，由调用方决定兜底）。此前 store 不保留该字段，页面「学校根」只能取常量 `'200'`。
+   */
+  const deptId = ref<string | null>(null);
 
   const isLogin = computed(() => token.value.length > 0);
 
@@ -36,6 +41,8 @@ export const useUserStore = defineStore('user', () => {
     const user = (res.user ?? {}) as Record<string, unknown>;
     username.value = String(user.userName ?? '');
     nickName.value = String(user.nickName ?? username.value);
+    const rawDeptId = user.deptId;
+    deptId.value = rawDeptId === undefined || rawDeptId === null ? null : String(rawDeptId);
     if (nickName.value) localStorage.setItem(NICK_KEY, nickName.value);
   }
 
@@ -55,7 +62,8 @@ export const useUserStore = defineStore('user', () => {
     nickName.value = '';
     roles.value = [];
     permissions.value = [];
+    deptId.value = null;
   }
 
-  return { token, username, nickName, roles, permissions, isLogin, hasPermi, setToken, fetchUserInfo, login, logout };
+  return { token, username, nickName, roles, permissions, deptId, isLogin, hasPermi, setToken, fetchUserInfo, login, logout };
 });

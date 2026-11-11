@@ -301,6 +301,7 @@ export interface ScheduleCreateBo {
   classTime: string;
   durationMin: number;
   /** 教学周 */
+  /** 教学周号。★ 不由管理端提交：后端按 `offering_id → term.start_date` 推算为唯一真值源（周数区间取 R-2 教学周配置，不写死 16）。此字段仅为兼容旧入参保留，前端表单不要填它。 */
   weekRef?: number;
   /** 1-7 */
   weekday: number;

@@ -141,7 +141,8 @@ const failReason = computed(() => {
 
 function goBack() {
   if (window.history.length > 1) router.back();
-  else router.push('/admin/review');
+  // 原「课程审核」页已并入课程总览（P-3），历史入口的兜底跳转同步改
+  else router.push('/admin/courses');
 }
 
 function openInNewTab() {
