@@ -44,10 +44,37 @@ const hasNewFields = computed(() => {
  */
 const logLevel = ref<'ERROR' | 'ALL'>('ERROR');
 
+/**
+ * 一行是不是「新日志条目的开头」（logback pattern: `HH:mm:ss.SSS [thread] LEVEL ...`）。
+ * 用于切分异常块：块内所有行（异常类名行 / `at ...` / `Caused by:` / `... N more`）都不长这样。
+ */
+function isLogHead(line: string): boolean {
+  return /^\s*(\d{2}:\d{2}:\d{2}[.,]\d{3}|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/.test(line);
+}
+
 /** 按筛选级别过滤后的行。ERROR 行判定复用行高亮的 isErrLine，两处口径永不脱节 */
 const errLinesShown = computed(() => {
   const lines = errLogs.value?.lines ?? [];
-  return logLevel.value === 'ERROR' ? lines.filter(l => isErrLine(l)) : lines;
+  if (logLevel.value === 'ALL') return lines;
+  /**
+   * ERROR 模式：一条 ERROR 日志 + 它后面整段异常块，直到下一条日志开头为止。
+   * ★ 2026-11-11 实测两个坑：
+   *  ① 尾部窗口里一条异常的 stack trace 占 150~200 行 ⇒ limit 取 50 连 ERROR 头都看不到；
+   *  ② ERROR 头行的**下一行不是 `at`**，而是异常类名行（`org...NoResourceFoundException: …`），
+   *    若只认 `at` 开头，堆栈会被整段丢掉、ERROR 视图只剩光秃秃一行。
+   * ⇒ 判据改成「块延续到下一个日志头」，不依赖块内行的具体格式，异常链/Caused by 全部保住。
+   */
+  const out: string[] = [];
+  let inBlock = false;
+  for (const l of lines) {
+    if (isLogHead(l)) {
+      inBlock = isErrLine(l);
+      if (inBlock) out.push(l);
+      continue;
+    }
+    if (inBlock) out.push(l);
+  }
+  return out;
 });
 
 /** 自动刷新间隔，与原型「实时 · 5s 刷新」一致 */
@@ -138,7 +165,7 @@ async function fetchErrorLogs() {
   if (errInFlight) return;
   errInFlight = true;
   try {
-    const r = await getErrorLogs(50);
+    const r = await getErrorLogs(200);
     errLogs.value = r && typeof r === 'object' ? r : null;
     errSupported.value = true;
   } catch {
@@ -212,8 +239,9 @@ const errFootText = computed(() => {
   const shown = errLinesShown.value.length;
   const size = errLogs.value?.fileSizeKB;
   const sizeText = size == null ? '' : ` · 文件 ${size} KB`;
-  const scope = logLevel.value === 'ERROR' ? '仅 ERROR' : '全部级别';
-  return `显示 ${shown}/${total} 行（${scope}，尾部 50 行）${sizeText}`;
+  // ERROR 模式现在带堆栈上下文，口径必须写清「ERROR + 堆栈」，否则 21/200 这种数字会被当成筛错了
+  const scope = logLevel.value === 'ERROR' ? 'ERROR 行 + 紧随堆栈' : '全部级别';
+  return `显示 ${shown}/${total} 行（${scope}，尾部取 ${total} 行）${sizeText}`;
 });
 
 /* ---------------- 工具 ---------------- */

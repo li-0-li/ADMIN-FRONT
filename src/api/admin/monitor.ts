@@ -29,8 +29,12 @@ export function getSystemStatus() {
  * 为什么不捆进 `getSystemStatus`：监控页 5 秒轮询一次 status，日志几十行捆进去
  * 99% 的轮询都在重复传同一段文本——单独端点，调用方按自己的慢节奏（约 30 秒）拉。
  * 读文件失败时后端**不抛 500**，`error` 字段带中文原因，调用方按文案渲染即可。
+ *
+ * ★ 2026-11-11 实测：`limit` 后端**硬顶 200**（传 500 仍只返 200 行），默认值必须取 200 不能取 50——
+ * 日志尾部一条异常的 stack trace 就要 150~200 行，取 50 必然切在堆栈中间，窗口里连一条 ERROR 头都
+ * 看不到（实测 50 行含 ERROR=0，200 行含 ERROR=1），默认「只看 ERROR」视图因此恒为空。
  */
-export function getErrorLogs(limit = 50) {
+export function getErrorLogs(limit = 200) {
   return request<ErrorLogsVo>({
     url: '/api/v1/admin/system/error-logs',
     method: 'get',
