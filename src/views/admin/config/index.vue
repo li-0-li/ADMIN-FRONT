@@ -3,7 +3,19 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { onBeforeRouteLeave, RouterLink } from 'vue-router';
 import ZkIcon from '@/components/ZkIcon.vue';
-import { listConfigs, listWords, saveWord, updateConfigs, type ConfigItem, type SensitiveWordVo } from '@/api/admin/config';
+import {
+  getTeachingWeek,
+  listConfigs,
+  listWords,
+  probeTeachingWeek,
+  saveTeachingWeek,
+  saveWord,
+  updateConfigs,
+  type ConfigItem,
+  type SensitiveWordVo,
+  type TeachingWeekOverride,
+  type TeachingWeekProbe
+} from '@/api/admin/config';
 
 /**
  * 系统配置页（/admin/config）：
@@ -310,9 +322,74 @@ function onBeforeUnload(e: BeforeUnloadEvent) {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * 教学周全局设置（G8 / R-2 · 录音 A1）
+ *   录音原话：「有的学校就是 1~18 周，有的 1~16 周，要能在后台去设置……设置了之后，
+ *   所有的课就按照这个教学周来，就不用人去调了。」
+ * ★ 这套接口不在 biz_config 25 键里（是独立端点 + 两个专用配置键），所以单独一块，
+ *   不混进分组卡片；改的是全局默认，单门课的覆盖仍由开课记录维护。
+ * ------------------------------------------------------------------ */
+const twProbe = ref<TeachingWeekProbe | 'probing'>('probing');
+const twLoading = ref(false);
+const twSaving = ref(false);
+const twForm = reactive({ weekFrom: 1, weekCount: 16 });
+const twIsDefault = ref(false);
+const twOverrides = ref<TeachingWeekOverride[]>([]);
+/** 已落库值（用来判"有没有改动"） */
+const twSaved = reactive({ weekFrom: 1, weekCount: 16 });
+const twDirty = computed(
+  () => twForm.weekFrom !== twSaved.weekFrom || twForm.weekCount !== twSaved.weekCount
+);
+
+async function loadTeachingWeek() {
+  twProbe.value = await probeTeachingWeek();
+  if (twProbe.value !== 'ready') return;
+  twLoading.value = true;
+  try {
+    const d = await getTeachingWeek();
+    const from = Number(d?.weekFrom ?? 1);
+    const count = Number(d?.weekCount ?? 16);
+    twForm.weekFrom = from;
+    twForm.weekCount = count;
+    twSaved.weekFrom = from;
+    twSaved.weekCount = count;
+    twIsDefault.value = d?.isDefault === true;
+    twOverrides.value = Array.isArray(d?.overrides) ? d.overrides : [];
+  } catch (e) {
+    // 探测通过但读失败（多半是权限点在探测与读取之间变了）⇒ 降级成 forbidden 提示，不弹红条
+    twProbe.value = 'forbidden';
+    ElMessage.warning(String((e as Error)?.message ?? '教学周配置读取失败'));
+  } finally {
+    twLoading.value = false;
+  }
+}
+
+async function submitTeachingWeek() {
+  if (!twDirty.value) return;
+  twSaving.value = true;
+  try {
+    await saveTeachingWeek({ weekFrom: twForm.weekFrom, weekCount: twForm.weekCount });
+    twSaved.weekFrom = twForm.weekFrom;
+    twSaved.weekCount = twForm.weekCount;
+    twIsDefault.value = false;
+    ElMessage.success(`已保存：第 ${twForm.weekFrom} 周起，共 ${twForm.weekCount} 周`);
+    void loadTeachingWeek();
+  } catch (e) {
+    ElMessage.error(String((e as Error)?.message ?? '教学周配置保存失败'));
+  } finally {
+    twSaving.value = false;
+  }
+}
+
+function resetTeachingWeek() {
+  twForm.weekFrom = twSaved.weekFrom;
+  twForm.weekCount = twSaved.weekCount;
+}
+
 onMounted(() => {
   fetchConfigs();
   fetchWords();
+  void loadTeachingWeek();
   window.addEventListener('scroll', onScrollSpy, { passive: true });
   window.addEventListener('beforeunload', onBeforeUnload);
 });
@@ -341,6 +418,60 @@ onUnmounted(() => {
     <el-input v-model="configSearch" clearable placeholder="搜索配置键或说明（如 ai. / 配额）" style="width: 300px" />
     <span v-if="configSearch.trim()" class="small muted">命中 {{ searchHitCount }} 项配置（跨键名与说明匹配）</span>
     <span v-else class="small muted">共 {{ items.length }} 项配置 · {{ groups.length }} 组 · 改动后点右上「保存全部」一次提交</span>
+  </div>
+
+  <!-- 教学周全局设置（G8/R-2 · 录音 A1）：独立端点，不属于 biz_config 分组，单列一块 -->
+  <div class="card card-pad tw-card">
+    <div class="card-title">
+      教学周设置
+      <span class="small muted" style="margin-left: 8px; font-weight: 400">
+        全局默认——新建排课时按它带出；单门课可在开课记录里单独覆盖
+      </span>
+    </div>
+
+    <div v-if="twProbe === 'probing'" class="small muted tw-hint">正在探测教学周接口…</div>
+
+    <div v-else-if="twProbe === 'absent'" class="ids-warn">
+      当前后端包未提供教学周设置接口（<code>GET /api/v1/admin/config/teaching-week</code> 返回「No static resource」）。
+      该接口已在后端源码实现，换包后本区块自动启用；在此之前，排课仍按所选学期的起止日期折算周数上限。
+    </div>
+
+    <div v-else-if="twProbe === 'forbidden'" class="ids-warn">
+      接口已在线，但当前账号缺权限点 <code>admin:config:teachingWeekQuery</code>（菜单 3362 尚未登记或未授权）。
+      这不是接口故障——登记并授权后刷新页面即可生效。
+    </div>
+
+    <div v-else v-loading="twLoading" class="tw-body">
+      <div class="tw-field">
+        <span class="tw-label">起始教学周</span>
+        <el-input-number v-model="twForm.weekFrom" :min="1" :max="25" :step="1" step-strictly style="width: 130px" />
+        <span class="small muted">从第几周开始算作第 1 个教学周</span>
+      </div>
+      <div class="tw-field">
+        <span class="tw-label">教学总周数</span>
+        <el-input-number v-model="twForm.weekCount" :min="1" :max="30" :step="1" step-strictly style="width: 130px" />
+        <span class="small muted">学期共几周（1~30）；16 / 18 是常见口径</span>
+      </div>
+      <div class="tw-field">
+        <span class="tw-label">当前口径</span>
+        <span class="tw-summary">
+          第 {{ twForm.weekFrom }} ~ {{ twForm.weekFrom + twForm.weekCount - 1 }} 周
+          <span v-if="twIsDefault" class="badge badge-neutral" title="biz_config 里还没有这两个键，这里显示的是后端缺省值">系统缺省</span>
+          <span v-else class="badge badge-neutral" title="已写入 biz_config 的 teaching.week.from / teaching.week.count">已自定义</span>
+        </span>
+      </div>
+      <div class="tw-actions">
+        <el-button :disabled="!twDirty" @click="resetTeachingWeek">撤销</el-button>
+        <el-button type="primary" :loading="twSaving" :disabled="!twDirty" @click="submitTeachingWeek">
+          保存教学周
+        </el-button>
+      </div>
+      <div v-if="twOverrides.length" class="small muted tw-override">
+        另有 {{ twOverrides.length }} 门课在开课记录里单独设了周窗口，不受这里的全局默认影响（{{
+          twOverrides.slice(0, 3).map(o => o.courseName || o.courseId).join('、')
+        }}{{ twOverrides.length > 3 ? ' 等' : '' }}）。
+      </div>
+    </div>
   </div>
 
   <div class="cfg-layout">
@@ -594,6 +725,44 @@ onUnmounted(() => {
   gap: 12px;
   margin-bottom: 16px;
   flex-wrap: wrap;
+}
+/* 教学周设置块（G8/R-2 · 录音 A1）：独立端点，单列一块放在分组卡片之前 */
+.tw-card {
+  margin-bottom: 16px;
+}
+.tw-hint {
+  padding: 6px 0;
+}
+.tw-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.tw-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.tw-label {
+  width: 84px;
+  flex: none;
+  font-size: 13px;
+  color: var(--ink-700, #374151);
+}
+.tw-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-800, #1f2937);
+}
+.tw-actions {
+  display: flex;
+  gap: 8px;
+}
+.tw-override {
+  line-height: 1.7;
 }
 /* 左导航 + 主内容两栏；≤1100px 收掉导航（窄屏优先保内容宽度，与全站 1024 断点策略一致） */
 .cfg-layout {

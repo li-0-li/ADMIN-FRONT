@@ -809,7 +809,7 @@ interface PoolEntry extends CourseBrief {
 }
 
 /**
- * 待排池**全集**：只过三重认证，不叠外层筛选。
+ * 待排池**全集**：不叠外层筛选、也不再按三重认证过滤（2026-11-11 放开，见 buildPoolEntries 末尾）。
  * 抽成独立函数（2026-11-03）是为了能算出「被外层筛选排除了多少条」——
  * 不抽出来的话，弹窗只能显示剩下几条，用户看不出还有多少课被筛选挡住了。
  * 只依赖响应式数据、无副作用，被两个 computed 各调用一次（数据量 ~20 门课，不必优化）。
@@ -850,8 +850,10 @@ function buildPoolEntries(): PoolEntry[] {
       out.push({ ...c, key: `course-${c.courseId}`, inSchedule: false });
     }
   }
-  // 三重认证门槛（2026-10-29）：未过认证的课程连签都不出——放回的课次签同拦，防止绕道重排
-  return out.filter(c => certPassed(c.courseId));
+  // 2026-11-11 放开认证门槛（录音 A3）：未认证课程**照常进待排池**。
+  // 原口径（2026-10-29）是「未过认证的课程连签都不出」——管理者既排不了课也看不见这门课，
+  // 等于把教师个人材料（说课视频）变成了排课的前置条件，与录音「排课是排课」直接冲突。
+  return out;
 }
 
 /**
@@ -1286,13 +1288,9 @@ function onDragStart(c: CourseBrief, e: DragEvent) {
  *   并由那里给出明确提示。
  */
 function onCellBlockDragStart(cell: ScheduleCell, e: DragEvent) {
-  // 三重认证门槛（2026-10-29）：未认证课次不许移动/互换——preventDefault 让拖拽根本起不来，
-  // 同时弹说明，避免"按不住又不知道为什么"（与 busy 静默拦截的教训同源）。
-  if (!certPassed(cell.courseId)) {
-    e.preventDefault();
-    ElMessage.info(`「${cell.courseName || '该课程'}」未通过三重认证，不能排课操作；请先在「课程审核」里通过认证`);
-    return;
-  }
+  // 2026-11-11 放开认证门槛（录音 A3）：未认证课次**允许**移动/互换。
+  // 原口径（2026-10-29）在这里 preventDefault，拖拽根本起不来——存量未认证课次就成了"只能看不能动"的死数据。
+  // 认证状态仍在格子角标与详情里显示（提示用途），但不再阻断排课操作。
   draggingCourse.value = null;
   draggingCell.value = cell;
   dragOverKey.value = '';
@@ -1972,27 +1970,24 @@ const classListOptions = computed(() => {
 });
 const detailSaving = ref(false);
 
-/** 详情弹窗教师（2026-10-29 锁只读，同新增弹门口径）：教师 = 课程的授课教师（提交三重认证的老师），弹窗内不可改。
- *  课程池查不到该课程时回退课次自带的教师信息，保证展示不空。
- *  失效条件：产品将来允许「代课 / 换教师」场景 ⇒ 这里恢复下拉，并同步放开下方 dirty 判定与保存 BO。 */
-const detailTeacher = computed(() => {
-  const c = detailCell.value;
-  if (!c) return null;
-  const fromCourse = courseById.value.get(String(c.courseId));
-  const tid = fromCourse?.teacherId ?? (c.teacherId === undefined || c.teacherId === null ? '' : String(c.teacherId));
-  const tname = fromCourse?.teacherName || c.teacherName || '';
-  return { id: tid, name: tname || (tid ? `教师 #${tid}` : '未指定教师') };
-});
+/*
+ * 详情弹窗教师改为可下拉手选（2026-11-11 · 录音 A2）。
+ * 原 `detailTeacher` computed（只读展示 + 「失效条件：允许代课/换教师」）已按该条件移除——
+ * 现在教师取 `editForm.teacherId`，与教室/班级同一条保存链路（saveDetail → moveSchedule）。
+ */
 
 /** 与原值比对，没改就不让点保存（避免无意义写库） */
 const detailDirty = computed(() => {
   const c = detailCell.value;
   if (!c) return false;
   const cur = c.classroomId === undefined || c.classroomId === null ? '' : String(c.classroomId);
+  // 2026-11-11：教师恢复可改（录音 A2），dirty 判定必须同步纳入——否则换了老师按钮还是不亮
+  const curTeacher = c.teacherId === undefined || c.teacherId === null ? '' : String(c.teacherId);
   return (
     editForm.classroomId !== cur ||
     editForm.remark !== (c.note ?? '') ||
-    editForm.clazzName !== (c.clazzName ?? '')
+    editForm.clazzName !== (c.clazzName ?? '') ||
+    editForm.teacherId !== curTeacher
   );
 });
 
@@ -2107,17 +2102,48 @@ const teacherList = ref<{ value: string; label: string }[]>([]);
 /** 拖动/点击课程卡进来时，记录来源课程，用于自动预选授课教师 */
 const presetCourseId = ref('');
 
-/** 新增弹窗的课程选项：courseList 过滤出**已通过三重认证**的课（2026-10-29）。
- *  courseList 本体保持全量——顶部课程筛选框还要用它把存量未认证课次筛出来看。 */
-const certifiedCourseOptions = computed(() => courseList.value.filter(o => certPassed(o.value)));
+/**
+ * 新增弹窗的课程选项（2026-11-11 放开认证前置 · 录音 A3）。
+ *
+ * 原口径（2026-10-29）：只列**已通过三重认证**的课，未认证的课连下拉都进不来。
+ * 会议录音 A3 明确否掉：
+ *   「排课是排课，你上传视频只是老师的一个人的内容……那这里就是有冲突的」
+ * ⇒ 排课不再被认证状态拦住。未认证课程照常可选，只在文案上带「未认证」后缀，
+ *   让管理员知情而不是被硬拦。`certPassed` 仍用于给课表格子/待排签打标签（提示用途）。
+ */
+const selectionCourseOptions = computed(() =>
+  courseList.value.map(o => ({
+    value: o.value,
+    label: certPassed(o.value) ? o.label : `${o.label}（未认证）`
+  }))
+);
 
-/** 授课教师只读化（2026-10-29）：教师固定 = 课程接口返回的 teacherId/teacherName
- *  （即提交三重认证的老师），不提供手选——选了课老师就定了，选不了课就留空拦提交。 */
+/** 课程自带的认证教师——只作**默认值**，不再是唯一可选值（2026-11-11） */
+const autoTeacherId = computed(() => {
+  const hit = form.courseId ? courseById.value.get(String(form.courseId)) : undefined;
+  return hit?.teacherId ? String(hit.teacherId) : '';
+});
+
+/**
+ * 选课带出默认教师（2026-11-11 改口径）。
+ *
+ * 原逻辑（2026-10-29）：教师**只读**，固定 = 课程接口返回的 teacherId/teacherName，不提供手选。
+ * 依据是"选了课老师就定了"。会议录音 A2 明确否掉这条路：
+ *   「老是自动带出都是有问题的啊，这里要支持选老师」「排课一定是我所有老师我都可以选」
+ * ⇒ 现在只把课程认证教师当**默认值**填进去，用户可改选任意教师；
+ *   课程没有认证教师时**保留**用户已选的人（原先会清空，等于把用户的选择吞掉）。
+ *
+ * 后端侧已核对：`AdminScheduleServiceImpl.doCreate` 只校验 teacherId 非空，
+ * 冲突检测也按 teacherId 独立判三维（教师/教室/班级），不存在"必须是课程认证人"的约束。
+ */
 watch(
   () => form.courseId,
-  id => {
-    const hit = id ? courseById.value.get(String(id)) : undefined;
-    form.teacherId = hit?.teacherId ? String(hit.teacherId) : '';
+  () => {
+    if (autoTeacherId.value) {
+      form.teacherId = autoTeacherId.value;
+    } else if (!form.courseId) {
+      form.teacherId = '';
+    }
   }
 );
 
@@ -3215,7 +3241,7 @@ function slotFreedom(ctx: AutoCtx, entry: PoolEntry) {
  */
 function noSlotReason(ctx: AutoCtx, entry: PoolEntry): string | null {
   if (!entry.teacherId) {
-    return '课程未指定授课教师，自动排课要求先定教师；可让该课程的授课教师先完成三重认证，或在签上拖拽手动指定';
+    return '课程未指定授课教师，自动排课要求先定教师；可在课程信息里补上授课教师，或在签上拖拽手动指定';
   }
   const f = slotFreedom(ctx, entry);
   // 锁了教室时，「有空档」必须是教师+班级+该教室三者同时空，否则会报成"没有共同空档"（误导）
@@ -4022,8 +4048,8 @@ watch(
                 >
                   <!-- 未发布标识（C-24）：draft 课次学生/教师端不可见，点「发布课表」后才可见 -->
                   <span v-if="s.status === 'draft'" class="draft-tag">未发布</span>
-                  <!-- 三重认证门槛（2026-10-29）：存量未认证课次的角标；该卡不可拖（见 onCellBlockDragStart） -->
-                  <span v-if="!certPassed(s.courseId)" class="uncert-tag" title="该课程未通过三重认证，不能排课/移动/互换">未认证</span>
+                  <!-- 未认证角标（2026-11-11 起为**提示性**，不再阻断）：放开后仍保留标识，让管理员看得见状态 -->
+                  <span v-if="!certPassed(s.courseId)" class="uncert-tag" title="该课程未通过三重认证；排课不受此限制，仅作状态提示">未认证</span>
                   <!-- 悬停反馈：不同教师 ⇒ 放下后可选「并入 / 互换」；同一教师 ⇒ 只能互换 -->
                   <span v-if="isChoiceHover(c.weekday, row.period.seq, s)" class="card-tag">
                     <ZkIcon name="plus" :size="11" />{{ draggingCell ? '可并入 / 可互换' : '也排到这一节' }}
@@ -4309,11 +4335,18 @@ watch(
       </div>
       <div class="detail-row">
         <span class="detail-k">教师</span>
-        <!-- 2026-10-29 只读化：教师 = 提交三重认证的老师（课程自带），同新增弹门口径，不可改 -->
-        <div v-if="detailTeacher" class="teacher-ro" style="flex: 1; min-width: 0">
-          {{ detailTeacher.name }}
-        </div>
-        <div v-else class="small muted" style="flex: 1">未指定教师</div>
+        <!-- 2026-11-11 恢复可改（录音 A2）：原先「教师 = 提交三重认证的老师，弹窗内不可改」，
+             正是注释里写的失效条件「产品将来允许代课/换教师」被触发了。
+             后端 moveSchedule 的 ScheduleUpdateBo 本就支持传 teacherId 换教师。 -->
+        <el-select
+          v-model="editForm.teacherId"
+          placeholder="未指定教师"
+          clearable
+          filterable
+          style="flex: 1; min-width: 0"
+        >
+          <el-option v-for="t in teacherList" :key="t.value" :label="t.label" :value="t.value" />
+        </el-select>
       </div>
       <div class="detail-row">
         <span class="detail-k">教室</span>
@@ -4499,17 +4532,31 @@ watch(
         </div>
       </el-form-item>
       <el-form-item label="课程" required>
-        <el-select v-model="form.courseId" placeholder="请选择课程（仅列已通过三重认证的课）" filterable style="width: 100%">
-          <el-option v-for="o in certifiedCourseOptions" :key="o.value" :label="o.label" :value="o.value" />
+        <el-select v-model="form.courseId" placeholder="请选择课程" filterable style="width: 100%">
+          <el-option v-for="o in selectionCourseOptions" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
       </el-form-item>
       <el-form-item label="授课教师" required>
-        <!-- 2026-10-29 只读化：教师 = 提交三重认证的老师（课程接口带出），不可手选 -->
-        <div v-if="form.teacherId" class="teacher-ro">
-          {{ courseById.get(String(form.courseId))?.teacherName || ('教师 #' + form.teacherId) }}
-          <span class="small muted">自动带出</span>
+        <!-- 2026-11-11 放开手选（录音 A2：「老是自动带出都是有问题的啊，这里要支持选老师」）：
+             默认仍按课程带出认证教师，但允许改成任一教师。 -->
+        <el-select
+          v-model="form.teacherId"
+          placeholder="请选择授课教师"
+          filterable
+          clearable
+          style="width: 100%"
+        >
+          <el-option v-for="t in teacherList" :key="t.value" :label="t.label" :value="t.value" />
+        </el-select>
+        <div class="small muted" style="width: 100%">
+          <template v-if="form.courseId && autoTeacherId && form.teacherId === autoTeacherId">
+            已按课程带出认证教师，可改选其他教师
+          </template>
+          <template v-else-if="!teacherList.length">
+            教师列表未取到——可点工具栏刷新后重试，或先到「基础数据 → 教师」确认有教师账号
+          </template>
+          <template v-else>排课不受课程认证限制，任意教师都可选</template>
         </div>
-        <div v-else class="small muted">请先选择课程——教师自动带出</div>
       </el-form-item>
       <el-form-item label="上课班级" required>
         <el-select
