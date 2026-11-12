@@ -453,18 +453,28 @@ const isStuOrTea = computed(() => form.role === 'student' || form.role === 'teac
    必填=登录账号/姓名/角色/工号学号；选填但格式校验=邮箱/手机号。错误以内联红字显示在输入框下方。 */
 const EMAIL_RE = /^[\w.+-]+@[\w-]+(\.[\w-]+)+$/;
 const PHONE_RE = /^1[3-9]\d{9}$/;
-const rules: FormRules = {
-  username: [{ required: true, message: '登录账号为必填', trigger: 'blur' }],
+const baseRules: FormRules = {
   nickName: [{ required: true, message: '姓名为必填', trigger: 'blur' }],
   role: [{ required: true, message: '角色为必选', trigger: 'change' }],
   userNo: [{ required: true, message: '工号/学号为必填', trigger: 'blur' }],
   email: [{ pattern: EMAIL_RE, message: '邮箱格式不正确', trigger: 'blur' }],
   phone: [{ pattern: PHONE_RE, message: '手机号格式不正确', trigger: 'blur' }]
 };
+/** username 校验必须跟着角色走：学生/教师表单里登录账号框不渲染（账号=学号/工号，后端留空自动取号），
+ *  若沿用静态 required，el-form 会拿看不见的空 username 拦下提交 —— 师生将永远保存不了（2026-11-12 修复）。 */
+const formRules = computed<FormRules>(() => ({
+  ...baseRules,
+  username: isStuOrTea.value ? [] : [{ required: true, message: '登录账号为必填', trigger: 'blur' }]
+}));
+// 角色在师生 ⇄ 非师生间切换时，清掉 username 上残留的红字（规则已换，旧提示不再成立）
+watch(isStuOrTea, () => formRef.value?.clearValidate('username'));
 
 function openCreate() {
   formMode.value = 'create';
-  Object.assign(form, { username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: '', userId: undefined, deptId: DEFAULT_DEPT_ID });
+  // ★ 默认预选「学生」：本页新增主体是师生，打开即是「只填工号/学号」形态（登录账号框不出现）；
+  //   要建管理员再手动切角色，切到非师生时登录账号框动态出现（watch 里同步清校验态）。
+  //   原来 role:'' 会让 isStuOrTea=false ⇒ 弹窗先露出「登录账号」框，被误解成师生也要填两列（2026-11-12 用户截图反馈）。
+  Object.assign(form, { username: '', nickName: '', email: '', phone: '', userNo: '', remark: '', role: 'student', userId: undefined, deptId: DEFAULT_DEPT_ID });
   formRolesOriginal.value = [];
   formRef.value?.clearValidate();
   formVisible.value = true;
@@ -1211,7 +1221,7 @@ async function openFootprint(row: AdminUserVo) {
 
   <!-- 新增 / 编辑 -->
   <el-dialog v-model="formVisible" :title="formMode === 'create' ? '新增账号' : '编辑账号'" width="480px">
-    <el-form ref="formRef" :model="form" :rules="rules" label-width="86px" label-position="left">
+    <el-form ref="formRef" :model="form" :rules="formRules" label-width="86px" label-position="left">
       <!-- 必填在前（带红星），选填在后；错误内联红字显示。
            ★ 占位文案全部用自绘覆盖层（.fc-ph）：原生 ::placeholder 在部分浏览器可被选中复制 -->
       <!-- 学生/教师：账号 = 学号/工号，只留「工号学号」一个框，避免两列填出不同值。
