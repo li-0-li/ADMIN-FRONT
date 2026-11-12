@@ -128,7 +128,7 @@ async function onLogin() {
         <template v-if="mode === 'pwd'">
           <div class="field">
             <label>账号</label>
-            <input v-model="form.username" class="input" placeholder="学号 / 工号 / 手机号 / 邮箱" @keyup.enter="onLogin" />
+            <input v-model="form.username" class="input" placeholder="工号 / 学号 / 管理员账号" @keyup.enter="onLogin" />
           </div>
           <div class="field">
             <label>密码</label>
@@ -171,7 +171,7 @@ async function onLogin() {
             <div><code>admin</code> / <code>admin123</code> — 系统管理员</div>
             <div><code>demo_teacher</code> / <code>admin123</code> — 教师</div>
             <div><code>demo_stu01</code> / <code>admin123</code> — 学生</div>
-            <div class="muted" style="margin-top: 6px">账号来自本地演示库；本端只放行管理员。</div>
+            <div class="muted" style="margin-top: 6px">账号来自本地演示库；本端只放行管理员。师生账号即学号/工号，登录只认账号，不支持手机号/邮箱。</div>
           </div>
         </details>
       </div>
