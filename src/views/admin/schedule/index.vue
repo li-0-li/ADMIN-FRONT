@@ -4113,14 +4113,6 @@ watch(
         放到<b>同一教师的课次</b>上，只能<b>互换上课时间</b>
       </span>
     </div>
-    <!-- 空态提示：选中学期后查不到课次时，大概率是课次没关联学期（term_id 为 NULL）被筛掉 -->
-    <div v-if="!loadError && !loading && !refreshing && !allCells.length && filters.termId" class="move-hint">
-      <ZkIcon name="alert-triangle" :size="14" />
-      <span>
-        当前学期筛选下没有课次（本周课程可能未关联学期，被学期过滤排除了）——把上方「学期」切回
-        <b>全部学期</b>即可看到。
-      </span>
-    </div>
     <!-- 翻周条：课表上方——上一周贴左 · 日期范围+本周按钮居中 · 下一周贴右 -->
     <div class="week-pager">
       <button class="btn btn-outline" @click="shiftWeek(-7)">
