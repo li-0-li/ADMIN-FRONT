@@ -18,6 +18,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import {
+  getTeacherProfile,
   updateTeacherProfile,
   type StudentProfile,
   type TeacherProfile,
@@ -135,13 +136,40 @@ async function submitEdit() {
     return;
   }
   saving.value = true;
+  const want = {
+    nickName: editForm.nickName.trim(),
+    deptName: editForm.deptName.trim() || null,
+    jobTitle: editForm.jobTitle.trim() || null,
+    status: editForm.status
+  };
   try {
-    await updateTeacherProfile(props.userId, {
-      nickName: editForm.nickName.trim(),
-      deptName: editForm.deptName.trim() || null,
-      jobTitle: editForm.jobTitle.trim() || null,
-      status: editForm.status
-    });
+    await updateTeacherProfile(props.userId, want);
+
+    /* ★ 2026-11-12 实测：这个 PUT 的返回值**不可作为成败判据**。
+     *   - jobTitle null → 讲师：数据真落库了，响应却是 {code:0, data:false}
+     *   - deptName 示例大学 → 测试学院：数据没变，响应同样是 {code:0, data:false}
+     *   即 data 恒为 false，与写没写进去无关。前端如果只看 code===0 就弹「已保存」，
+     *   就是**假成功**（用户改完看着成功、刷新回退，且无从察觉）。
+     *   唯一可信的判据是「保存后回读比对」。 */
+    const back = await getTeacherProfile(props.userId);
+    const norm = (v: unknown) => {
+      const s = v === null || v === undefined ? '' : String(v).trim();
+      return s === '' ? null : s;
+    };
+    const changed: string[] = [];
+    if (norm(back?.nickName) !== norm(want.nickName)) changed.push('姓名');
+    if (norm(back?.jobTitle) !== norm(want.jobTitle)) changed.push('职称');
+    if (String(back?.status ?? '') !== String(want.status)) changed.push('状态');
+
+    if (changed.length) {
+      backendBroken.value =
+        `保存未生效：${changed.join('、')} 回读值与提交值不一致（后端返回 code=0 但未落库）。` +
+        '院系字段后端同样会忽略，已在表单里置为只读。已记入回报，待后端修复。';
+      ElMessage.error(`保存未生效（${changed.join('、')}），请查看面板顶部提示`);
+      emit('saved'); // 让父组件重拉，页面回到真实值，避免用户以为改成了
+      return;
+    }
+
     ElMessage.success('已保存');
     editing.value = false;
     backendBroken.value = '';
@@ -216,7 +244,12 @@ async function submitEdit() {
           </div>
           <div class="edit-item">
             <span class="k">院系</span>
-            <el-input v-model="editForm.deptName" maxlength="50" placeholder="可留空" style="width: 200px" />
+            <!-- ★ 2026-11-12 实测：PUT 传 deptName 被后端静默忽略（传「测试学院」回读仍是「示例大学」），
+                 却照样返回 code=0。所以这里不给可编辑输入框——让用户白填再弹「已保存」，比不给填更糟。 -->
+            <div class="edit-readonly" title="后端 PUT 会忽略 deptName 字段，改动不会落库">
+              {{ editForm.deptName || '—' }}
+              <span class="ro-tip">后端暂不支持修改</span>
+            </div>
           </div>
           <div class="edit-item">
             <span class="k">职称</span>
@@ -353,6 +386,22 @@ async function submitEdit() {
 }
 .edit-item .k {
   width: 40px;
+  color: var(--ink-400, #9aa3b2);
+}
+/* 只读字段：外观刻意区别于输入框，避免用户以为能改 */
+.edit-readonly {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 200px;
+  padding: 5px 10px;
+  border: 1px dashed var(--border, #e3e8ef);
+  border-radius: 6px;
+  color: var(--ink-600, #5b6472);
+  background: var(--bg-soft, #f7f9fc);
+}
+.ro-tip {
+  font-size: 11px;
   color: var(--ink-400, #9aa3b2);
 }
 .chip-list {
