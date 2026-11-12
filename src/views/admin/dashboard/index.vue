@@ -154,7 +154,8 @@ onMounted(async () => {
     /* 已在请求层提示，卡片保持「—」 */
   }
   try {
-    const c = await listCourses({ page: 1, pageSize: 5 });
+    /* 8 行：5 行时首页右栏下方会空出约 350px，8 行刚好与右栏「快捷入口」齐平（11-12 实测） */
+    const c = await listCourses({ page: 1, pageSize: 8 });
     courses.value = c?.list ?? [];
   } catch {
     courses.value = [];
