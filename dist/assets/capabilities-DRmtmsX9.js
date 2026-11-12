@@ -1,0 +1,1 @@
+import{r as e}from"./request-vcgxesTQ.js";function t(t){return e({url:`/api/v1/admin/teachers/${t}/capabilities`,method:`get`})}function n(t,n){return e({url:`/api/v1/admin/teachers/${t}/capabilities`,method:`post`,data:{courseIds:n}})}function r(t){return e({url:`/api/v1/admin/courses/${t}/capability-teachers`,method:`get`})}export{t as n,n as r,r as t};

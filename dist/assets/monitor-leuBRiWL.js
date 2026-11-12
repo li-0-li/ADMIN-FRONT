@@ -1,0 +1,1 @@
+import{r as e}from"./request-vcgxesTQ.js";function t(){return e({url:`/api/v1/admin/system/status`,method:`get`,silent:!0})}function n(t=200){return e({url:`/api/v1/admin/system/error-logs`,method:`get`,params:{limit:t},silent:!0})}export{t as n,n as t};
