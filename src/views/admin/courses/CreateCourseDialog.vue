@@ -316,7 +316,7 @@ async function submitOffering() {
       return; // 用户选「暂不」：保持弹窗可继续开下一门
     }
     try {
-      await autoArrange(res.offeringId);
+      await autoArrange({ offeringId: res.offeringId });
       ElMessage.success('自动排课完成，可到「智能排课」页查看与微调');
       close();
     } catch {

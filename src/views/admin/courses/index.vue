@@ -72,7 +72,7 @@ async function onRearrange(o: { offeringId: string; termCode?: string }) {
   }
   rearrangingId.value = o.offeringId;
   try {
-    await autoArrange(o.offeringId);
+    await autoArrange({ offeringId: o.offeringId });
     ElMessage.success('自动排课完成，可到「智能排课」页查看与微调');
     // 刷新抽屉里的课次数：openDetail 是按行对象打开的，这里就地重拉 offerings
     detailOfferLoading.value = true;

@@ -137,18 +137,40 @@ export async function publishSchedules() {
 }
 
 /**
- * B-7 自动排课（auto-arrange v1，后端 2026-11-09 a9c6a6e）：
- * 为某条开课记录（course_offering）按其 weekFrom/weekCount 一次性生成全部课次。
- * ★ 供建课向导 step2 开课成功后「一键重排」调用（会议 #A3：新增的课要重新排一次）。
- * ★ 8080 实测（2026-11-10）：POST 存在（GET 报 method not supported）；
- *   offeringId 不存在时报业务错「开课记录不存在或已被删除」。
- *   出参形状后端未定档，前端按泛型透传，只报成功/失败不解析字段。
+ * B-7 自动排课（auto-arrange v1，后端 2026-11-09 a9c6a6e；批次2 2026-11-12 扩参）：
+ * 为某条开课记录（offeringId）或整门课全部教学班（courseId，二选一）按学期锚点铺满课次。
+ * 批次2 新参：weekParity（all/odd/even，判定基准=教学周绝对周号）、
+ * targetClass（指定班级，覆盖 offering 首选班级）、preferredClassroomId（教室锁定）。
+ * ★ 供建课向导 step2「一键重排」与排课页「自动排课」统一调用（批次2：前端本地 runAuto 已下线，
+ *   自动排课只走这一个端点，消除两套算法打架）。
+ * ★ 幂等：已有课次的周自动跳过，重复调用零副作用；教师资格闸门在后端。
  */
-export async function autoArrange(offeringId: string | number) {
-  return request<Record<string, unknown>>({
+export interface AutoArrangeBody {
+  offeringId?: string | number;
+  courseId?: string | number;
+  weekdays?: number[];
+  periodNos?: string[];
+  weekParity?: 'all' | 'odd' | 'even';
+  targetClass?: string;
+  preferredClassroomId?: string | number;
+}
+export async function autoArrange(body: AutoArrangeBody) {
+  return request<
+    Array<{ offeringId: string; courseId: string; courseName?: string; totalWeeks?: number; arranged?: number; weeksPlaced?: number[]; skipped?: Array<{ week?: number; weekNo?: number; reason?: string }> }>
+  >({
     url: `${await schedulePath()}/auto-arrange`,
     method: 'post',
-    data: { offeringId: String(offeringId) }
+    data: {
+      ...(body.offeringId !== undefined ? { offeringId: String(body.offeringId) } : {}),
+      ...(body.courseId !== undefined ? { courseId: String(body.courseId) } : {}),
+      weekdays: body.weekdays,
+      periodNos: body.periodNos,
+      weekParity: body.weekParity ?? 'all',
+      ...(body.targetClass ? { targetClass: body.targetClass } : {}),
+      ...(body.preferredClassroomId !== undefined && body.preferredClassroomId !== ''
+        ? { preferredClassroomId: String(body.preferredClassroomId) }
+        : {})
+    }
   });
 }
 
