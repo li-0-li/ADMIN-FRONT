@@ -3949,6 +3949,18 @@ watch(
           </el-dropdown-menu>
         </template>
       </el-dropdown>
+      <!-- 手动排课与自动排课必须并排：录音（11-10 教学讨论）原话「手动排课这个功能放到自动排课
+           那一边，排在一起了，要不然这两个按钮都分得太远了」。入口只打开已有的「新增课次」表单，
+           字段正好是录音点名的 课程 / 教师 / 班级 / 教室 / 节次 / 星期，不另做第二套表单；
+           教师下拉已放开为全量教师（录音「手动排课也要覆盖所有老师」）。 -->
+      <button
+        class="btn btn-outline"
+        type="button"
+        title="手动排课：逐门指定课程、教师、班级、教室与节次星期（也可把下方待排课程直接拖进课表格子）"
+        @click="openCreate(null, null)"
+      >
+        <ZkIcon name="pencil" :size="16" style="margin-right: 4px" />手动排课
+      </button>
       <button class="btn btn-primary" title="把待排课程自动找空闲时段排入课表" @click="openAuto">
         <ZkIcon name="zap" :size="16" style="margin-right: 4px" />自动排课
       </button>
@@ -4047,8 +4059,10 @@ watch(
       <button class="btn btn-outline btn-sm" title="展开全部待排课程（可搜索筛选、可拖动）" @click="openPoolPanel">
         <ZkIcon name="eye" :size="13" style="margin-right: 4px" />展开
       </button>
-      <button class="btn btn-outline btn-sm" @click="openCreate(null, null)">
-        <ZkIcon name="plus" :size="13" style="margin-right: 4px" />添加课程
+      <!-- 「添加课程」原按钮名会让人以为在加基础课程（实际上是新建 1 节课次），与页头「手动排课」
+           同一个动作 ⇒ 改名对齐，避免两处按钮看着是两个功能 -->
+      <button class="btn btn-outline btn-sm" title="新建 1 节课次（等同页头「手动排课」）" @click="openCreate(null, null)">
+        <ZkIcon name="plus" :size="13" style="margin-right: 4px" />新建课次
       </button>
       <span v-if="draggingCourse" class="badge badge-info">
         <ZkIcon name="grip-vertical" :size="12" style="margin-right: 4px" />正在拖动：{{ draggingCourse.courseName }}
