@@ -3,12 +3,14 @@ import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
-import { createSchedule, deleteSchedule, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules } from '@/api/admin/schedules';
-import type { ScheduleCreateBody, ScheduleSwapBody, ScheduleUpdateBody } from '@/api/admin/schedules';
+import { createSchedule, deleteSchedule, listCourseOfferings, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules } from '@/api/admin/schedules';
+import type { OfferingBrief, ScheduleCreateBody, ScheduleSwapBody, ScheduleUpdateBody } from '@/api/admin/schedules';
 import { deleteCourse } from '@/api/admin/courses';
 import { listClasses, listClassrooms, listMajors, listSchools, listTerms, updateClassroom } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
 import { listPeriods } from '@/api/admin/periods';
+import { getTeachingWeek } from '@/api/admin/config';
+import { getCourseCapabilityTeachers } from '@/api/admin/capabilities';
 import type { Classroom, CourseBrief, ScheduleCell } from '@/types/admin';
 
 /**
@@ -741,6 +743,13 @@ type PoolCourse = CourseBrief & {
    * ★ 可选：旧包不下发该字段，certPassed() 里有回退分支，不能按必填用。
    */
   certPassed?: boolean;
+  /**
+   * 该课程名下开课记录数（后端 `AdminCourseVo.offeringCount`）。
+   * ★ 2026-11-12 新增：T-01 后课程行不再带教师，教师挂在开课记录上 ⇒
+   *   「有没有教师可查」全靠这个数判断（0 = 只建了基础课程、还没开课）。
+   * ★ 旧包可能不下发 ⇒ 一律 `Number(x ?? 0)` 读，缺省按 0 处理（= 不查 offerings）。
+   */
+  offeringCount?: number;
 };
 const poolCourses = ref<PoolCourse[]>([]);
 
@@ -756,6 +765,114 @@ const courseById = computed(() => {
   for (const c of poolCourses.value) m.set(String(c.courseId), c);
   return m;
 });
+
+/* ---------- 教师归属：走开课记录（T-01 口径，2026-11-12） ----------
+ * 后端 T-01 把课程改成「基础课程口径」后，`GET /admin/courses` **不再下发** teacherId/teacherName
+ * （`AdminCourseVo` 类注释：六列是开课属性，从行上移除），教师改挂 `course_offering`。
+ * 所以「课程池里看不到教师、待排签全显示未指定教师、选课带不出教师」都不是接口坏了，
+ * 而是**前端还在读一个已经不下发的字段**。
+ *
+ * 做法：课程池加载完补一轮开课记录，把教师**合并回课程行**（就地改 poolCourses）：
+ *   · 只有一个教师 ⇒ 写回 teacherId/teacherName —— 待排签显示、选课默认带出、noSlotReason 判据同时恢复
+ *   · 有多个教师   ⇒ teacherId 留空（**不自动带出**，否则会把 A 老师默认成 B 老师），
+ *                   teacherName 显示「张三 / 李四」提示这是多教学班
+ * ⛔ 不做的是：不逐门课去查详情（N+1 更慢），也不改后端（这是既定的契约口径，不是缺陷）。
+ */
+const offeringByCourse = ref<Record<string, OfferingBrief[]>>({});
+
+/** 并发上限：池子最多 200 行，串行会被后端打回，6 路并发够快又不压库 */
+const OFFERING_FETCH_LIMIT = 6;
+
+/**
+ * 正在拉取中的 courseId（值是该课的请求 Promise）。
+ * ★ 必要性：`loadPickers` 有 7 个调用点，其中两处是 `Promise.all([load(), loadPickers()])`
+ *   并发跑的——只靠 `offeringByCourse` 判缓存，两个并发请求会同时看到空缓存，
+ *   同一批 offerings 被打两遍（实测 21 门课发了 42 个请求）。这里按 courseId 去重。
+ */
+const offeringInflight = new Map<string, Promise<OfferingBrief[]>>();
+
+async function loadOfferingTeachers(rows: PoolCourse[]) {
+  // 只捞有开课记录、且**还没拉过**的课：loadPickers 在全页有多处调用点
+  // （首屏 / 换学校 / 换学期 / 刷新），不拦一道会把同一批 offerings 打两遍。
+  const cached = offeringByCourse.value;
+  const targets = rows.filter(c => Number(c.offeringCount ?? 0) > 0 && !cached[String(c.courseId)]);
+  if (!targets.length) return;
+  const next: Record<string, OfferingBrief[]> = { ...cached };
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < targets.length) {
+      const row = targets[cursor++];
+      const key = String(row.courseId);
+      try {
+        // 同一门课已在飞行中 ⇒ 直接复用那次请求，不再发第二个
+        let p = offeringInflight.get(key);
+        if (!p) {
+          p = listCourseOfferings(row.courseId).catch(() => [] as OfferingBrief[]);
+          offeringInflight.set(key, p);
+          void p.finally(() => offeringInflight.delete(key));
+        }
+        const list = await p;
+        if (list.length) next[key] = list;
+      } catch {
+        /* 旧包/缺权限一律静默降级为「教师未知」，绝不阻断课程池渲染 */
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(OFFERING_FETCH_LIMIT, targets.length) }, worker));
+  offeringByCourse.value = next;
+}
+
+/** 把开课记录里的教师合并回课程行（就地改，poolCourses 是唯一真值源，computed 会自动重算） */
+function mergeOfferingTeachers() {
+  for (const c of poolCourses.value) {
+    const offs = offeringByCourse.value[String(c.courseId)];
+    if (!offs?.length) continue;
+    const uniq = new Map<string, string>();
+    let students = 0;
+    for (const o of offs) {
+      students += Number(o.studentCount ?? 0);
+      if (o?.teacherId) uniq.set(String(o.teacherId), (o.teacherName || '').trim() || `教师 #${o.teacherId}`);
+    }
+    // 学生数也跟着走 offering：T-01 后课程行同样不再下发 studentCount，
+    // 不补就会让待排签全显示「0 人」（比不显示更误导）
+    if (students > 0) c.studentCount = students;
+    if (!uniq.size) continue;
+    if (uniq.size === 1) {
+      const [id, name] = [...uniq.entries()][0];
+      c.teacherId = id;
+      c.teacherName = name;
+    } else {
+      const names = [...uniq.values()];
+      // 多教师：不自动带出（teacherId 留空），但名字要让管理员看得见是谁在开这门课
+      delete c.teacherId;
+      c.teacherName = names.length > 2 ? `${names[0]} 等 ${names.length} 人` : names.join(' / ');
+    }
+  }
+}
+
+/**
+ * 把开课记录里出现、但不在教师下拉里的教师补进去。
+ *
+ * ★ 为什么必须补：`el-select` 的值匹配不到选项时，Element Plus 会把**原始值**直接显示出来——
+ *   实测弹窗「授课教师」显示成裸的 `1`。根因是演示库的 `course_offering.teacher_id = 1`
+ *   指向超管「若依」，而教师下拉是按 `roleKey=teacher` 拉的（12 人，不含超管）。
+ *   后端 `doCreate` 只校验 teacherId 非空、没有"必须是 teacher 角色"的约束 ⇒ 这类教师
+ *   本来就是合法授课人，补进下拉比显示裸 ID 正确。
+ */
+function syncTeacherOptionsFromOfferings() {
+  const have = new Set(teacherList.value.map(t => t.value));
+  const added: { value: string; label: string }[] = [];
+  for (const offs of Object.values(offeringByCourse.value)) {
+    for (const o of offs) {
+      if (!o?.teacherId) continue;
+      const id = String(o.teacherId);
+      if (have.has(id)) continue;
+      have.add(id);
+      added.push({ value: id, label: (o.teacherName || '').trim() || `教师 #${id}` });
+    }
+  }
+  if (added.length) teacherList.value = [...teacherList.value, ...added];
+}
 /**
  * 该课程是否已通过三重认证。课程池里查不到的课次（历史/脏数据）按未认证处理——宁可多拦，不放未认证的进来。
  *
@@ -780,6 +897,14 @@ const returnedCells = ref<ScheduleCell[]>([]);
 
 /** 当前学期 id（loadPickers 拉学期列表时记录）：未选学期（=全部学期）时池子按它判定「已排」 */
 const currentTermId = ref('');
+
+/**
+ * 教学周全局总周数（biz_config: teaching.week.count，管理员在「配置 → 教学周设置」维护）。
+ * null = 还没取到 / 端点不可用 ⇒ 各处沿用历史兜底值，不阻塞页面。
+ * ★ 2026-11-12：加这个 ref 是为了收口「一个学校几个周数」的分歧 —— 此前
+ *   自动排课写死 18、教学周设置缺省 16、学期起止算出来 20，三处各说各话。
+ */
+const teachingWeekCount = ref<number | null>(null);
 
 /* ---------- 学期周次标注：2026-10-29 需求整体移除（页头胶囊、摘要内联、两处弹窗警告、weekNo 计算） ---------- */
 
@@ -948,6 +1073,8 @@ async function openPoolPanel() {
   // 待排池/教师/班级强制刷新：别处刚新增的课程、教师、班级立即可见（loadPickers 内部有缓存判定，清空才重拉）
   courseList.value = [];
   poolCourses.value = [];
+  // 开课记录缓存一并失效：别处可能刚改过某门课的授课教师，只清课程池会读到旧教师
+  offeringByCourse.value = {};
   teacherList.value = [];
   clazzNameList.value = [];
   clazzMajorMap.value = {};
@@ -1944,6 +2071,8 @@ async function confirmCourseDelete(courseId: string | number, name: string) {
     // 课程池与下拉缓存失效：清空强制 loadPickers 重拉
     courseList.value = [];
     poolCourses.value = [];
+  // 开课记录缓存一并失效：别处可能刚改过某门课的授课教师，只清课程池会读到旧教师
+  offeringByCourse.value = {};
     await Promise.all([load(true), loadPickers()]);
   } catch {
     /* 请求层已提示 */
@@ -2144,14 +2273,59 @@ watch(
     } else if (!form.courseId) {
       form.teacherId = '';
     }
+    // 选课变了就重圈候选教师（2026-11-12，见 loadCapabilityTeachers）
+    void loadCapabilityTeachers(form.courseId);
   }
 );
+
+/**
+ * 新建课次：教师候选按「该课程的授课资格」收口（2026-11-12）。
+ * 录音原话：「他会把一个上英语的排去上数学，是不是但是逻辑说不通的」
+ * —— 此前下拉是全量教师、与课程无关，自动排课又硬卡资格，两头口径不一致。
+ *
+ * 规则（三条兜底，保证任何一条坏掉都不堵排课）：
+ *   ① 选了课程且有资格行 ⇒ 只列有资格的教师；
+ *   ② 没选课程 / 教材无资格行（空集合）⇒ 退化为全量；
+ *   ③ 端点不可用或缺权限点 ⇒ 退化为全量，不弹错。
+ * 另给「显示全部教师」勾选框，保留 11-11「这里要支持选老师」的自由度。
+ */
+const capTeacherIds = ref<Set<string> | null>(null);
+const capTeacherLoading = ref(false);
+const showAllTeachers = ref(false);
+let capTeacherSeq = 0;
+async function loadCapabilityTeachers(courseId: string) {
+  const my = ++capTeacherSeq;
+  if (!courseId) {
+    capTeacherIds.value = null;
+    return;
+  }
+  capTeacherLoading.value = true;
+  try {
+    const rows = await getCourseCapabilityTeachers(courseId);
+    if (my !== capTeacherSeq) return;
+    const list = rows ?? [];
+    capTeacherIds.value = list.length ? new Set(list.map(r => String(r.teacherId))) : null;
+  } catch {
+    if (my !== capTeacherSeq) return;
+    capTeacherIds.value = null;
+  } finally {
+    if (my === capTeacherSeq) capTeacherLoading.value = false;
+  }
+}
+const createTeacherOptions = computed(() => {
+  if (showAllTeachers.value || !capTeacherIds.value) return teacherOptions.value;
+  return teacherOptions.value.filter(o => capTeacherIds.value!.has(String(o.value)));
+});
 
 async function loadPickers() {
   if (!courseList.value.length) {
     try {
       const res = await listCoursePool(filters.schoolId || undefined);
       poolCourses.value = res?.list ?? [];
+      // T-01 后教师只在开课记录上：补一轮再合并，否则待排签全是「未指定教师」、
+      // 选课也带不出默认教师（课程行已不含 teacherId，见 loadOfferingTeachers 注释）
+      await loadOfferingTeachers(poolCourses.value);
+      mergeOfferingTeachers();
       courseList.value = poolCourses.value
         .map(c => ({ value: String(c.courseId), label: c.courseName || String(c.courseId) }))
         .filter(o => o.value);
@@ -2170,6 +2344,9 @@ async function loadPickers() {
       /* 已在请求层提示 */
     }
   }
+  // 课程池与教师下拉都到位后再补：开课记录里的教师若不在 roleKey=teacher 名单内，
+  // 不补进下拉的话 el-select 会把值原样显示成裸 ID（实测显示成「1」）
+  syncTeacherOptionsFromOfferings();
   if (!terms.value.length) {
     try {
       const res = await listTerms({ page: 1, pageSize: 50 });
@@ -2187,6 +2364,14 @@ async function loadPickers() {
       // 记录当前学期：池子「已排」判定在「全部学期」视图下按它收口
       const curTerm = res?.list?.find(t => t.isCurrent === 1) ?? res?.list?.[0];
       currentTermId.value = curTerm?.termId !== undefined ? String(curTerm.termId) : '';
+      // ★ 2026-11-12：恢复「默认锁当前学期」。
+      //   10-20 撤掉它的阻塞条件是「演示数据 term_id 为 NULL ⇒ 带 termId 查必空」；
+      //   T-00a 已把 schedule.offering_id 全量回填（实测 9/9 行有 offering，offering.term_id 全 = 当前学期），
+      //   该条件已消失。不锁学期的代价是**跨学期课次同屏**，正是录音里「排课中课程混乱」的观感来源。
+      //   仍保留「全部学期」空选项：想跨学期看，手动切回即可。
+      if (curTerm?.termId !== undefined && !filters.termId) {
+        filters.termId = String(curTerm.termId);
+      }
     } catch {
       /* 已在请求层提示 */
     }
@@ -2199,6 +2384,16 @@ async function loadPickers() {
         .map(s => ({ schoolId: s.schoolId as string, name: s.name || String(s.schoolId) }));
     } catch {
       /* 已在请求层提示 */
+    }
+  }
+  // 教学周全局设置（只取一次）：拿到就用它当「铺满整学期」的周数，拿不到保留 null 走历史兜底
+  if (teachingWeekCount.value === null) {
+    try {
+      const tw = await getTeachingWeek();
+      const n = Number(tw?.weekCount);
+      if (Number.isFinite(n) && n >= 1 && n <= 30) teachingWeekCount.value = n;
+    } catch {
+      /* 端点未上线 / 缺权限点 ⇒ 不打扰用户，兜底值照旧 */
     }
   }
   if (!classroomList.value.length) {
@@ -2244,6 +2439,9 @@ async function openCreate(
   // 课程/教师/班级下拉强制刷新：别处（基础数据/审核/账号）刚新增的无需刷新页面即可选到
   courseList.value = [];
   poolCourses.value = [];
+  // ★ 这里**不清** offeringByCourse：点签/点空格只是打开表单，开课记录（教师、人数）不会因此变化。
+  //   清了会让每次开窗都重打一轮 offerings（实测 21 门课 × 每次开窗）。真正需要刷新的两处
+  //   （保存课次后、打开待排池面板）已各自清缓存。
   teacherList.value = [];
   clazzNameList.value = [];
   clazzMajorMap.value = {};
@@ -2266,6 +2464,8 @@ async function openCreate(
   syncRepeatTotal();
   presetCourseId.value = preset.courseId ?? '';
   form.courseId = preset.courseId ?? '';
+  // 每次开窗重置「显示全部教师」：上一门课勾过的宽集不该带进下一门课
+  showAllTeachers.value = false;
 
   // 拖动排课：课程自带授课教师 → 自动预选（教师不在可选列表里则不预选，交由人工选）
   // 2026-10-29 起教师整体只读：watch(form.courseId) 统一从课程接口回填，这里不再单独处理
@@ -2933,14 +3133,16 @@ function entryClass(entry: PoolEntry) {
  * 自动排课的**兜底**周数：只在学期没配开始/结束日期时使用（2026-10-29 起与弹窗表单解耦）。
  * ★ 2026-10-30 更正：原来把它当唯一口径（写死 18 周），而学期实际 2026-08-24~2027-01-15 = 21 周，
  *   于是自动排课每次都少排 3 周、且起点跟着「当前浏览周」跑。真实周数以 termWeekCount 为准，
- *   本常量退化为「学期没配日期时」的兜底值。
+ *   本值退化为「学期没配日期时」的兜底值。
+ * ★ 2026-11-12：兜底值改为读「教学周设置」（biz_config teaching.week.count），
+ *   未取到才退 18。此前写死 18 与设置页缺省 16、学期真实 20 三处打架。
  */
-const AUTO_WEEKS = 18;
+const AUTO_WEEKS = computed(() => teachingWeekCount.value ?? 18);
 /** 自动排课要铺的周数 = 学期真实周数（学期起点周一起算，含头尾）；学期没配日期回落 AUTO_WEEKS */
 const termWeekCount = computed(() => {
   const anchor = termAnchorMonday.value;
   const end = parseDateOnly(currentTermInfo.value?.endDate);
-  if (!anchor || !end) return AUTO_WEEKS;
+  if (!anchor || !end) return AUTO_WEEKS.value;
   const days = Math.floor((end.getTime() - anchor.getTime()) / 86400000) + 1;
   // clamp 1~25（自动排课的安全上限，与历史口径一致）；手动排课的结束周上限走 termWeeksOf 的 1~30
   return Math.max(1, Math.min(25, Math.ceil(days / 7)));
@@ -3394,7 +3596,7 @@ const autoPlanNoClass = computed(() => (autoPlan.value ? autoPlan.value.items.fi
 const autoTermRangeLabel = computed(() => {
   const anchor = termAnchorMonday.value;
   const end = parseDateOnly(currentTermInfo.value?.endDate);
-  if (!anchor || !end) return `未配置学期起止日期，按兜底 ${AUTO_WEEKS} 周铺`;
+  if (!anchor || !end) return `未配置学期起止日期，按兜底 ${AUTO_WEEKS.value} 周铺`;
   const fmt = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   return `学期第 1~${termWeekCount.value} 周（${fmt(anchor)} ~ ${fmt(end)}）`;
 });
@@ -4538,15 +4740,18 @@ watch(
       </el-form-item>
       <el-form-item label="授课教师" required>
         <!-- 2026-11-11 放开手选（录音 A2：「老是自动带出都是有问题的啊，这里要支持选老师」）：
-             默认仍按课程带出认证教师，但允许改成任一教师。 -->
+             默认仍按课程带出认证教师，但允许改成任一教师。
+             2026-11-12 收口：候选默认只列**该课程有授课资格**的教师（录音「不能把上英语的排去上数学」），
+             想用其他教师勾一下「显示全部教师」即可 —— 自由度不丢，默认不乱排。 -->
         <el-select
           v-model="form.teacherId"
           placeholder="请选择授课教师"
           filterable
           clearable
+          :loading="capTeacherLoading"
           style="width: 100%"
         >
-          <el-option v-for="t in teacherList" :key="t.value" :label="t.label" :value="t.value" />
+          <el-option v-for="t in createTeacherOptions" :key="t.value" :label="t.label" :value="t.value" />
         </el-select>
         <div class="small muted" style="width: 100%">
           <template v-if="form.courseId && autoTeacherId && form.teacherId === autoTeacherId">
@@ -4555,8 +4760,14 @@ watch(
           <template v-else-if="!teacherList.length">
             教师列表未取到——可点工具栏刷新后重试，或先到「基础数据 → 教师」确认有教师账号
           </template>
-          <template v-else>排课不受课程认证限制，任意教师都可选</template>
+          <template v-else-if="capTeacherIds && !showAllTeachers">
+            已按「该课程有资格的教师」收口（{{ createTeacherOptions.length }} 人），需要其他人请勾下方选项
+          </template>
+          <template v-else>候选为全部教师（该课程暂无资格登记，或已勾选显示全部）</template>
         </div>
+        <el-checkbox v-if="form.courseId && capTeacherIds" v-model="showAllTeachers" size="small" style="width: 100%">
+          显示全部教师（含无该课程资格）
+        </el-checkbox>
       </el-form-item>
       <el-form-item label="上课班级" required>
         <el-select

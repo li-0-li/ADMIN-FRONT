@@ -33,3 +33,29 @@ export function saveTeacherCapabilities(teacherId: string | number, courseIds: s
     data: { courseIds }
   });
 }
+
+/** 可授课程反查返回的教师行（后端 CapabilityTeacherVo） */
+export interface CapabilityTeacherVo {
+  capabilityId?: string | number;
+  teacherId: string | number;
+  userName?: string;
+  teacherName?: string;
+  phonenumber?: string;
+  /** 资格来源三口径：教研室默认 / 教师自设 / 管理员代设 */
+  source?: string;
+  createTime?: string;
+}
+
+/**
+ * 课程 → 有授课资格的教师（2026-11-12 接线）
+ * `GET /api/v1/admin/courses/{courseId}/capability-teachers`，权限点
+ * `admin:capabilities:courseTeachers`（菜单 3364）。
+ * 用途：排课「新建课次 / 自动排课」的教师候选过滤 —— 没有它就只能全量教师任选，
+ * 也就是 11-11 录音里那句「他会把一个上英语的排去上数学」。
+ */
+export function getCourseCapabilityTeachers(courseId: string | number) {
+  return request<CapabilityTeacherVo[]>({
+    url: `/api/v1/admin/courses/${courseId}/capability-teachers`,
+    method: 'get'
+  });
+}

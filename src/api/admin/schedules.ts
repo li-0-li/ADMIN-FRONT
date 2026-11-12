@@ -160,3 +160,41 @@ export async function listCoursePool(schoolId?: string | number) {
     params: { page: 1, pageSize: 200, schoolId: schoolId || undefined }
   });
 }
+
+/**
+ * 开课记录行（`AdminOfferingVo`，`GET /admin/courses/{courseId}/offerings`）。
+ *
+ * ★ T-01 起「教师」只在开课记录上：`AdminCourseVo` 类注释明写
+ *   `courseCode / teacherId / teacherName / semester / studentCount / targetClasses` 六列
+ *   **是开课属性、从课程行上移除**（见 `AdminCourseVo`）。所以课程列表返回 `teacherId=null`
+ *   **不是缺陷**，前端要教师就得走这条接口 —— 别再当 bug 派给后端（2026-11-12 已核实）。
+ */
+export interface OfferingBrief {
+  offeringId: string;
+  /** 授课教师（该开课记录的教师，不是课程的） */
+  teacherId?: string | null;
+  teacherName?: string | null;
+  termId?: string | null;
+  termCode?: string | null;
+  /** 教学班标识（如 `CS2026-1`） */
+  classKey?: string | null;
+  /** 面向班级名（数组；无班级时后端返回 `[]` 而非 null） */
+  targetClasses?: string[] | null;
+  studentCount?: number | null;
+  status?: string | null;
+  weekCount?: number | null;
+}
+
+/**
+ * 某门课的全部开课记录。
+ * ★ `data` 是**裸数组**（实测 `{"code":0,...,"data":[...]}`），没有 list/total 信封。
+ * ★ 旧包/无权限时可能失败 ⇒ 调用方一律 catch 后按「教师未知」降级，不许阻断课程池渲染。
+ */
+export async function listCourseOfferings(courseId: string | number) {
+  // 复用课程池的前缀探测（`/api/v1/admin/courses` vs `/api/v1/courses`），旧包也能拼对
+  const data = await request<OfferingBrief[]>({
+    url: `${await coursePath()}/${String(courseId)}/offerings`,
+    method: 'get'
+  });
+  return Array.isArray(data) ? data : [];
+}
