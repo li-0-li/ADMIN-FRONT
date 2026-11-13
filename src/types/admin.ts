@@ -650,6 +650,8 @@ export interface AdminCourseDetailVo {
   status: string;
   scheduleCount: number;
   offeringCount: number;
+  /** 未配置排课节奏的开课数（>0 ⇒ 自动排课跳过该课对应开课，2026-11-13） */
+  offeringUnconfigured?: number;
   certPassed?: boolean;
   schoolId: string;
   createTime?: string;

@@ -763,6 +763,9 @@ type PoolCourse = CourseBrief & {
    * ★ 旧包可能不下发 ⇒ 一律 `Number(x ?? 0)` 读，缺省按 0 处理（= 不查 offerings）。
    */
   offeringCount?: number;
+  /** 未配置排课节奏的开课数（后端 AdminCourseVo.offeringUnconfigured，2026-11-13）。
+   *  ★ 旧包不下发 ⇒ `?? 0` 读，缺省按 0（= 不标记，不阻塞）。 */
+  offeringUnconfigured?: number;
 };
 const poolCourses = ref<PoolCourse[]>([]);
 
@@ -944,6 +947,13 @@ interface PoolEntry extends CourseBrief {
    * 自动排课默认跳过这类签（见 autoEntries）；要重排整门课，先把该课全部放回。
    */
   inSchedule: boolean;
+  /**
+   * 排课节奏未配置（2026-11-13 业主口径：先在课程详情保存排课设置才能自动排课）。
+   * 后端按 offering 维度拦截（schedule_configured=0 → Skip(week=0)）；
+   * 前端在弹窗里标「未配置节奏」并**默认排除**，显式勾选才参与。
+   * 课程行无 offerings ⇒ 按课程聚合列 offeringUnconfigured>0 判，粒度是课程级近似。
+   */
+  unconfigured?: boolean;
 }
 
 /**
@@ -979,13 +989,14 @@ function buildPoolEntries(): PoolEntry[] {
           ...c,
           key: `lesson-${r.scheduleId}`,
           inSchedule: used.has(String(r.courseId)),
+          unconfigured: (c.offeringUnconfigured ?? 0) > 0,
           // 2026-11-05：带上原课次时间坐标，供池子卡片区分「同一门课的哪一节」
           fromWeekday: r.weekday,
           fromPeriodNo: r.periodNo
         });
       }
     } else if (!used.has(String(c.courseId))) {
-      out.push({ ...c, key: `course-${c.courseId}`, inSchedule: false });
+      out.push({ ...c, key: `course-${c.courseId}`, inSchedule: false, unconfigured: (c.offeringUnconfigured ?? 0) > 0 });
     }
   }
   // 2026-11-11 放开认证门槛（录音 A3）：未认证课程**照常进待排池**。
@@ -3061,10 +3072,18 @@ const autoSkippedInSchedule = computed(() =>
  * （这一轮只想排其中几门），两者独立计数、分开报数，不混成一句「已跳过」。
  */
 const poolPick = reactive<Record<string, boolean>>({});
-/** 真正参与排课的签：过了护栏 + 用户没取消勾选 */
-const autoSelected = computed(() => autoEntries.value.filter(e => poolPick[e.key] !== false));
+/**
+ * 真正参与排课的签：过了护栏 + 用户没取消勾选。
+ * ★ 未配置排课节奏的签（2026-11-13）默认**排除**——语义与普通签相反（普通=不勾才排除），
+ *   显式勾选（poolPick[key] === true）才参与；后端仍有一道兜底拦截。
+ */
+const autoSelected = computed(() =>
+  autoEntries.value.filter(e => (e.unconfigured ? poolPick[e.key] === true : poolPick[e.key] !== false))
+);
 /** 用户手动取消的条数（与护栏跳过分开统计） */
 const autoUnpicked = computed(() => autoEntries.value.length - autoSelected.value.length);
+/** 未配置排课节奏、被默认排除的签数（设置视图明示，不静默吞） */
+const autoUnconfigured = computed(() => autoEntries.value.filter(e => e.unconfigured).length);
 
 function resetPoolPick() {
   for (const k of Object.keys(poolPick)) delete poolPick[k];
@@ -3328,7 +3347,10 @@ async function runAuto() {
           const realSkips = rows2.filter(s => !(s.reason || '').includes('不上（'));
           const parityNote = paritySkips ? `，${paritySkips} 周为${parityWord}周不上` : '';
           if (placed > 0) ok.push(`「${name}」→ 已排 ${placed}/${r.totalWeeks ?? '?'} 周${parityNote}`);
-          for (const s of realSkips.slice(0, 3)) skip.push(`「${name}」第 ${s.week} 周：${s.reason || '教师/教室无空档'}`);
+          for (const s of realSkips.slice(0, 3)) {
+            // week=0 = 整门开课被前置校验跳过（未配置节奏/无教师），不是某一周排不上
+            skip.push(s.week === 0 ? `「${name}」：${s.reason || '前置校验未通过'}` : `「${name}」第 ${s.week} 周：${s.reason || '教师/教室无空档'}`);
+          }
           if (realSkips.length > 3) skip.push(`「${name}」另有 ${realSkips.length - 3} 周排不上（教师/教室无空档）`);
           if (placed === 0 && realSkips.length === 0 && rows2.length) {
             skip.push(`「${name}」：本学期各周均为${parityWord}周或已有课次，未排新课次`);
@@ -4802,6 +4824,14 @@ watch(
         <span class="detail-k">隔周</span>
         <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">{{ poolParitySummary }}</div>
       </div>
+      <!-- 未配置排课节奏（2026-11-13）：默认排除，指路课程详情；显式勾选才参与 -->
+      <div v-if="autoUnconfigured" class="detail-row">
+        <span class="detail-k">未配置</span>
+        <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">
+          <b>{{ autoUnconfigured }}</b> 条未配置排课节奏（总课时/每周几节/周范围），已默认排除不参与自动排课。
+          到「课程详情 → 开课记录 → 排课设置」保存后重新打开即恢复；确要现在排可手动勾选。
+        </div>
+      </div>
       <!-- 班级缺口（2026-11-02）：课程不带班级、放回签也没原班级时，不选班级就会排成空班级课次 -->
       <div v-if="autoClassGap" class="detail-row">
         <span class="detail-k">预警</span>
@@ -4844,24 +4874,25 @@ watch(
               style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px"
             >
               <el-checkbox
-                :model-value="poolPick[e.key] !== false"
+                :model-value="e.unconfigured ? poolPick[e.key] === true : poolPick[e.key] !== false"
                 size="small"
                 style="flex: none"
                 @change="poolPick[e.key] = !!$event"
               />
               <span
                 class="small"
-                :title="`${e.courseName}${e.teacherName ? ' · ' + e.teacherName : ''}${e.inSchedule ? ' · 课程已在课表（勾选会重复排课）' : ''}`"
+                :title="`${e.courseName}${e.teacherName ? ' · ' + e.teacherName : ''}${e.unconfigured ? ' · 未配置排课节奏（默认不参与）' : ''}${e.inSchedule ? ' · 课程已在课表（勾选会重复排课）' : ''}`"
                 :style="{
                   flex: '1 1 auto',
                   minWidth: 0,
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
-                  opacity: poolPick[e.key] === false ? 0.4 : 1,
-                  textDecoration: poolPick[e.key] === false ? 'line-through' : 'none'
+                  opacity: (e.unconfigured ? poolPick[e.key] !== true : poolPick[e.key] !== false) ? 0.4 : 1,
+                  textDecoration: (e.unconfigured ? poolPick[e.key] !== true : poolPick[e.key] !== false) ? 'line-through' : 'none'
                 }"
               >{{ e.courseName }}</span>
+              <span v-if="e.unconfigured" class="badge badge-warning" style="flex: none">未配置节奏</span>
               <span v-if="e.inSchedule" class="badge badge-warning" style="flex: none">已在课表</span>
               <el-select
                 v-model="poolClazz[e.key]"
@@ -4869,7 +4900,7 @@ watch(
                 clearable
                 filterable
                 placeholder="未指定"
-                :disabled="poolPick[e.key] === false"
+                :disabled="e.unconfigured ? poolPick[e.key] !== true : poolPick[e.key] === false"
                 style="width: 148px; flex: none"
               >
                 <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
