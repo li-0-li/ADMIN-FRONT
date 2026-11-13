@@ -195,7 +195,7 @@ const planLoading = ref(false);
 const planError = ref('');
 
 const planStatusOptions = [
-  { value: '', label: '全部状态' },
+  { value: '', label: '全部计划状态' },
   { value: 'pending', label: '待巡查' },
   { value: 'ongoing', label: '巡查中' },
   { value: 'done', label: '已完成' },
@@ -594,7 +594,7 @@ async function refreshAll() {
 }
 
 const statusOptions = [
-  { value: '', label: '全部状态' },
+  { value: '', label: '全部会话状态' },
   { value: 'ongoing', label: '进行中' },
   { value: 'waiting', label: '待开始' },
   { value: 'late_absent', label: '迟到/缺勤' },
@@ -617,7 +617,7 @@ onMounted(refreshAll);
 
       <el-tooltip
         v-if="!canExport"
-        content="当前账号缺 admin:patrol:export 授权 —— 该权限点在 sys_menu 里尚未登记（patrol 下只有 3275/3276/3357~3361），需后端补菜单后才能授出"
+        content="当前账号未获「导出巡查记录」授权（admin:patrol:export，菜单 3365）。请管理员到「角色管理 → 配置权限」勾选该按钮权限后重新登录"
         placement="bottom"
       >
         <span><el-button disabled><ZkIcon name="download" :size="15" style="margin-right: 5px" />导出巡查记录</el-button></span>
@@ -684,7 +684,7 @@ onMounted(refreshAll);
             style="width: 150px"
             @change="onPlanFilterChange"
           />
-          <el-select v-model="planQuery.status" placeholder="全部状态" style="width: 130px" @change="onPlanFilterChange">
+          <el-select v-model="planQuery.status" placeholder="全部计划状态" style="width: 130px" @change="onPlanFilterChange">
             <el-option v-for="o in planStatusOptions" :key="o.value" :label="o.label" :value="o.value" />
           </el-select>
         </div>
@@ -795,7 +795,7 @@ onMounted(refreshAll);
       </span>
     </div>
     <div class="right">
-      <el-select v-model="query.status" placeholder="全部状态" style="width: 150px" @change="onStatusChange">
+      <el-select v-model="query.status" placeholder="全部会话状态" style="width: 150px" @change="onStatusChange">
         <el-option v-for="o in statusOptions" :key="o.value" :label="o.label" :value="o.value" />
       </el-select>
     </div>

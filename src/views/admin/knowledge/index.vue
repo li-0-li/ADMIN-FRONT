@@ -215,7 +215,7 @@ onMounted(async () => {
     <div class="actions">
       <!-- 上传：端点在线（POST /courses/{id}/kb/docs），按 admin:kb:upload 门禁 -->
       <input ref="fileInput" type="file" :accept="KB_UPLOAD_ACCEPT" style="display: none" @change="onFilePicked" />
-      <el-tooltip v-if="!canUpload" content="缺权限点 admin:kb:upload —— sys_menu 里尚未登记该按钮（kb 下只有 3353~3356），需补菜单后才能授给角色" placement="bottom">
+      <el-tooltip v-if="!canUpload" content="当前账号未获「上传文档」授权（admin:kb:upload，菜单 3366）。请管理员到「角色管理 → 配置权限」勾选该按钮权限后重新登录" placement="bottom">
         <span>
           <el-button disabled>
             <ZkIcon name="upload" :size="15" style="margin-right: 5px" />上传文档
