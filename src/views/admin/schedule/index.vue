@@ -3730,7 +3730,14 @@ watch(
       </div>
       <!-- 学期：不带 clearable（有值时悬停显示叉叉会挤掉箭头、观感与其他框不一），但选项表头补一条
            「全部学期」⇒ 选完仍有回去的路，不用刷新页面 -->
-      <el-select v-model="filters.termId" class="f-select" placeholder="全部学期">
+      <!-- 宽度单独放宽：学期名是长值（「2026-2027学年第1学期」11 字），.f-select 均分到 110px 时
+           只显示「2026-2027学年…」，看不出是第 1 还是第 2 学期（2026-11-13 全页巡查实测） -->
+      <el-select
+        v-model="filters.termId"
+        class="f-select"
+        style="min-width: 190px"
+        placeholder="全部学期"
+      >
         <el-option label="全部学期" value="" />
         <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="String(t.termId)" />
       </el-select>
