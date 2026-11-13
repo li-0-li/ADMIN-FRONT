@@ -237,6 +237,8 @@ export interface ClazzPoolItem {
   weekCount?: number | null;
   termId?: string | null;
   termCode?: string | null;
+  /** 排课节奏是否已配置（0=未配置，自动排课会跳过；1=已配置） */
+  scheduleConfigured?: number | null;
   scheduledCount?: number | null;
 }
 export async function fetchClazzPool(clazzId: string | number, termId?: string | number) {

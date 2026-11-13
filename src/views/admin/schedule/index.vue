@@ -734,7 +734,7 @@ const grid = computed(() =>
  *   ⇒ 规则据此分成「可选并入/互换」与「只能互换」两种，见 ③④。
  * ★ 互换会把对方也挪走（破坏性大于"并入"），所以两种都可行时必须由用户显式选择，
  *   不做默认自动决定 —— 避免"我只是想把他俩放一起，怎么把另一节挪走了"。
- * ⛔ 仍不接后端端点：`/schedules/auto`（自动排课走页内本地实现，见下方 runAuto）
+ * ✔ 已接后端端点：`/schedules/auto`（runAuto 逐门调 autoArrange；未配置排课节奏的课由后端跳过并提示）
  *   ✔ 已实现并真发请求：`publishSchedules()`（发布课表，`:2215`）、`deleteSchedule()`（删除课次，`:1294` / `:1300` / `:1475`）
  */
 /**
@@ -4583,7 +4583,21 @@ watch(
           {{ createCapacityWarn }}
         </div>
       </el-form-item>
-      <el-form-item label="节次">
+      <el-form-item label="星期">
+        <el-select v-model="form.weekday" style="width: 100%">
+          <el-option v-for="d in WEEKDAYS" :key="d.v" :label="d.label" :value="d.v" />
+        </el-select>
+      </el-form-item>
+      <!-- 每周节数（2026-10-20）：一周多节的课一次排完，每节可分别定时间
+           2026-11-13 业主反馈：原独立「节次」项改叫「第一节」并挪到每周节数之下，
+           与「第2节…」形成同一序列（第一节的时间共用上面的星期） -->
+      <el-form-item label="每周节数">
+        <div style="display: flex; gap: 8px; width: 100%; align-items: center">
+          <el-input-number v-model="repeatForm.weekly" :min="1" :max="5" @change="syncRepeatTotal" style="width: 110px" />
+          <span class="small muted">大于 1 时可为每节分别选时间</span>
+        </div>
+      </el-form-item>
+      <el-form-item label="第一节">
         <el-select v-model="form.periodNo" style="width: 100%">
           <el-option
             v-for="p in PERIODS"
@@ -4592,18 +4606,6 @@ watch(
             :value="p.seq"
           />
         </el-select>
-      </el-form-item>
-      <el-form-item label="星期">
-        <el-select v-model="form.weekday" style="width: 100%">
-          <el-option v-for="d in WEEKDAYS" :key="d.v" :label="d.label" :value="d.v" />
-        </el-select>
-      </el-form-item>
-      <!-- 每周节数（2026-10-20）：一周多节的课一次排完，每节可分别定时间 -->
-      <el-form-item label="每周节数">
-        <div style="display: flex; gap: 8px; width: 100%; align-items: center">
-          <el-input-number v-model="repeatForm.weekly" :min="1" :max="5" @change="syncRepeatTotal" style="width: 110px" />
-          <span class="small muted">大于 1 时可为每节分别选时间</span>
-        </div>
       </el-form-item>
       <el-form-item
         v-for="(s, i) in extraSlotList"
@@ -4680,8 +4682,9 @@ watch(
           {{ createWeekRangeError }}
         </div>
       </el-form-item>
-      <!-- 总节数（2026-10-20）：满额可改小 —— 不够分时从最后一周往前少排（前满后少） -->
-      <el-form-item v-if="repeatForm.mode !== 'once'" label="总节数">
+      <!-- 总课时（2026-11-13 业主反馈：「总节数」改叫「总课时」——录音口径「一共多少课时」）
+           满额可改小 —— 不够分时从最后一周往前少排（前满后少） -->
+      <el-form-item v-if="repeatForm.mode !== 'once'" label="总课时">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
           <el-input-number
             v-model="repeatForm.total"
@@ -4692,7 +4695,7 @@ watch(
           <span v-if="repeatForm.total < repeatForm.weekly * effectiveRepeatTimes" class="small" style="color: var(--warning, #b45309)">
             不足满额 {{ repeatForm.weekly * effectiveRepeatTimes }} 节：从最后一周往前少排（前满后少）
           </span>
-          <span v-else class="small muted">满额 = 每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 次</span>
+          <span v-else class="small muted">满额 = 每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 周</span>
         </div>
       </el-form-item>
     </el-form>
@@ -4934,6 +4937,13 @@ watch(
         </el-table-column>
         <el-table-column label="教学周" width="130">
           <template #default="{ row }">第 {{ row.weekFrom ?? 1 }} 周起 · {{ row.weekCount ?? '—' }} 周</template>
+        </el-table-column>
+        <el-table-column label="排课节奏" width="120">
+          <template #default="{ row }">
+            <!-- 2026-11-13 业主反馈：必须先在课程详情配置总课时/每周几节/周范围才能参与自动排课 -->
+            <el-tag v-if="row.scheduleConfigured === 0" size="small" type="warning">未配置</el-tag>
+            <el-tag v-else size="small" type="success">已配置</el-tag>
+          </template>
         </el-table-column>
         <el-table-column label="已排" width="120">
           <template #default="{ row }">

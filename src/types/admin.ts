@@ -629,6 +629,8 @@ export interface AdminOfferingVo {
   lessonsPerWeek?: number | null;
   /** 一共多少课时（节次口径；null = 按周数×每周节次自然铺满） */
   totalLessons?: number | null;
+  /** 排课节奏是否已配置（0=未配置，不可参与自动排课；1=已配置） */
+  scheduleConfigured?: number | null;
   /** active 进行中 / archived 已归档 */
   status: string;
   createTime: string;

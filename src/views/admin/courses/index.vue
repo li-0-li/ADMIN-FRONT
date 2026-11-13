@@ -111,6 +111,8 @@ function schedCfgLabel(o: AdminOfferingVo) {
   const weeks = o.weekCount ?? 0;
   const perWeek = o.lessonsPerWeek ?? 1;
   const total = o.totalLessons ?? weeks * perWeek;
+  // 2026-11-13 业主反馈：未配置排课节奏的课不可参与自动排课，需在此显式提示
+  if (o.scheduleConfigured === 0) return '未配置（不可自动排课）——请保存一次排课设置';
   if (!weeks) return '未设置（缺省整学期 · 每周 1 节）';
   return `第 ${from}~${from + weeks - 1} 周 · 每周 ${perWeek} 节 · 共 ${total} 课时`;
 }
