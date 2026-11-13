@@ -3336,7 +3336,9 @@ async function runAuto() {
           courseId: e.courseId,
           weekParity: parityOf(e),
           targetClass: entryClass(e).trim() || autoClass.value || undefined,
-          preferredClassroomId: autoLockRoomId.value || undefined
+          preferredClassroomId: autoLockRoomId.value || undefined,
+          // 只排当前学期（2026-11-13）：不传时后端也会排除已结束学期，但显式传更准
+          termId: filters.termId || currentTermId.value || undefined
         });
         for (const r of rows ?? []) {
           const name = r.courseName || e.courseName;
@@ -3430,7 +3432,10 @@ async function runPoolRow(row: ClazzPoolItem) {
     for (const r of rows ?? []) {
       const name = r.courseName || row.courseName;
       const placed = r.arranged ?? r.weeksPlaced?.length ?? 0;
-      if (placed > 0) poolResults.value.push(`「${name}」→ 已排 ${placed}/${r.totalWeeks ?? '?'} 周`);
+      // 整开课被前置校验跳过（未配置节奏 / 无教师）：把后端原因原样带出来，别吞成「无空档」
+      const blocking = (r.skipped ?? []).find(x => x.week === 0);
+      if (blocking) poolResults.value.push(`「${name}」→ ${blocking.reason || '前置校验未通过，已跳过'}`);
+      else if (placed > 0) poolResults.value.push(`「${name}」→ 已排 ${placed}/${r.totalWeeks ?? '?'} 周`);
       else poolResults.value.push(`「${name}」→ 本学期各周已有课次或无空档，未排新课次`);
     }
   } catch (err) {

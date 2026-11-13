@@ -153,6 +153,8 @@ export interface AutoArrangeBody {
   weekParity?: 'all' | 'odd' | 'even';
   targetClass?: string;
   preferredClassroomId?: string | number;
+  /** 只排该学期的开课（2026-11-13）：不传则后端排除已结束学期，避免排进历史学期 */
+  termId?: string | number;
 }
 export async function autoArrange(body: AutoArrangeBody) {
   return request<
@@ -167,6 +169,7 @@ export async function autoArrange(body: AutoArrangeBody) {
       periodNos: body.periodNos,
       weekParity: body.weekParity ?? 'all',
       ...(body.targetClass ? { targetClass: body.targetClass } : {}),
+      ...(body.termId !== undefined && body.termId !== '' ? { termId: String(body.termId) } : {}),
       ...(body.preferredClassroomId !== undefined && body.preferredClassroomId !== ''
         ? { preferredClassroomId: String(body.preferredClassroomId) }
         : {})
