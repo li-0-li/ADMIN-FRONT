@@ -159,6 +159,23 @@ export function listCourseOfferings(courseId: string | number) {
 }
 
 /**
+ * 批次7 排课配置（录音口径：排课前先在课程详情里选好 一共多少课时 / 一周几节 / 第几周到第几周）。
+ * 只动 offering 四列（week_from / week_count / lessons_per_week / total_lessons），
+ * 已排课次不变，影响后续 auto-arrange 的窗口与节奏。weekCount = 周止 - 周起 + 1（前端换算）。
+ * 权限 admin:offerings:scheduleConfig（menu 3370）。
+ */
+export function updateOfferingScheduleConfig(
+  offeringId: string | number,
+  body: { weekFrom: number; weekCount: number; lessonsPerWeek: number; totalLessons?: number | null }
+) {
+  return request<number>({
+    url: `/api/v1/admin/courses/offerings/${offeringId}/schedule-config`,
+    method: 'put',
+    data: { ...body, totalLessons: body.totalLessons ?? null }
+  });
+}
+
+/**
  * 加课码预检（mode=check，大小写不敏感）。
  * ★ silent=true：红字提示由表单自己画。
  */

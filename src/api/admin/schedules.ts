@@ -247,3 +247,26 @@ export async function fetchClazzPool(clazzId: string | number, termId?: string |
   });
   return Array.isArray(data) ? data : [];
 }
+
+
+/* ---------------- B-10 课次调整（批次6，后端 1a3682b5，2026-11-13） ----------------
+ * 录音缺口：调课/停课不再只靠 remark 文字。停课 canceled（课表保留并标注、冲突检测让位）、
+ * 补课 makeup、恢复正常 normal（恢复时后端清空代课与原因）；可带代课教师与调整原因。
+ * 权限 admin:schedules:lessonStatus（menu 3369）。
+ */
+export interface LessonStatusBody {
+  lessonStatus: 'normal' | 'canceled' | 'makeup';
+  substituteTeacherId?: string | number | null;
+  adjustReason?: string | null;
+}
+export async function updateLessonStatus(scheduleId: string | number, body: LessonStatusBody) {
+  return request<number>({
+    url: `${await schedulePath()}/${String(scheduleId)}/lesson-status`,
+    method: 'put',
+    data: {
+      lessonStatus: body.lessonStatus,
+      ...(body.substituteTeacherId ? { substituteTeacherId: String(body.substituteTeacherId) } : {}),
+      ...(body.adjustReason ? { adjustReason: body.adjustReason } : {})
+    }
+  });
+}

@@ -268,6 +268,14 @@ export interface ScheduleCell {
    * published=已发布、normal=历史存量（与 published 同义）。
    */
   status?: string;
+  /** 课次调整状态（批次6）：normal=正常（缺省）、canceled=本次停课、makeup=补课 */
+  lessonStatus?: string;
+  /** 代课教师 id（后端 STRING 序列化；未代课为空） */
+  substituteTeacherId?: string;
+  /** 代课教师姓名 */
+  substituteTeacherName?: string;
+  /** 调整原因（停课/补课/代课说明） */
+  adjustReason?: string;
   /** 后端取 schedule.remark */
   note?: string;
 }
@@ -615,6 +623,12 @@ export interface AdminOfferingVo {
   scheduleCount: number;
   /** 教学周数（T-00a 迁移行可能为 null = 还没设过） */
   weekCount?: number | null;
+  /** 起始周（第几周开始上课；null = 未设过，缺省 1） */
+  weekFrom?: number | null;
+  /** 一周几节（课次/周，批次7 排课配置；缺省 1） */
+  lessonsPerWeek?: number | null;
+  /** 一共多少课时（节次口径；null = 按周数×每周节次自然铺满） */
+  totalLessons?: number | null;
   /** active 进行中 / archived 已归档 */
   status: string;
   createTime: string;

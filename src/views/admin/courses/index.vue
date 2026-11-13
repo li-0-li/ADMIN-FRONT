@@ -4,13 +4,13 @@ import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import type { TableInstance } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
-import { changeCourseStatus, deleteCourse, exportCourses, getCourse, listCourses } from '@/api/admin/courses';
+import { changeCourseStatus, deleteCourse, exportCourses, getCourse, listCourses, updateOfferingScheduleConfig } from '@/api/admin/courses';
 import type { AdminCourseOrderBy, AdminCourseVo } from '@/api/admin/courses';
 import { getCertDetail, reviewCertification } from '@/api/admin/certifications';
 import { autoArrange, listSchedules } from '@/api/admin/schedules';
 import { listTerms } from '@/api/admin/basicdata';
 import { useUserStore } from '@/store/user';
-import type { AdminCourseDetailVo, CertDetail } from '@/types/admin';
+import type { AdminCourseDetailVo, AdminOfferingVo, CertDetail } from '@/types/admin';
 import CreateCourseDialog from './CreateCourseDialog.vue';
 
 /**
@@ -94,11 +94,71 @@ async function onRearrange(o: { offeringId: string; termCode?: string }) {
   }
 }
 
+/* ---------- 批次7 排课配置（录音口径：排课前先在课程详情选好 一共多少课时 / 一周几节 / 第几周到第几周） ----------
+ * 每条「进行中」开课记录就地展开小表单；第X周~第Y周换算为 weekFrom + weekCount（Y-X+1）。
+ * 总课时留空 = 按周数×每周节次自然铺满；填了则排满该节次总数即停（auto-arrange 幂等补差额）。 */
+const schedCfgId = ref('');
+const schedCfgSaving = ref(false);
+const schedCfgForm = reactive({
+  weekFrom: 1,
+  weekTo: 16,
+  lessonsPerWeek: 1,
+  totalLessons: null as number | null
+});
+
+function schedCfgLabel(o: AdminOfferingVo) {
+  const from = o.weekFrom ?? 1;
+  const weeks = o.weekCount ?? 0;
+  const perWeek = o.lessonsPerWeek ?? 1;
+  const total = o.totalLessons ?? weeks * perWeek;
+  if (!weeks) return '未设置（缺省整学期 · 每周 1 节）';
+  return `第 ${from}~${from + weeks - 1} 周 · 每周 ${perWeek} 节 · 共 ${total} 课时`;
+}
+
+function openSchedCfg(o: AdminOfferingVo) {
+  schedCfgId.value = o.offeringId;
+  const weeks = o.weekCount ?? 16;
+  schedCfgForm.weekFrom = o.weekFrom ?? 1;
+  schedCfgForm.weekTo = (o.weekFrom ?? 1) + weeks - 1;
+  schedCfgForm.lessonsPerWeek = o.lessonsPerWeek ?? 1;
+  schedCfgForm.totalLessons = o.totalLessons ?? null;
+}
+
+async function saveSchedCfg(o: AdminOfferingVo) {
+  const { weekFrom, weekTo, lessonsPerWeek, totalLessons } = schedCfgForm;
+  if (weekTo < weekFrom) {
+    ElMessage.warning('结束周不能早于开始周');
+    return;
+  }
+  schedCfgSaving.value = true;
+  try {
+    await updateOfferingScheduleConfig(o.offeringId, {
+      weekFrom,
+      weekCount: weekTo - weekFrom + 1,
+      lessonsPerWeek,
+      totalLessons
+    });
+    ElMessage.success('排课配置已保存，自动排课将按新节奏执行');
+    schedCfgId.value = '';
+    detailOfferLoading.value = true;
+    try {
+      detailData.value = await getCourse(detailCourse.value?.courseId ?? '');
+    } catch {
+      /* 保留旧数据 */
+    } finally {
+      detailOfferLoading.value = false;
+    }
+  } catch {
+    /* request.ts 已弹后端原话 */
+  } finally {
+    schedCfgSaving.value = false;
+  }
+}
+
 /** 停用 / 启用（幂等；后端不级联动开课记录与课次） */
 const toggling = ref('');
 async function toggleStatus(row: AdminCourseVo) {
-  const toDisable = row.status === 'active';
-  const verb = toDisable ? '停用' : '启用';
+  const toDisable = row.status === 'active';  const verb = toDisable ? '停用' : '启用';
   try {
     await ElMessageBox.confirm(
       toDisable
@@ -1295,6 +1355,38 @@ onMounted(async () => {
                 <div class="small muted">
                   加课码 <b>{{ o.joinCode }}</b> · 课次 {{ o.scheduleCount ?? 0 }} 节
                   <template v-if="o.weekCount"> · {{ o.weekCount }} 教学周</template>
+                </div>
+                <!-- 批次7 排课配置（录音：排课前先选好 总课时/一周几节/第几周到第几周） -->
+                <div class="small muted" style="margin-top: 2px">
+                  排课设置：<span style="color: var(--text, #344054)">{{ schedCfgLabel(o) }}</span>
+                  <el-button
+                    v-if="canOffer && o.status === 'active'"
+                    link
+                    size="small"
+                    type="primary"
+                    style="margin-left: 6px"
+                    @click="schedCfgId === o.offeringId ? (schedCfgId = '') : openSchedCfg(o)"
+                  >{{ schedCfgId === o.offeringId ? '收起' : '修改' }}</el-button>
+                </div>
+                <div
+                  v-if="schedCfgId === o.offeringId"
+                  style="margin-top: 8px; padding: 10px 12px; background: var(--fill-1, #f5f6f7); border-radius: 8px"
+                >
+                  <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center">
+                    <span class="small">第 <el-input-number v-model="schedCfgForm.weekFrom" :min="1" :max="30" size="small" style="width: 84px" controls-position="right" /> ~
+                      第 <el-input-number v-model="schedCfgForm.weekTo" :min="1" :max="30" size="small" style="width: 84px" controls-position="right" /> 周</span>
+                    <span class="small">每周 <el-input-number v-model="schedCfgForm.lessonsPerWeek" :min="1" :max="7" size="small" style="width: 84px" controls-position="right" /> 节</span>
+                    <span class="small">共 <el-input-number v-model="schedCfgForm.totalLessons" :min="1" :max="500" size="small" style="width: 100px" controls-position="right" placeholder="留空铺满" /> 课时</span>
+                    <el-button
+                      size="small"
+                      type="primary"
+                      :loading="schedCfgSaving"
+                      @click="saveSchedCfg(o)"
+                    >保存</el-button>
+                  </div>
+                  <div class="small muted" style="margin-top: 6px">
+                    总课时留空 = 按 周数 × 每周节次 自然铺满；填了则排满该节次总数即停（重复排课幂等补差额，已停课的节次不计入）。
+                  </div>
                 </div>
               </div>
               <!-- B-7 重新排课：对进行中的开课记录一键重跑 auto-arrange

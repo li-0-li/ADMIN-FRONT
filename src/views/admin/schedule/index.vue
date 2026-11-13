@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
-import { autoArrange, createSchedule, deleteSchedule, fetchClazzPool, listCourseOfferings, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules } from '@/api/admin/schedules';
+import { autoArrange, createSchedule, deleteSchedule, fetchClazzPool, listCourseOfferings, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules, updateLessonStatus } from '@/api/admin/schedules';
 import type { ClazzPoolItem, OfferingBrief, ScheduleCreateBody, ScheduleSwapBody, ScheduleUpdateBody } from '@/api/admin/schedules';
 import { deleteCourse } from '@/api/admin/courses';
 import { listClasses, listClassrooms, listMajors, listSchools, listTerms, updateClassroom } from '@/api/admin/basicdata';
@@ -2166,6 +2166,62 @@ function openDetail(cell: ScheduleCell) {
   clazzMajorMap.value = {};
   majorNames.value = [];
   void loadPickers();
+  // 课次调整表单（批次6 B-10）：随弹窗初始化；停课/补课/代课结构化，替代纯 remark 文字
+  lessonForm.lessonStatus = (cell.lessonStatus && ['normal', 'canceled', 'makeup'].includes(cell.lessonStatus)
+    ? cell.lessonStatus
+    : 'normal') as 'normal' | 'canceled' | 'makeup';
+  lessonForm.substituteTeacherId = cell.substituteTeacherId ?? '';
+  lessonForm.adjustReason = cell.adjustReason ?? '';
+}
+
+/* ---------- 课次调整（批次6 B-10，后端 1a3682b5）----------
+ * 停课 canceled：行保留、课表标灰+「停课」标，冲突检测让位（该时段教师/教室/班级空闲可另排）；
+ * 补课 makeup：补出来的课次标「补课」；恢复正常：后端清空代课与原因。
+ * 代课教师与状态独立保存（可与 normal 组合=只换人上课）。 */
+const lessonSaving = ref(false);
+const lessonForm = reactive({
+  lessonStatus: 'normal' as 'normal' | 'canceled' | 'makeup',
+  substituteTeacherId: '' as string | number,
+  adjustReason: ''
+});
+
+function lessonStatusText(cell: ScheduleCell) {
+  const parts: string[] = [];
+  if (cell.lessonStatus === 'canceled') parts.push('已停课');
+  else if (cell.lessonStatus === 'makeup') parts.push('补课');
+  if (cell.substituteTeacherName) parts.push(`由 ${cell.substituteTeacherName} 代课`);
+  if (cell.adjustReason) parts.push(cell.adjustReason);
+  return parts.join(' · ') || '正常';
+}
+
+async function saveLessonStatus() {
+  if (!detailCell.value) return;
+  lessonSaving.value = true;
+  try {
+    await updateLessonStatus(detailCell.value.scheduleId, {
+      lessonStatus: lessonForm.lessonStatus,
+      substituteTeacherId: lessonForm.lessonStatus === 'canceled' ? null : lessonForm.substituteTeacherId || null,
+      adjustReason: lessonForm.adjustReason || null
+    });
+    // 就地更新弹窗里的行（课表网格由 load(true) 重拉）
+    detailCell.value.lessonStatus = lessonForm.lessonStatus;
+    detailCell.value.adjustReason = lessonForm.adjustReason || undefined;
+    detailCell.value.substituteTeacherId = lessonForm.substituteTeacherId
+      ? String(lessonForm.substituteTeacherId)
+      : undefined;
+    ElMessage.success(
+      lessonForm.lessonStatus === 'canceled'
+        ? '已停课（课表保留标注，该时段教师/教室已释放）'
+        : lessonForm.lessonStatus === 'makeup'
+          ? '已标记为补课'
+          : '已恢复正常'
+    );
+    await load(true);
+  } catch {
+    /* request.ts 已弹后端原话 */
+  } finally {
+    lessonSaving.value = false;
+  }
 }
 
 /**
@@ -3903,7 +3959,8 @@ watch(
                       'c-join-target': isChoiceHover(c.weekday, row.period.seq, s),
                       'c-swap-target': isSwapOnlyHover(c.weekday, row.period.seq, s),
                       'c-jump': String(s.scheduleId) === String(jumpTargetId),
-                      'c-uncertified': !certPassed(s.courseId)
+                      'c-uncertified': !certPassed(s.courseId),
+                      'c-canceled': s.lessonStatus === 'canceled'
                     }
                   ]"
                   :style="
@@ -3928,6 +3985,22 @@ watch(
                 >
                   <!-- 未发布标识（C-24）：draft 课次学生/教师端不可见，点「发布课表」后才可见 -->
                   <span v-if="s.status === 'draft'" class="draft-tag">未发布</span>
+                  <!-- 批次6 课次调整（B-10）：停课红标（冲突检测已让位）/ 补课蓝标 / 代课黄标 -->
+                  <span
+                    v-if="s.lessonStatus === 'canceled'"
+                    class="lesson-tag lesson-tag--canceled"
+                    :title="lessonStatusText(s)"
+                  >已停课</span>
+                  <span
+                    v-else-if="s.lessonStatus === 'makeup'"
+                    class="lesson-tag lesson-tag--makeup"
+                    :title="lessonStatusText(s)"
+                  >补课</span>
+                  <span
+                    v-else-if="s.substituteTeacherName"
+                    class="lesson-tag lesson-tag--sub"
+                    :title="lessonStatusText(s)"
+                  >代课·{{ s.substituteTeacherName }}</span>
                   <!-- 未认证角标（2026-11-11 起为**提示性**，不再阻断）：放开后仍保留标识，让管理员看得见状态 -->
                   <span v-if="!certPassed(s.courseId)" class="uncert-tag" title="该课程未通过三重认证；排课不受此限制，仅作状态提示">未认证</span>
                   <!-- 悬停反馈：不同教师 ⇒ 放下后可选「并入 / 互换」；同一教师 ⇒ 只能互换 -->
@@ -4268,6 +4341,49 @@ watch(
           maxlength="200"
           style="flex: 1; min-width: 0"
         />
+      </div>
+      <!-- 批次6 课次调整（B-10）：停课/补课/代课结构化，替代纯 remark 文字。
+           停课=课表保留并标注、冲突检测让位；补课=补出来的课次标「补课」；恢复正常=清空代课与原因。 -->
+      <div class="detail-row">
+        <span class="detail-k">课次状态</span>
+        <div style="flex: 1; min-width: 0">
+          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
+            <el-radio-group v-model="lessonForm.lessonStatus" size="small">
+              <el-radio-button value="normal">正常</el-radio-button>
+              <el-radio-button value="canceled">停课</el-radio-button>
+              <el-radio-button value="makeup">补课</el-radio-button>
+            </el-radio-group>
+            <el-select
+              v-model="lessonForm.substituteTeacherId"
+              placeholder="代课教师（可选）"
+              clearable
+              filterable
+              size="small"
+              style="width: 158px"
+              :disabled="lessonForm.lessonStatus === 'canceled'"
+            >
+              <el-option v-for="t in teacherList" :key="t.value" :label="t.label" :value="t.value" />
+            </el-select>
+            <el-button size="small" type="primary" plain :loading="lessonSaving" @click="saveLessonStatus">
+              保存状态
+            </el-button>
+          </div>
+          <el-input
+            v-if="lessonForm.lessonStatus !== 'normal'"
+            v-model="lessonForm.adjustReason"
+            placeholder="调整原因（如：教师外出培训 / 补第 8 周课）"
+            maxlength="200"
+            size="small"
+            style="margin-top: 6px"
+          />
+          <div
+            v-if="detailCell.lessonStatus && detailCell.lessonStatus !== 'normal'"
+            class="small"
+            style="color: var(--warning, #b45309); margin-top: 4px"
+          >
+            当前：{{ lessonStatusText(detailCell) }}
+          </div>
+        </div>
       </div>
       <p class="move-hint">
         <ZkIcon name="move" :size="14" />
@@ -5482,15 +5598,43 @@ watch(
   background: var(--ink-500);
   color: #fff;
   font-size: 10px;
+  font-weight: 600;  white-space: nowrap;
+  z-index: 1;
+}
+/* 批次6 课次调整标识：左下角（避开左上 draft / 右上悬停标签）；停课红、补课蓝、代课黄 */
+.lesson-tag {
+  position: absolute;
+  bottom: -1px;
+  left: -1px;
+  padding: 1px 6px;
+  border-radius: 0 8px 0 8px;
+  color: #fff;
+  font-size: 10px;
   font-weight: 600;
   white-space: nowrap;
   z-index: 1;
+  max-width: calc(100% + 2px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lesson-tag--canceled {
+  background: var(--error, #d92d20);
+}
+.lesson-tag--makeup {
+  background: var(--brand-600, #2563eb);
+}
+.lesson-tag--sub {
+  background: var(--warning, #b45309);
 }
 /* 三重认证门槛（2026-10-29）：未认证存量课次标灰 + 左下角标；不隐藏（隐藏=课次静默消失） */
 .cblock.c-uncertified {
   opacity: 0.45;
   filter: grayscale(0.9);
   cursor: not-allowed;
+}
+/* 批次6 停课课次：半透明仍可见（时间位置还在，点开可恢复正常） */
+.cblock.c-canceled {
+  opacity: 0.55;
 }
 .cblock.c-uncertified.c-jump {
   opacity: 0.85;
