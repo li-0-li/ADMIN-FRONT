@@ -24,6 +24,11 @@ import {
   type TeacherProfile,
   type TeacherTaughtCourse
 } from '@/api/admin/profiles';
+import { useUserStore } from '@/store/user';
+
+/** 与 AdminProfileController#updateTeacher 的 @ss.hasPermi('admin:profiles:edit') 对应 */
+const userStore = useUserStore();
+const canEditProfile = computed(() => userStore.hasPermi('admin:profiles:edit'));
 
 const props = defineProps<{
   mode: 'teacher' | 'student';
@@ -206,9 +211,10 @@ async function submitEdit() {
           <span class="sec-title">基本信息</span>
           <template v-if="isTeacher">
             <template v-if="!editing">
-              <el-button size="small" @click="startEdit">
+              <el-button v-if="canEditProfile" size="small" @click="startEdit">
                 <ZkIcon name="pencil" :size="13" style="margin-right: 4px" />编辑
               </el-button>
+              <span v-else class="small muted">无编辑权限</span>
             </template>
             <template v-else>
               <el-button size="small" :disabled="saving" @click="cancelEdit">取消</el-button>

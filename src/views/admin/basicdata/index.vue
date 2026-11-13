@@ -29,6 +29,7 @@ import {
 } from '@/api/admin/basicdata';
 import { listDeptTree, listUsers, type DeptNodeVo } from '@/api/admin/users';
 import type { BasicDataQuery } from '@/types/admin';
+import { useUserStore } from '@/store/user';
 
 /* ---------------- tab 定义（与原型 admin-basicdata.html 的 8 个 pill 一致） ---------------- */
 type TabKey = 'school' | 'dept' | 'major' | 'teacher' | 'clazz' | 'student' | 'term' | 'room';
@@ -362,7 +363,28 @@ onMounted(() => {
 
 /* ---------------- 增删改（只对有接口的 tab 开放；院系只读） ---------------- */
 const CRUD_TABS: TabKey[] = ['school', 'dept', 'major', 'clazz', 'term', 'room'];
+/** 各 tab 对应的后端权限前缀（逐个从 AdminBasicDataController / sys_dept 的 @ss.hasPermi 抄来） */
+const TAB_PERM: Partial<Record<TabKey, string>> = {
+  school: 'admin:schools',
+  dept: 'system:dept',
+  major: 'admin:majors',
+  clazz: 'admin:classes',
+  term: 'admin:terms',
+  room: 'admin:classrooms'
+};
+
+/**
+ * canCrud 表达的是「这个 tab 在业务上是否支持增删改」（能力维度，与权限无关）。
+ * 2026-11-13 补：此前它同时被当成权限用 ⇒ 任何角色进页面都能看到「新增/编辑/删除」，
+ * 点下去才被后端 403 挡回（后端 113 端点已 100% 带 @ss.hasPermi）。
+ * 现在拆成三个权限位，按钮无权限即不渲染；超管 *:*:* 恒 true，行为零变化。
+ */
 const canCrud = computed(() => CRUD_TABS.includes(active.value));
+const userStore = useUserStore();
+const activePerm = computed(() => TAB_PERM[active.value] ?? '');
+const canAdd = computed(() => canCrud.value && userStore.hasPermi(`${activePerm.value}:add`));
+const canEdit = computed(() => canCrud.value && userStore.hasPermi(`${activePerm.value}:edit`));
+const canRemove = computed(() => canCrud.value && userStore.hasPermi(`${activePerm.value}:remove`));
 
 /** 各 CRUD tab 的主键字段名（删除/编辑都要用，收口一处避免五处各写一份） */
 const CRUD_ID_KEYS: Record<string, string> = { school: 'schoolId', dept: 'deptId', major: 'majorId', clazz: 'clazzId', term: 'termId', room: 'classroomId' };
@@ -801,10 +823,10 @@ async function exportCsv() {
       </el-button>
       <!-- ⚠️ 院系不提供批量删除：el-table 树形勾选父行会级联勾选全部子孙（探针实测：点 1 行 → 选中整棵树
            → 5 个叶子部门被连带软删）。树形域语义复杂且后端对「有下级/有用户」本就拒绝，批量无收益纯风险。 -->
-      <el-button v-if="canCrud && active !== 'dept' && selectionRows.length" style="color: var(--error)" @click="doBatchDelete">
+      <el-button v-if="canRemove && active !== 'dept' && selectionRows.length" style="color: var(--error)" @click="doBatchDelete">
         <ZkIcon name="trash-2" :size="15" style="margin-right: 4px" />删除所选（{{ selectionRows.length }}）
       </el-button>
-      <el-button v-if="canCrud" type="primary" @click="openCreate">
+      <el-button v-if="canAdd" type="primary" @click="openCreate">
         <ZkIcon name="plus" :size="15" style="margin-right: 4px" />新增
       </el-button>
     </div>
@@ -892,7 +914,7 @@ async function exportCsv() {
       @selection-change="onSelectionChange"
     >
       <!-- 批量删除选择列（A1 序号列 + A5 首列冻结） -->
-      <el-table-column v-if="canCrud && active !== 'dept'" type="selection" width="42" align="center" fixed="left" />
+      <el-table-column v-if="canRemove && active !== 'dept'" type="selection" width="42" align="center" fixed="left" />
       <el-table-column type="index" label="#" width="56" align="center" fixed="left" />
       <el-table-column v-for="c in visibleColumns" :key="c.prop" :label="c.label" :prop="c.prop" min-width="130" :align="c.align" :fixed="c.link ? 'left' : undefined">
         <template #default="{ row }">
@@ -901,10 +923,10 @@ async function exportCsv() {
           <span v-else>{{ c.render ? c.render(row) : (row[c.prop] ?? '—') }}</span>
         </template>
       </el-table-column>
-      <el-table-column v-if="canCrud" label="操作" width="150" align="right" fixed="right">
+      <el-table-column v-if="canEdit || canRemove" label="操作" width="150" align="right" fixed="right">
         <template #default="{ row }">
-          <el-button text size="small" :disabled="idsCorrupted" @click="openEdit(row)">编辑</el-button>
-          <el-button text size="small" style="color: var(--error)" :disabled="idsCorrupted" @click="doDelete(row)">删除</el-button>
+          <el-button v-if="canEdit" text size="small" :disabled="idsCorrupted" @click="openEdit(row)">编辑</el-button>
+          <el-button v-if="canRemove" text size="small" style="color: var(--error)" :disabled="idsCorrupted" @click="doDelete(row)">删除</el-button>
         </template>
       </el-table-column>
       <template #empty>
@@ -915,7 +937,7 @@ async function exportCsv() {
           <template v-else-if="active === 'teacher' || active === 'student'">暂无数据（数据源＝账号接口按角色过滤）</template>
           <template v-else>
             暂无数据
-            <el-button v-if="canCrud" text type="primary" size="small" @click="openCreate">去新增</el-button>
+            <el-button v-if="canAdd" text type="primary" size="small" @click="openCreate">去新增</el-button>
           </template>
         </div>
       </template>

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref } from 'vue';
+import { computed, nextTick, onMounted, ref } from 'vue';
 import { ElMessage } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import {
@@ -9,6 +9,11 @@ import {
   listRoles
 } from '@/api/admin/roles';
 import type { AdminRoleVo, PermissionNodeVo } from '@/types/admin';
+import { useUserStore } from '@/store/user';
+
+/** 与 AdminRoleController 的 @ss.hasPermi('admin:roles:perms') 对应；超管恒 true */
+const userStore = useUserStore();
+const canAssignPerms = computed(() => userStore.hasPermi('admin:roles:perms'));
 
 /* ---------------- 列表 ---------------- */
 const loading = ref(false);
@@ -129,7 +134,7 @@ onMounted(fetchList);
         <template #default="{ row }">{{ row.remark || '—' }}</template>
       </el-table-column>
       <el-table-column label="创建时间" width="170" prop="createTime" />
-      <el-table-column label="操作" width="140" align="right">
+      <el-table-column v-if="canAssignPerms" label="操作" width="140" align="right">
         <template #default="{ row }">
           <el-button
             text size="small"

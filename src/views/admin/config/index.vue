@@ -16,6 +16,18 @@ import {
   type TeachingWeekOverride,
   type TeachingWeekProbe
 } from '@/api/admin/config';
+import { useUserStore } from '@/store/user';
+
+/**
+ * 按钮级权限（与后端注解一一对应，2026-11-13 逐条从 controller 抄过来）：
+ *   AdminSystemConfigController → admin:configs:edit / admin:config:teachingWeekEdit / admin:sensitive:add
+ * 后端 `@ss.hasPermi` 已 113 端点全覆盖，所以这里只解决「看得见点不动」的 UX：
+ * 没有权限就不渲染按钮，而不是点下去弹 403。超管（*:*:*）恒为 true，行为零变化。
+ */
+const userStore = useUserStore();
+const canEditConfigs = computed(() => userStore.hasPermi('admin:configs:edit'));
+const canEditTeachingWeek = computed(() => userStore.hasPermi('admin:config:teachingWeekEdit'));
+const canEditWords = computed(() => userStore.hasPermi('admin:sensitive:add'));
 
 /**
  * 系统配置页（/admin/config）：
@@ -423,8 +435,8 @@ onUnmounted(() => {
   <div class="page-head">
     <h1>系统配置</h1>
     <div class="actions">
-      <el-button :disabled="!dirtyCount" @click="discardAll">放弃更改</el-button>
-      <el-button type="primary" :loading="saving" :disabled="!dirtyCount" @click="saveAll">
+      <el-button v-if="canEditConfigs" :disabled="!dirtyCount" @click="discardAll">放弃更改</el-button>
+      <el-button v-if="canEditConfigs" type="primary" :loading="saving" :disabled="!dirtyCount" @click="saveAll">
         <ZkIcon name="save" :size="15" style="margin-right: 4px" />保存全部配置{{ dirtyCount ? `（${dirtyCount} 项改动）` : '' }}
       </el-button>
     </div>
@@ -456,19 +468,20 @@ onUnmounted(() => {
     </div>
 
     <div v-else-if="twProbe === 'forbidden'" class="ids-warn">
-      接口已在线，但当前账号缺权限点 <code>admin:config:teachingWeekQuery</code>（菜单 3362 尚未登记或未授权）。
-      这不是接口故障——登记并授权后刷新页面即可生效。
+      接口已在线，但当前账号缺权限点 <code>admin:config:teachingWeekQuery</code>。
+      该权限点已在 <code>sys_menu</code> 登记（菜单 3362）并授权给平台管理员（role 100），
+      所以出现此提示说明登录的是**其他角色**——找平台管理员为该角色勾选该权限即可，不是接口故障。
     </div>
 
     <div v-else v-loading="twLoading" class="tw-body">
       <div class="tw-field">
         <span class="tw-label">起始教学周</span>
-        <el-input-number v-model="twForm.weekFrom" :min="1" :max="25" :step="1" step-strictly style="width: 130px" />
+        <el-input-number v-model="twForm.weekFrom" :min="1" :max="25" :step="1" step-strictly style="width: 130px" :disabled="!canEditTeachingWeek" />
         <span class="small muted">从第几周开始算作第 1 个教学周</span>
       </div>
       <div class="tw-field">
         <span class="tw-label">教学总周数</span>
-        <el-input-number v-model="twForm.weekCount" :min="1" :max="30" :step="1" step-strictly style="width: 130px" />
+        <el-input-number v-model="twForm.weekCount" :min="1" :max="30" :step="1" step-strictly style="width: 130px" :disabled="!canEditTeachingWeek" />
         <span class="small muted">学期共几周（1~30）；16 / 18 是常见口径</span>
       </div>
       <div class="tw-field">
@@ -479,7 +492,7 @@ onUnmounted(() => {
           <span v-else class="badge badge-neutral" title="已写入 biz_config 的 teaching.week.from / teaching.week.count">已自定义</span>
         </span>
       </div>
-      <div class="tw-actions">
+      <div v-if="canEditTeachingWeek" class="tw-actions">
         <el-button :disabled="!twDirty" @click="resetTeachingWeek">撤销</el-button>
         <el-button type="primary" :loading="twSaving" :disabled="!twDirty" @click="submitTeachingWeek">
           保存教学周
@@ -532,14 +545,14 @@ onUnmounted(() => {
             v-model="drafts[i.configKey]"
             active-value="true"
             inactive-value="false"
-            :disabled="i.editable === 0"
+            :disabled="i.editable === 0 || !canEditConfigs"
           />
           <el-input-number
             v-else-if="i.valueType === 'number'"
             :model-value="(drafts[i.configKey] as unknown as number)"
             :controls="false"
             style="width: 120px"
-            :disabled="i.editable === 0"
+            :disabled="i.editable === 0 || !canEditConfigs"
             @update:model-value="(v: number | null) => (drafts[i.configKey] = v === null || v === undefined ? '' : String(v))"
           />
           <el-input
@@ -548,9 +561,9 @@ onUnmounted(() => {
             type="textarea"
             :rows="3"
             style="width: 300px"
-            :disabled="i.editable === 0"
+            :disabled="i.editable === 0 || !canEditConfigs"
           />
-          <el-input v-else v-model="drafts[i.configKey]" style="width: 200px" :disabled="i.editable === 0" />
+          <el-input v-else v-model="drafts[i.configKey]" style="width: 200px" :disabled="i.editable === 0 || !canEditConfigs" />
         </div>
       </div>
     </div>
@@ -565,7 +578,7 @@ onUnmounted(() => {
             <el-option label="全部分类" value="" />
             <el-option v-for="(t, k) in CATEGORY_TEXT" :key="k" :label="t" :value="k" />
           </el-select>
-          <el-button type="primary" plain size="small" @click="openWordCreate">
+          <el-button v-if="canEditWords" type="primary" plain size="small" @click="openWordCreate">
             <ZkIcon name="plus" :size="14" style="margin-right: 4px" />新增敏感词
           </el-button>
         </div>
@@ -590,7 +603,7 @@ onUnmounted(() => {
             <span class="badge" :class="row.status === 1 ? 'badge-success' : 'badge-neutral'">{{ row.status === 1 ? '启用' : '停用' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="200" align="right" fixed="right">
+        <el-table-column v-if="canEditWords" label="操作" width="200" align="right" fixed="right">
           <template #default="{ row }">
             <el-button text size="small" @click="openWordEdit(row)">编辑</el-button>
             <el-button text size="small" @click="toggleWordStatus(row)">{{ row.status === 1 ? '停用' : '启用' }}</el-button>
