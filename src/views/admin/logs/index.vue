@@ -174,6 +174,14 @@
               <span class="badge" :class="r.status === 0 ? 'badge-success' : 'badge-error'">
                 {{ r.status === 0 ? '成功' : '失败' }}
               </span>
+              <!-- 有失败原因可看时给一个视觉钩子：否则「失败」两个字点开的抽屉里有没有内容全靠猜 -->
+              <ZkIcon
+                v-if="r.status !== 0 && r.errorMsg"
+                name="alert-triangle"
+                :size="13"
+                class="fail-hint"
+                title="点开本行可看失败原因"
+              />
               <span v-if="tab === 'operation' && r.costTime !== null && r.costTime !== undefined" class="small muted cost">
                 {{ r.costTime }} ms
               </span>
@@ -281,6 +289,22 @@
           </span>
         </dd>
       </dl>
+
+      <!-- 失败原因：后端 `error_msg` 已有真实内容（11-13 实测 81 条失败里 22 条系统异常、
+           59 条业务校验拦截），此前只显示「失败」两个字，等于把最有用的信息丢了。 -->
+      <div v-if="detail.status !== 0 && detail.errorMsg" class="fail-box">
+        <div class="fail-title">
+          <ZkIcon name="alert-triangle" :size="14" />
+          <span>失败原因</span>
+        </div>
+        <pre class="fail-msg">{{ detail.errorMsg }}</pre>
+      </div>
+
+      <!-- 请求参数：可能含手机号等敏感入参，默认折叠，点了才看 -->
+      <details v-if="detail.operParam" class="param-box">
+        <summary>请求参数<span class="small muted">（可能含敏感信息，点击展开）</span></summary>
+        <pre class="param-pre">{{ prettyParam(detail.operParam) }}</pre>
+      </details>
 
       <div class="drawer-actions">
         <button class="btn btn-outline" @click="copyDetail">
@@ -645,6 +669,20 @@ function locText(r: LogRowVo) {
 }
 
 /**
+ * 请求参数美化：后端存的是紧凑 JSON 字符串（实测 `{"deptId":201,"nickName":"..."}`）。
+ * 能解析就缩进展示，解析不了就原样给出——不因为格式不合法而把内容藏起来。
+ */
+function prettyParam(raw: string) {
+  const s = (raw || '').trim();
+  if (!s) return '—';
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2);
+  } catch {
+    return s;
+  }
+}
+
+/**
  * 登录日志的「角色」「设备 / 客户端」两列 —— 能力探测。
  *
  * 现状：后端 `AdminLogRowVo` 没有这三个字段，所以这两列现在不渲染。
@@ -938,6 +976,65 @@ onMounted(() => {
   color: var(--ink-700);
   word-break: break-all;
 }
+
+/* 失败原因块：红边 + 浅底，与「成功/失败」徽章的语义连起来，滚动区避免长 SQL 撑爆抽屉 */
+.fail-box {
+  margin-top: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--danger-300, #f3b6b6);
+  border-left: 3px solid var(--danger-500, #e05252);
+  border-radius: 6px;
+  background: var(--danger-50, #fef4f4);
+}
+.fail-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--danger-700, #b02a2a);
+}
+.fail-msg {
+  margin: 0;
+  max-height: 190px;
+  overflow: auto;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ink-700);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 请求参数：默认折叠，避免手机号等敏感入参一进抽屉就铺开 */
+.param-box {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--ink-500);
+}
+.param-box summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 4px 0;
+}
+.param-box summary:hover {
+  color: var(--brand-600, #0f766e);
+}
+.param-pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  max-height: 210px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--bg-soft, #f7f9fc);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--ink-600);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 .drawer-actions {
   margin-top: 22px;
   padding-top: 16px;
@@ -946,6 +1043,12 @@ onMounted(() => {
 .cost {
   margin-left: 6px;
   white-space: nowrap;
+}
+/* 失败行的小警示图标：仅提示「这行有原因可看」，不单独可点（整行已可点开抽屉） */
+.fail-hint {
+  margin-left: 6px;
+  vertical-align: -2px;
+  color: var(--danger-500, #e05252);
 }
 /* 分页条：与表体用上边线分开，表格自带横向滚动，不共用滚动区 */
 .log-pager {

@@ -54,8 +54,22 @@ const GROUP_TITLES: Record<string, string> = {
   cert: '认证参数（三重认证）',
   class: '课堂参数',
   security: '安全策略',
-  system: '系统杂项'
+  system: '系统杂项',
+  /** ★ 2026-11-13 巡检发现：后端 `biz_config` 里有 `teaching` 组（2 项），前端没登记
+   *  ⇒ 侧栏与卡片标题直接显示英文 `teaching`。登记上标题做兜底，即使被下面的
+   *  `HIDDEN_GROUPS` 隐藏，搜索命中等路径也不会再露出英文键名。 */
+  teaching: '教学周设置'
 };
+
+/**
+ * 不在下方键值列表里渲染的组。
+ *
+ * `teaching`：页面顶部已有专门的「教学周设置」卡片（起始周 / 总周数 / 当前口径 / 撤销 / 保存），
+ * 走的是 `PUT /admin/config/teaching-week` 这条带语义校验的接口。而下方列表是**原始键值编辑**，
+ * 直接改 `teaching.week.from` 会绕过那道校验 —— 同一份数据两个入口、其中一个还能绕过校验，
+ * 是 11-13 巡检实测出来的重复（截图里 `teaching 2 项` 与顶部卡片内容完全一样）。
+ */
+const HIDDEN_GROUPS = new Set(['teaching']);
 /**
  * 组级口径说明（业主 11-10 拍板：保留 ai/quota 两组并加说明，防止再被误认为属于「AI 工作台」页）。
  * 证据：教师端 AiQuotaService 真实消费 ai.enabled / ai.daily_quota_per_user / ai.course_daily_quota
@@ -70,6 +84,8 @@ const groups = computed(() => {
   const map = new Map<string, ConfigItem[]>();
   items.value.forEach(i => {
     const g = i.configGroup || 'other';
+    /* 已被专门的卡片接管的组不再进键值列表（见 HIDDEN_GROUPS 注释） */
+    if (HIDDEN_GROUPS.has(g)) return;
     if (!map.has(g)) map.set(g, []);
     map.get(g)!.push(i);
   });
@@ -90,6 +106,9 @@ const filteredGroups = computed(() => {
     .filter(([, list]) => list.length > 0);
 });
 const searchHitCount = computed(() => filteredGroups.value.reduce((n, [, list]) => n + list.length, 0));
+/** 键值列表里实际渲染的项数（不含被专门卡片接管的组）——顶部「共 N 项配置」按它算，
+ *  否则会和屏幕上的条数对不上（items 含 teaching 2 项，但列表里不渲染） */
+const visibleItemCount = computed(() => groups.value.reduce((n, [, list]) => n + list.length, 0));
 
 /* ---------------- json 键即时校验（编辑时就该知道对不对，而不是保存才报） ---------------- */
 function jsonInvalid(item: ConfigItem): boolean {
@@ -417,7 +436,7 @@ onUnmounted(() => {
   <div class="cfg-toolbar">
     <el-input v-model="configSearch" clearable placeholder="搜索配置键或说明（如 ai. / 配额）" style="width: 300px" />
     <span v-if="configSearch.trim()" class="small muted">命中 {{ searchHitCount }} 项配置（跨键名与说明匹配）</span>
-    <span v-else class="small muted">共 {{ items.length }} 项配置 · {{ groups.length }} 组 · 改动后点右上「保存全部」一次提交</span>
+    <span v-else class="small muted">共 {{ visibleItemCount }} 项配置 · {{ groups.length }} 组 · 改动后点右上「保存全部」一次提交<span class="muted">（教学周的 2 项在上方卡片里维护，不重复列在下方）</span></span>
   </div>
 
   <!-- 教学周全局设置（G8/R-2 · 录音 A1）：独立端点，不属于 biz_config 分组，单列一块 -->

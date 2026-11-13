@@ -53,6 +53,24 @@ export interface LogRowVo {
   os?: string;
   /** 登录账号所属角色名（多角色时由后端拼接，如「教师、管理员」） */
   roleName?: string;
+
+  /**
+   * 失败原因（`sys_oper_log.error_msg`）。**2026-11-13 实测后端已返回**。
+   *
+   * 为什么必须展示：实测 81 条 status=1 的记录里，只有 22 条是真正的数据库/系统异常
+   * （`### Error updating database. Cause: java.sql.SQLException ...`），其余 59 条全部是
+   * **业务校验与权限规则拦截**——「只有超级管理员可以重置管理员密码」「所属院系不能为空」
+   * 「登录账号已存在：test05」这类。两者混在一起时，使用者只能看到「失败」两个字，
+   * 无法判断是自己填错了还是系统坏了。
+   *
+   * 可选字段：后端没返回时详情抽屉不渲染该块（能力探测，与 browser/os 同一套写法）。
+   */
+  errorMsg?: string | null;
+  /**
+   * 请求入参（`sys_oper_log.oper_param`）。同一批实测已返回。
+   * ★ 可能含手机号等敏感入参，默认**折叠**展示，由使用者主动展开。
+   */
+  operParam?: string | null;
 }
 
 /** 页签标识：与后端 `AdminLogServiceImpl.java:27` 的 LOG_TYPE_LOGIN 对齐，其余一律走操作日志 */
