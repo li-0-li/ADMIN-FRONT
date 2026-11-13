@@ -20,8 +20,12 @@ import CreateCourseDialog from './CreateCourseDialog.vue';
  * 课程代码/教师/学期/人数四列从行上移除（开课明细在详情抽屉的「开课记录」区块，
  * 数据源 GET /courses/{id} 的 offerings[]）；新增课程编号/开课数两列。
  * 新建课程走两步向导（CreateCourseDialog：① 基础课程 → ② 开课）。
- * 状态词表：active 启用 / disabled 已停用（T-01 起管理端只写这两值），
- * creating/certifying 是课程审核状态、不再出现在本页。
+ * 状态词表：active 启用 / disabled 已停用 / certifying 认证中 / archived 已归档。
+ * ★ 2026-11-13 实测纠正一条旧注释：原写「creating/certifying 是审核状态、不再出现在本页」，
+ *   但库里 `select status,count(*) from course` 实测 active 15 / **certifying 10** / archived 1
+ *   ⇒ 这些行**真的会出现在列表里**（列表默认不按 status 过滤）。前端只映射了两个值，
+ *   结果 10 行里 8 行裸奔英文 `certifying`。现补齐词表 + 徽标色 + 筛选下拉；
+ *   未知状态仍原样透出（不吞成"未知"），但至少已覆盖后端全部真实取值。
  *
  * ★ 认证材料不是本页主数据：C-14 详情按 courseId 取，历史课程可能没有认证记录
  *   ⇒ 详情失败只降级成一句说明，不弹红条、不阻塞列表——这是"可选信息"，不是"页面必需数据"。
@@ -148,8 +152,27 @@ const hasFilter = computed(
 const terms = ref<{ termId: string; name: string; code: string }[]>([]);
 const termOptionsReady = computed(() => terms.value.length > 0);
 
-const STATUS_LABEL: Record<string, string> = { active: '启用', disabled: '已停用' };
-const STATUS_BADGE: Record<string, string> = { active: 'badge-success', disabled: 'badge-neutral' };
+/**
+ * 课程状态词表。
+ * ★ 取值以库为准（2026-11-13 实测 `course.status`：active 15 / certifying 10 / archived 1），
+ *   不是以"T-01 只写两值"的设计意图为准 —— 设计意图只约束**新增**的写入，
+ *   历史行和被驳回的行仍是 certifying（驳回会把 active 回退成 certifying，见本文 §reject）。
+ *   `disabled` 保留：管理端「停用」动作写的就是它。
+ */
+const STATUS_LABEL: Record<string, string> = {
+  active: '启用',
+  disabled: '已停用',
+  certifying: '认证中',
+  archived: '已归档',
+  creating: '草稿'
+};
+const STATUS_BADGE: Record<string, string> = {
+  active: 'badge-success',
+  disabled: 'badge-neutral',
+  certifying: 'badge-warning',
+  archived: 'badge-neutral',
+  creating: 'badge-neutral'
+};
 const statusLabel = (s: string) => STATUS_LABEL[s] ?? s ?? '—';
 const statusBadge = (s: string) => STATUS_BADGE[s] ?? 'badge-neutral';
 
@@ -994,10 +1017,12 @@ onMounted(async () => {
           :value="t.termId"
         />
       </el-select>
-      <!-- 状态筛选（T-01）：不再固定 active，默认全部 -->
+      <!-- 状态筛选（T-01）：不再固定 active，默认全部。取值与 STATUS_LABEL 对齐（含实测存在的 certifying/archived） -->
       <el-select v-model="query.status" placeholder="全部状态" clearable style="width: 120px" @change="onSearch">
         <el-option label="启用" value="active" />
+        <el-option label="认证中" value="certifying" />
         <el-option label="已停用" value="disabled" />
+        <el-option label="已归档" value="archived" />
       </el-select>
       <!-- 排课情况筛选（10-29 新增）：与「排课情况」列同源，都基于课次聚合 -->
       <el-select

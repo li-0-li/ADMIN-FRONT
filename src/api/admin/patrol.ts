@@ -1,25 +1,37 @@
-import { rawRequest, request } from '@/api/request';
+import { rawRequest, request, requestBlob } from '@/api/request';
 import type { PageResult } from '@/types/admin';
 
 /**
- * 课堂巡查（G4 / T1）—— 2026-11-11 实测 8080 现役包，只有「会话层」两个端点：
+ * 课堂巡查（G4）—— 2026-11-13 实测 8080 包（api-docs 551 路径），两层都齐了：
  *
+ * **会话层（教师端自动产生、管理端补结论）**
  * | 端点 | 权限 | 出参 |
  * |---|---|---|
- * | GET /api/v1/admin/sessions?status=&page=&pageSize= | admin:patrol:list（菜单 3275） | PageResult<PatrolSessionVO> |
- * | GET /api/v1/sessions/{sessionId}/step-logs | admin:patrol:steplogs（菜单 3276） | **裸数组** SessionStepLogVO[] |
+ * | GET /api/v1/admin/sessions?status=&page=&pageSize= | admin:patrol:list（3275） | PageResult<PatrolSessionVO> |
+ * | GET /api/v1/sessions/{sessionId}/step-logs | admin:patrol:steplogs（3276） | **裸数组** SessionStepLogVO[] |
+ * | POST /api/v1/admin/patrol/sessions/export | admin:patrol:export（★ 菜单**未落库**） | Excel 流 |
  *
- * ★ 与启动包的两处偏差（以实测为准）：
- *  1. 步骤明细**不是"随会话"鉴权**，后端另有独立权限点 `admin:patrol:steplogs`（sys_menu 3276）。
- *     少授这个点的人能看列表、但点开步骤会 403 ⇒ 页面对"查看步骤"做权限门禁，不做点了报错的按钮。
- *  2. `pageSize>100` 服务端兜底 20（**不含** total 计算，所以统计卡取 total 仍准）。
+ * **计划层（管理端自建巡查安排 + 听课记录）**
+ * | 端点 | 权限 | 出参 |
+ * |---|---|---|
+ * | GET /api/v1/admin/patrol/plans | admin:patrol:planList（3357） | PageResult<PatrolPlanVO>（行内 records[]） |
+ * | POST /api/v1/admin/patrol/plans | admin:patrol:planAdd（3358） | planId |
+ * | PUT /api/v1/admin/patrol/plans/{planId} | admin:patrol:planEdit（3359） | boolean |
+ * | DELETE /api/v1/admin/patrol/plans/{planId} | admin:patrol:planRemove（3360） | boolean |
+ * | POST /api/v1/admin/patrol/records?planId=&content= | admin:patrol:recordAdd（3361） | {recordId, fileUrl} |
  *
- * ★ 计划层（`/api/v1/admin/patrol/plans`，5 端点）当前包 **0 个**（api-docs 453 条路径里没有），
- *   sys_menu 3357~3364 也是 0 行 ⇒ 页面只做能力探测 + 缺口提示，不写无法实测的 CRUD。
- *   探测用 `probePatrolPlans()`，三态：absent / forbidden / ready。
+ * ★ 与 2026-11-11 首版的差异（当时只有会话层两个端点，计划层写成"缺口提示"）：
+ *   源码 T-05 提交 `1bfe3e69` 已合入远端 be-admin，建表脚本 `patrol-plan-1110.sql` 与菜单
+ *   3357~3361 也已在本地库执行 ⇒ 计划层**可以做成真界面**，页面横幅已撤。
  *
- * ★ 会话层**没有**巡查结论的写端点（无 PATCH/PUT）⇒ 「保存巡查记录」按钮是禁用态 + 说明，
- *   不做一个点了没反应的按钮（验收会当 bug）。
+ * ★ 三个仍要留意的后端事实（实测，别再重复排查）：
+ *  1. 步骤明细**不是"随会话"鉴权**，是独立权限点 `admin:patrol:steplogs`（3276）。
+ *  2. `pageSize>100` 服务端兜底 20（计划层同口径），**不影响 total**，统计卡取 total 仍准。
+ *  3. 导出权限点 `admin:patrol:export` 在 sys_menu 里**一行都没有**（3357~3361 只有计划层 5 个）
+ *     ⇒ 非超管账号调导出必 403。按钮按权限门禁，并在页面写明"需补菜单"，不假装能导。
+ *
+ * ★ 会话层**没有**巡查结论写端点（无 PATCH/PUT）⇒「保存巡查记录」仍是禁用态 + 说明。
+ *   结论只能由教师端/别的入口写入，管理端目前只读。
  */
 
 /** 会话状态（后端 status 列 varchar(16)，取值见 AdminPatrolController 注释） */
@@ -138,4 +150,143 @@ export async function probePatrolPlans(): Promise<PatrolPlanProbe> {
     // 网络层异常（含 401 跳登录）一律按未上线处理，页面降级成缺口提示
     return 'absent';
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * 计划层（真实端点，2026-11-13 起）
+ * ------------------------------------------------------------------ */
+
+/** 计划状态（后端 STATUSES 白名单，新增恒 pending，只能编辑流转） */
+export type PlanStatus = 'pending' | 'ongoing' | 'done' | 'cancelled';
+
+/** 听课记录（PatrolRecordVo）。★ fileUrl 是**预签名地址**（`/oss/...`），对象名不外泄 */
+export interface PatrolRecordVO {
+  recordId: string | number;
+  planId: string | number;
+  recorderId?: string | number | null;
+  recorderName?: string | null;
+  content?: string | null;
+  fileName?: string | null;
+  fileSize?: number | null;
+  fileUrl?: string | null;
+  createTime?: string | null;
+}
+
+/** 巡查计划行（AdminPatrolPlanVo）。records 由后端按当页 planId 一次性回填，非 N+1 */
+export interface PatrolPlanVO {
+  planId: string | number;
+  planName?: string | null;
+  offeringId?: string | number | null;
+  courseId?: string | number | null;
+  courseName?: string | null;
+  teacherId?: string | number | null;
+  teacherName?: string | null;
+  classroom?: string | null;
+  /** yyyy-MM-dd（后端用 LocalDate.parse 校验，传别的时间格式会 500 + "格式非法"） */
+  patrolDate?: string | null;
+  periodNo?: number | null;
+  status?: string | null;
+  remark?: string | null;
+  createTime?: string | null;
+  records?: PatrolRecordVO[] | null;
+}
+
+/**
+ * 新建/编辑入参（PatrolPlanSaveBo）。
+ * ★ 后端必填只有 planName + patrolDate（`validate()` 里逐条判，其余可为空）；
+ *   periodNo 传了就必须在 1~30，否则 "节次非法（1~30）"。
+ * ★ 编辑时空对象会被 `isEmptyUpdate()` 拒绝（"缺少要更新的字段"）⇒ 前端一律整份提交。
+ */
+export interface PatrolPlanSaveBody {
+  planId?: string | number;
+  planName: string;
+  offeringId?: string | number | null;
+  courseId?: string | number | null;
+  teacherId?: string | number | null;
+  classroom?: string | null;
+  patrolDate: string;
+  periodNo?: number | null;
+  status?: string | null;
+  remark?: string | null;
+}
+
+export interface PatrolPlanQuery {
+  status?: string;
+  /** yyyy-MM-dd 精确匹配（后端按天筛，不是区间） */
+  patrolDate?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+/** 计划分页列表。records[] 内嵌听课记录，附件已预签名 */
+export function listPatrolPlans(query: PatrolPlanQuery = {}, opts: CallOpts = {}) {
+  const params: Record<string, unknown> = {
+    page: query.page ?? 1,
+    pageSize: query.pageSize ?? 20
+  };
+  if (query.status) params.status = query.status;
+  if (query.patrolDate) params.patrolDate = query.patrolDate;
+  return request<PageResult<PatrolPlanVO>>({
+    url: PATROL_PLANS,
+    method: 'get',
+    params,
+    silent: opts.silent === true
+  });
+}
+
+/** 新建计划（后端恒置 pending，忽略入参 status） */
+export function createPatrolPlan(body: PatrolPlanSaveBody) {
+  return request<string | number>({ url: PATROL_PLANS, method: 'post', data: body });
+}
+
+/**
+ * 编辑计划（含状态流转 pending/ongoing/done/cancelled）。
+ * ★ 入参是 Partial：后端 `updatePlan()` **不调用** `validate()`，只判
+ *   「存在 + status 白名单 + 非空更新」⇒ 只传 `{status:'ongoing'}` 完全合法（实测通过）。
+ *   但**不能传空对象**（isEmptyUpdate 会拒绝 "缺少要更新的字段"）。
+ */
+export function updatePatrolPlan(planId: string | number, body: Partial<PatrolPlanSaveBody>) {
+  return request<boolean>({ url: `${PATROL_PLANS}/${String(planId)}`, method: 'put', data: body });
+}
+
+/** 软删计划（听课记录保留，后端软删） */
+export function removePatrolPlan(planId: string | number) {
+  return request<boolean>({ url: `${PATROL_PLANS}/${String(planId)}`, method: 'delete' });
+}
+
+/**
+ * 上传听课记录（multipart）。
+ * ★ 参数位置是后端的硬约定：planId / content 走 **query**，file 走 **multipart body**
+ *   （`@RequestParam` + `MultipartFile`，不是 @RequestPart 对象）。
+ * ★ content 与 file **至少其一非空**，都空后端直接 "听课纪要与附件至少其一非空"。
+ * ★ 附件 50MB 上限，超了后端报 "附件超过 50MB 上限"。
+ * ★ 附件落存储（MinIO / 本地磁盘降级）—— 存储不可用时后端返回 "附件上传失败，请稍后重试"，
+ *   这是**环境问题不是前端问题**，页面要按这个语义提示。
+ */
+export function uploadPatrolRecord(planId: string | number, content: string, file?: File | null) {
+  const params: Record<string, unknown> = { planId };
+  if (content && content.trim()) params.content = content.trim();
+  const form = new FormData();
+  // 只有真的带文件才 append：append('file', null) 会变成字符串 "null" 传给后端
+  if (file) form.append('file', file);
+  return request<{ recordId?: string | number; fileUrl?: string }>({
+    url: '/api/v1/admin/patrol/records',
+    method: 'post',
+    params,
+    data: form
+  });
+}
+
+/**
+ * 导出巡查记录（会话层，筛选条件与 #12 列表同口径）。
+ * ★ 走 POST + body（与 C-12b `/courses/export` 同构），GET 会得到
+ *   "Request method 'POST' is not supported"。后端直接回 Excel 流 ⇒ requestBlob。
+ * ★ body 允许为空（`@RequestBody(required=false)`），传 `{}` 也安全。
+ */
+export function exportPatrolSessions(status?: string) {
+  return requestBlob({
+    url: '/api/v1/admin/patrol/sessions/export',
+    method: 'post',
+    data: { status: status || undefined }
+  });
 }

@@ -274,6 +274,29 @@ const noScoreSample = computed(() => distTotal.value === 0);
 const categoriesTotal = computed(() => (data.value?.categories ?? []).reduce((s, c) => s + (c.courseCount ?? 0), 0));
 /** 只判空态行不够：数据行也得收掉，否则屏上是「4 行 0 + 一行空态」 */
 const catRows = computed(() => (categoriesTotal.value ? data.value?.categories ?? [] : []));
+/**
+ * 单行是否「没有已批改成绩」。
+ * ★ 后端在空集上回的是 **0** 而不是 null（2026-11-13 实测 `GET /admin/analytics/school`：
+ *   general / lab 分类 avgScore=0.0、passRate=0.0；elective 有 357 名学生却也是 0.0）。
+ *   直接 `num(0)` 会把「还没批改」显示成「考了 0 分 / 及格率 0%」——语义正好相反，家长/督导会当真。
+ * 判据三档，每档都可核对，不做"看着像 0 就当无数据"的瞎猜：
+ *   ① 行自带 scoreCount 的（院系/课程/教师排行都有）：0 份 ⇒ 无成绩；
+ *   ② 分类行没有 scoreCount：courseCount=0 ⇒ 该类没开课，本来就不是 0 分；
+ *   ③ 分类行有课但「平均分与及格率同时为 0」⇒ 一份都没批（全部批成 0 分且全部不及格的教学场景不存在，
+ *      真出现也是异常数据，显示「—」比显示 0 分更不容易误导）。
+ */
+function noScoreRow(row: {
+  scoreCount?: number | null;
+  courseCount?: number | null;
+  avgScore?: number | null;
+  passRate?: number | null;
+}): boolean {
+  if (row.scoreCount !== undefined && row.scoreCount !== null) return row.scoreCount === 0;
+  if ((row.courseCount ?? 0) === 0) return true;
+  return (row.avgScore ?? 0) === 0 && (row.passRate ?? 0) === 0;
+}
+/** 无成绩行的统一显示（配合 title 说明，避免用户以为加载失败） */
+const NO_SCORE_TIP = '暂无已批改成绩（后端空集返回 0，此处按"无数据"显示）';
 const dpW = (rate: number) => Math.min(100, Math.max(rate > 0 ? 3 : 0, rate));
 /** 份数不足 10 的及格率不稳（5 份里挂 1 份就是 80%），条眼降透明并在口径行里说明 */
 const SMALL_N = 10;
@@ -552,7 +575,7 @@ function buildCsv(): string {
   out.push(csvRow([]));
   out.push(csvRow(['课程分类统计']));
   out.push(csvRow(['类别', '课程数', '学生数', '平均分', '及格率']));
-  for (const c of catRows.value) out.push(csvRow([catText(c.category), c.courseCount, c.studentCount, num(c.avgScore), num(c.passRate, '%')]));
+  for (const c of catRows.value) out.push(csvRow([catText(c.category), c.courseCount, c.studentCount, noScoreRow(c) ? '—' : num(c.avgScore), noScoreRow(c) ? '—' : num(c.passRate, '%')]));
   out.push(csvRow([]));
   out.push(csvRow(['分数段分布']));
   out.push(csvRow(['分数段', '份数']));
@@ -560,15 +583,15 @@ function buildCsv(): string {
   out.push(csvRow([]));
   out.push(csvRow(['院系及格率对比']));
   out.push(csvRow(['院系', '及格率', '成绩份数', '样本偏少']));
-  for (const x of d?.deptPassRates ?? []) out.push(csvRow([x.deptName, num(x.passRate, '%'), x.scoreCount, thinSample(x.scoreCount) ? '是' : '']));
+  for (const x of d?.deptPassRates ?? []) out.push(csvRow([x.deptName, noScoreRow(x) ? '—' : num(x.passRate, '%'), x.scoreCount, thinSample(x.scoreCount) ? '是' : '']));
   out.push(csvRow([]));
   out.push(csvRow(['课程及格率倒数 TOP']));
   out.push(csvRow(['课程', '院系', '平均分', '及格率', '成绩份数', '样本偏少']));
-  for (const x of d?.courseRankings ?? []) out.push(csvRow([x.course, x.dept ?? '—', num(x.avgScore), num(x.passRate, '%'), x.scoreCount, thinSample(x.scoreCount) ? '是' : '']));
+  for (const x of d?.courseRankings ?? []) out.push(csvRow([x.course, x.dept ?? '—', noScoreRow(x) ? '—' : num(x.avgScore), noScoreRow(x) ? '—' : num(x.passRate, '%'), x.scoreCount, thinSample(x.scoreCount) ? '是' : '']));
   out.push(csvRow([]));
   out.push(csvRow(['教师教学排行']));
   out.push(csvRow(['教师', '院系', '课程数', '批改份数', '平均分', '及格率']));
-  for (const x of d?.teacherRankings ?? []) out.push(csvRow([x.teacher, x.dept ?? '—', x.courseCount, x.scoreCount, num(x.avgScore), num(x.passRate, '%')]));
+  for (const x of d?.teacherRankings ?? []) out.push(csvRow([x.teacher, x.dept ?? '—', x.courseCount, x.scoreCount, noScoreRow(x) ? '—' : num(x.avgScore), noScoreRow(x) ? '—' : num(x.passRate, '%')]));
   out.push(csvRow([]));
   out.push(csvRow(['备课与实验进度（教师明细）']));
   out.push(csvRow(['院系', '课程', '教师', '备课完成周', '备课总周', '实验完成次', '实验总次', '备课进度']));
@@ -725,8 +748,8 @@ onMounted(async () => {
                 <td><span class="badge" :class="catCls(i)">{{ catText(c.category) }}</span></td>
                 <td>{{ c.courseCount }}</td>
                 <td>{{ c.studentCount }}</td>
-                <td>{{ num(c.avgScore) }}</td>
-                <td>{{ num(c.passRate, '%' ) }}</td>
+                <td :title="noScoreRow(c) ? NO_SCORE_TIP : ''">{{ noScoreRow(c) ? '—' : num(c.avgScore) }}</td>
+                <td :title="noScoreRow(c) ? NO_SCORE_TIP : ''">{{ noScoreRow(c) ? '—' : num(c.passRate, '%') }}</td>
               </tr>
               <tr v-if="!catRows.length">
                 <td colspan="6" class="center muted" style="padding: 24px">当前筛选范围内没有课程</td>
@@ -744,7 +767,7 @@ onMounted(async () => {
               <span class="dm-label">已批改成绩</span>
             </div>
             <div class="dm-item">
-              <span class="dm-num">{{ num(data.summary?.passRate, '%') }}</span>
+              <span class="dm-num">{{ noScoreSample ? '—' : num(data.summary?.passRate, '%') }}</span>
               <span class="dm-label">及格率</span>
             </div>
           </div>
@@ -759,7 +782,7 @@ onMounted(async () => {
               <div v-for="d in data.deptPassRates ?? []" :key="d.deptId" class="dp-row" :class="{ thin: thinSample(d.scoreCount) }">
                 <span class="dp-name" :title="d.deptName">{{ d.deptName }}</span>
                 <div class="dp-track"><i :style="{ width: dpW(d.passRate) + '%' }" :class="{ low: d.passRate < 60 }"></i></div>
-                <span class="dp-num" :class="{ low: d.passRate < 60 }">{{ num(d.passRate, '%') }}</span>
+                <span class="dp-num" :class="{ low: d.passRate < 60 }" :title="noScoreRow(d) ? NO_SCORE_TIP : ''">{{ noScoreRow(d) ? '—' : num(d.passRate, '%') }}</span>
                 <span class="dp-cnt" :class="{ warn: thinSample(d.scoreCount) }" :title="thinSample(d.scoreCount) ? `仅 ${d.scoreCount} 份成绩，及格率不稳` : ''">{{ d.scoreCount }} 份</span>
               </div>
             </template>
@@ -797,7 +820,7 @@ onMounted(async () => {
             <div v-for="c in courseRanks" :key="c.courseId" class="dp-row" :class="{ thin: thinSample(c.scoreCount) }">
               <span class="dp-name" :title="c.course">{{ c.course }}</span>
               <div class="dp-track"><i class="low" :style="{ width: dpW(c.passRate) + '%' }"></i></div>
-              <span class="dp-num low">{{ num(c.passRate, '%') }}</span>
+              <span class="dp-num low" :title="noScoreRow(c) ? NO_SCORE_TIP : ''">{{ noScoreRow(c) ? '—' : num(c.passRate, '%') }}</span>
               <span class="dp-cnt" :class="{ warn: thinSample(c.scoreCount) }" :title="thinSample(c.scoreCount) ? `仅 ${c.scoreCount} 份成绩，及格率不稳` : ''">{{ c.scoreCount }} 份</span>
             </div>
           </div>
@@ -828,8 +851,11 @@ onMounted(async () => {
               <td class="small muted">{{ t.dept || '—' }}</td>
               <td>{{ t.courseCount }}</td>
               <td>{{ t.scoreCount }}</td>
-              <td>{{ num(t.avgScore) }}</td>
-              <td><span class="badge" :class="t.passRate >= 60 ? 'badge-success' : 'badge-error'">{{ num(t.passRate, '%') }}</span></td>
+              <td :title="noScoreRow(t) ? NO_SCORE_TIP : ''">{{ noScoreRow(t) ? '—' : num(t.avgScore) }}</td>
+              <td>
+                <span v-if="noScoreRow(t)" class="muted" :title="NO_SCORE_TIP">—</span>
+                <span v-else class="badge" :class="t.passRate >= 60 ? 'badge-success' : 'badge-error'">{{ num(t.passRate, '%') }}</span>
+              </td>
             </tr>
           </tbody>
         </table>

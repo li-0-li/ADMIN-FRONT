@@ -2,9 +2,14 @@
 /**
  * G3 · 知识库管理（2026-11-10 派单）
  *
- * 本期硬边界（派单 §二）：后端**没有上传/新增文档端点**（依赖 MinIO，本机未部署）。
- *   ⇒ 只做「查看 + 删除」；上传入口做成**禁用态 + title 说明**，
- *     绝不做一个点了没反应的按钮（验收会把它当 bug）。
+ * ★ 2026-11-13 解禁上传：原注释写「后端没有上传端点」，实测 api-docs 里
+ *   `POST /admin/courses/{courseId}/kb/docs` **在线**（权限点 `admin:kb:upload`）。
+ *   早先判定"没有端点"是因为用 JSON 发请求拿到 Content-Type 错误 —— 那是请求形态错，不是端点不存在。
+ *   ⇒ 上传入口改为可用，按 `admin:kb:upload` 门禁。
+ *
+ * ★ 但真正卡住上传的是**存储**：本机实测该端点回 `{"msg":"文件保存失败","code":500}`
+ *   ⇒ 抽文本、切分块全过了，倒在 `storage.upload()`（MinIO 没起 / `storage.mode` 没切 local）。
+ *   页面必须把这个原因讲明白：否则用户看到红条只会以为是网络问题，反复重试。
  *
  * 数据形态（实测，见 api/admin/knowledge.ts）：
  *   - sources / chunks 都是**裸数组**，没有分页；
@@ -15,14 +20,23 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import { listCourses, type AdminCourseVo } from '@/api/admin/courses';
 import {
+  KB_MAX_BYTES,
+  KB_UPLOAD_ACCEPT,
   indexStatusView,
   listKbChunks,
   listKbSources,
   removeKbChunk,
   removeKbSource,
+  uploadKbDoc,
   type KbChunk,
   type KbSource
 } from '@/api/admin/knowledge';
+import { useUserStore } from '@/store/user';
+
+const userStore = useUserStore();
+/** 上传权限点 `admin:kb:upload`。★ 实测 sys_menu 里**没有这一行**（kb 下只有 3353~3356），
+ *  非超管账号恒 false ⇒ 按钮禁用 + 说明"需补菜单"，不做点了 403 的按钮。 */
+const canUpload = computed(() => userStore.hasPermi('admin:kb:upload'));
 
 const courseOptions = ref<AdminCourseVo[]>([]);
 const courseId = ref('');
@@ -128,6 +142,65 @@ function contentBrief(s?: string | null) {
   return (s ?? '').replace(/\s+/g, ' ').trim() || '（空内容）';
 }
 
+/* ---------------- 上传文档 ---------------- */
+const uploading = ref(false);
+const fileInput = ref<HTMLInputElement | null>(null);
+
+function pickFile() {
+  if (!canUpload.value) return;
+  if (!courseId.value) {
+    ElMessage.warning('先在上面选课程 —— 知识库是按课程存放的');
+    return;
+  }
+  fileInput.value?.click();
+}
+
+async function onFilePicked(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const f = input.files?.[0] ?? null;
+  // 立刻清空，否则选第二次同一个文件不触发 change
+  input.value = '';
+  if (!f) return;
+
+  const ext = (f.name.split('.').pop() ?? '').toLowerCase();
+  if (!['txt', 'md', 'docx', 'pdf'].includes(ext)) {
+    ElMessage.warning(`不支持 .${ext || '无扩展名'}：后端只收 txt / md / docx / pdf`);
+    return;
+  }
+  if (f.size > KB_MAX_BYTES) {
+    ElMessage.warning(`文件 ${(f.size / 1024 / 1024).toFixed(1)}MB 超过 ${KB_MAX_BYTES / 1024 / 1024}MB 上限`);
+    return;
+  }
+
+  uploading.value = true;
+  try {
+    const r = await uploadKbDoc(courseId.value, f);
+    const n = r?.chunkCount ?? r?.chunks ?? null;
+    ElMessage.success(n ? `已入库「${f.name}」，切成 ${n} 个分块` : `已入库「${f.name}」`);
+    await loadAll();
+  } catch (err) {
+    /*
+     * ★ 关键区分：后端 "文件保存失败" 说明**文本抽取和分块都已通过**，只是落存储失败。
+     *   实测本机就是这种情况（MinIO 没起 / storage.mode 没切 local）。
+     *   这时候如果只弹原始文案，用户会反复重试、换文件名，白折腾 —— 必须把原因说透。
+     */
+    const msg = String((err as Error)?.message ?? '');
+    if (/文件保存失败|上传失败|存储不可用/.test(msg)) {
+      ElMessage({
+        type: 'error',
+        duration: 8000,
+        showClose: true,
+        message:
+          '解析与分块已通过，但文件落盘失败：后端对象存储当前不可用（MinIO 未启动，或 storage.mode 未设为 local）。' +
+          '这是环境配置问题，重传或改名都不会成功；需后端/运维处理后再传。'
+      });
+    }
+    /* 其它错误（同名文档已存在、格式不支持、超大小）请求层已弹后端原话 */
+  } finally {
+    uploading.value = false;
+  }
+}
+
 const isEmpty = computed(() => !loading.value && !loadError.value && !sources.value.length && !chunks.value.length);
 
 onMounted(async () => {
@@ -140,14 +213,18 @@ onMounted(async () => {
   <div class="page-head">
     <h1>知识库管理</h1>
     <div class="actions">
-      <!-- 上传：后端没有端点，做禁用态并说明原因（派单 §二要求） -->
-      <el-tooltip content="上传待后端补端点（依赖 MinIO，当前本机未部署）" placement="bottom">
+      <!-- 上传：端点在线（POST /courses/{id}/kb/docs），按 admin:kb:upload 门禁 -->
+      <input ref="fileInput" type="file" :accept="KB_UPLOAD_ACCEPT" style="display: none" @change="onFilePicked" />
+      <el-tooltip v-if="!canUpload" content="缺权限点 admin:kb:upload —— sys_menu 里尚未登记该按钮（kb 下只有 3353~3356），需补菜单后才能授给角色" placement="bottom">
         <span>
           <el-button disabled>
             <ZkIcon name="upload" :size="15" style="margin-right: 5px" />上传文档
           </el-button>
         </span>
       </el-tooltip>
+      <el-button v-else :loading="uploading" @click="pickFile">
+        <ZkIcon name="upload" :size="15" style="margin-right: 5px" />上传文档
+      </el-button>
       <el-button class="tb-icon" :loading="loading" title="刷新" @click="loadAll">
         <ZkIcon v-if="!loading" name="refresh-cw" :size="15" />
       </el-button>
@@ -156,7 +233,10 @@ onMounted(async () => {
 
   <div class="toolbar">
     <div class="left">
-      <span class="small muted">知识库按课程存放；本期只能查看与删除，上传待后端补齐。</span>
+      <span class="small muted">
+        知识库按课程存放。上传支持 txt / md / docx / pdf（单文件 ≤ {{ KB_MAX_BYTES / 1024 / 1024 }}MB），后端会同步抽文本并切分块；
+        同名文档需先删除旧的再传（后端拒绝覆盖）。
+      </span>
     </div>
     <div class="right" style="gap: 10px">
       <el-select v-model="courseId" placeholder="选择课程" filterable style="width: 220px" @change="onCourseChange">
@@ -187,7 +267,7 @@ onMounted(async () => {
     </div>
     <el-skeleton v-if="loading" :rows="2" animated />
     <div v-else-if="!sources.length" class="empty-inline">
-      {{ isEmpty ? '这门课的知识库还是空的（没有文档源）。上传端点待后端补齐后，这里会列出已入库文件。' : '没有文档源。' }}
+      {{ isEmpty ? '这门课的知识库还是空的（没有文档源）。点右上「上传文档」传第一份 txt / md / docx / pdf。' : '没有文档源。' }}
     </div>
     <div v-else class="src-list">
       <div v-for="s in sources" :key="s.sourceFile" class="src-item">
@@ -257,7 +337,7 @@ onMounted(async () => {
             {{ !courseId ? '先选一门课程' : sourceFilter ? '该文档源下没有分块' : '这门课还没有分块' }}
           </div>
           <div class="small muted">
-            {{ !courseId ? '知识库按课程存放。' : sourceFilter ? '换个文档源，或清空筛选。' : '分块由文档上传后自动切分，后端上传端点未提供，所以这里为空是正常的。' }}
+            {{ !courseId ? '知识库按课程存放，先在上面选课程。' : sourceFilter ? '换个文档源，或清空筛选。' : '分块由文档上传后自动切分；还没传过文档时这里自然是空的。' }}
           </div>
         </div>
       </template>
