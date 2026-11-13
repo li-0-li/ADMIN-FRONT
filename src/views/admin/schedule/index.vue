@@ -4693,9 +4693,9 @@ watch(
             style="width: 130px"
           />
           <span v-if="repeatForm.total < repeatForm.weekly * effectiveRepeatTimes" class="small" style="color: var(--warning, #b45309)">
-            不足满额 {{ repeatForm.weekly * effectiveRepeatTimes }} 节：从最后一周往前少排（前满后少）
+            不足满额 {{ repeatForm.weekly * effectiveRepeatTimes }} 课时：从最后一周往前少排（前满后少）
           </span>
-          <span v-else class="small muted">满额 = 每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 周</span>
+          <span v-else class="small muted">共 {{ repeatForm.weekly * effectiveRepeatTimes }} 课时（每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 周）</span>
         </div>
       </el-form-item>
     </el-form>
