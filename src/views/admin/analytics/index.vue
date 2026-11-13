@@ -574,7 +574,7 @@ function buildCsv(): string {
   out.push(csvRow(['课程数', s?.courseCount, '教师数', s?.teacherCount, '学生数', s?.studentCount, '已批改成绩', distTotal.value]));
   out.push(csvRow([]));
   out.push(csvRow(['课程分类统计']));
-  out.push(csvRow(['类别', '课程数', '学生数', '平均分', '及格率']));
+  out.push(csvRow(['类别', '课程数', '选课人次', '平均分', '及格率']));
   for (const c of catRows.value) out.push(csvRow([catText(c.category), c.courseCount, c.studentCount, noScoreRow(c) ? '—' : num(c.avgScore), noScoreRow(c) ? '—' : num(c.passRate, '%')]));
   out.push(csvRow([]));
   out.push(csvRow(['分数段分布']));
@@ -740,7 +740,7 @@ onMounted(async () => {
           <div class="tbl-wrap">
           <table class="tbl">
             <thead>
-              <tr><th>#</th><th>类别</th><th>课程数</th><th>学生数</th><th>平均分</th><th>及格率</th></tr>
+              <tr><th>#</th><th>类别</th><th>课程数</th><th>选课人次</th><th>平均分</th><th>及格率</th></tr>
             </thead>
             <tbody>
               <tr v-for="(c, i) in catRows" :key="c.category">
