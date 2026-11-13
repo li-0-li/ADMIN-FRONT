@@ -3,8 +3,8 @@ import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
-import { autoArrange, createSchedule, deleteSchedule, listCourseOfferings, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules } from '@/api/admin/schedules';
-import type { OfferingBrief, ScheduleCreateBody, ScheduleSwapBody, ScheduleUpdateBody } from '@/api/admin/schedules';
+import { autoArrange, createSchedule, deleteSchedule, fetchClazzPool, listCourseOfferings, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules } from '@/api/admin/schedules';
+import type { ClazzPoolItem, OfferingBrief, ScheduleCreateBody, ScheduleSwapBody, ScheduleUpdateBody } from '@/api/admin/schedules';
 import { deleteCourse } from '@/api/admin/courses';
 import { listClasses, listClassrooms, listMajors, listSchools, listTerms, updateClassroom } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
@@ -174,6 +174,8 @@ const schools = ref<{ schoolId: string; name: string }[]>([]);
 /** 班级名 → 专业名 映射（schedule.target_class 是冗余字符串、无 clazzId 外键，
  *  专业信息只能借基础数据的班级列表接口按名称映射） */
 const clazzMajorMap = ref<Record<string, string>>({});
+/** 班级名 → 主表 clazzId（loadPickers 填充；按班成池下拉只列有主键的班级） */
+const clazzIdByName = ref<Record<string, string>>({});
 
 /**
  * 拉取本周课次。
@@ -2430,6 +2432,12 @@ async function loadPickers() {
       }
       clazzNameList.value = names;
       clazzMajorMap.value = map;
+      /** 班级名 → 主表 clazzId（按班成池 B-9 需要主键定位；主表没登记的班级进不了按班排课） */
+      const ids: Record<string, string> = {};
+      for (const c of clsRes?.list ?? []) {
+        if (c.clazzName && c.clazzId) ids[c.clazzName] = String(c.clazzId);
+      }
+      clazzIdByName.value = ids;
       majorNames.value = (majRes?.list ?? []).map(m => m.name || '').filter(Boolean);
     } catch {
       /* 已在请求层提示 */
@@ -3282,6 +3290,79 @@ async function runAuto() {
   await load(true);
 }
 
+/* ---------- 按班成池（批次5 B-9，后端 f3118e42，2026-11-13） ----------
+ * 录音（11-11）原话「必修课按行政班直接分进去，不让学生选；只有选修课才开放选课」。
+ * 缺口：整建制排课要先想得起"这个班这学期有哪些必修课"，页面此前只能从课程角度反查，
+ * 管理员得自己拼班级→课程清单。这里选班拉池（/schedules/clazz-pool），逐门点「排课」
+ * 复用 autoArrange（幂等，已排的周自动跳过），排完就地刷新计数。
+ * 班级下拉只列班级主表登记过的班（池接口按 clazzId 定位）——主表没登记的班先去基础数据补档。 */
+const poolVisible = ref(false);
+const poolLoading = ref(false);
+const poolClazzId = ref('');
+const poolClazzName = computed(() => {
+  const hit = Object.entries(clazzIdByName.value).find(([, v]) => v === poolClazzId.value);
+  return hit?.[0] || '';
+});
+const poolRows = ref<ClazzPoolItem[]>([]);
+const poolRunningKey = ref('');
+const poolResults = ref<string[]>([]);
+/** 有主键的班级下拉选项（名→id），按名排序 */
+const poolClazzOptions = computed(() =>
+  Object.entries(clazzIdByName.value)
+    .map(([label, value]) => ({ label, value }))
+    .sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans-CN'))
+);
+/** 行是否已排满（scheduledCount ≥ 周数）——已排满仍可重排（幂等跳过），只做提示不拦 */
+function poolFull(r: ClazzPoolItem) {
+  const sc = r.scheduledCount ?? 0;
+  return sc > 0 && r.weekCount != null && sc >= r.weekCount;
+}
+
+async function openClazzPool() {
+  poolVisible.value = true;
+  poolResults.value = [];
+  poolRows.value = [];
+  poolClazzId.value = '';
+  await loadPickers();
+}
+
+async function loadPool() {
+  if (!poolClazzId.value) {
+    poolRows.value = [];
+    return;
+  }
+  poolLoading.value = true;
+  poolResults.value = [];
+  try {
+    poolRows.value = await fetchClazzPool(poolClazzId.value);
+  } catch {
+    poolRows.value = [];
+  } finally {
+    poolLoading.value = false;
+  }
+}
+
+/** 逐门自动排课：targetClass 固定传所选班级（池是按班拉出来的，别让 offering 首选班把课带去别的班） */
+async function runPoolRow(row: ClazzPoolItem) {
+  if (poolRunningKey.value) return;
+  const key = String(row.offeringId);
+  poolRunningKey.value = key;
+  try {
+    const rows = await autoArrange({ offeringId: row.offeringId, targetClass: poolClazzName.value || undefined });
+    for (const r of rows ?? []) {
+      const name = r.courseName || row.courseName;
+      const placed = r.arranged ?? r.weeksPlaced?.length ?? 0;
+      if (placed > 0) poolResults.value.push(`「${name}」→ 已排 ${placed}/${r.totalWeeks ?? '?'} 周`);
+      else poolResults.value.push(`「${name}」→ 本学期各周已有课次或无空档，未排新课次`);
+    }
+  } catch (err) {
+    poolResults.value.push(`「${row.courseName}」→ ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    poolRunningKey.value = '';
+  }
+  await Promise.all([loadPool(), load(true)]);
+}
+
 /* ---------- 批量放回待排（2026-10-30）：课程级批量入口 ----------
  * 缺口：原来只有单节放回（C-22：拖到池子 / 详情弹窗）⇒ 取消整门课要重复 21 次；
  *   10-29 清空整张课表（417 条）时页面根本没有入口，是走接口脚本删的。
@@ -3543,6 +3624,15 @@ watch(
       </button>
       <button class="btn btn-primary" title="把待排课程自动找空闲时段排入课表" @click="openAuto">
         <ZkIcon name="zap" :size="16" style="margin-right: 4px" />自动排课
+      </button>
+      <!-- 按班排课（批次5 B-9）：录音「必修课按行政班直接分进去」——选班拉必修课清单，逐门自动排 -->
+      <button
+        class="btn btn-outline"
+        type="button"
+        title="按行政班整建制排课：选一个班，拉出本学期面向该班的必修课清单，逐门自动排入课表"
+        @click="openClazzPool"
+      >
+        <ZkIcon name="layers" :size="16" style="margin-right: 4px" />按班排课
       </button>
     </div>
   </div>
@@ -4696,6 +4786,67 @@ watch(
         <el-button :disabled="autoRunning" @click="autoVisible = false">取消</el-button>
         <el-button type="primary" :loading="autoRunning" :disabled="!autoSelected.length" @click="runAuto">开始排课</el-button>
       </span>
+    </template>
+  </el-dialog>
+
+  <!-- 按班成池（批次5 B-9）：选班 → 本学期必修课池 → 逐门自动排（复用 autoArrange 幂等） -->
+  <el-dialog v-model="poolVisible" title="按班排课（必修课整建制）" width="720px">
+    <p class="small" style="margin-top: 0">
+      选一个行政班，列出本学期面向该班的<b>必修课</b>（按开课记录的面向班级精确匹配）；逐门点「排课」会自动找空闲时段铺满教学周，
+      已排过的周自动跳过（重复执行不产生重复课）。班级下拉来自班级主表，没登记的班先去「基础数据 → 班级」补档。
+    </p>
+    <div class="detail-row">
+      <span class="detail-k">班级</span>
+      <div style="flex: 1; min-width: 0">
+        <el-select
+          v-model="poolClazzId"
+          placeholder="选择行政班"
+          filterable
+          style="width: 100%"
+          :loading="poolLoading"
+          @change="loadPool"
+        >
+          <el-option v-for="o in poolClazzOptions" :key="o.value" :label="o.label" :value="o.value" />
+        </el-select>
+      </div>
+    </div>
+    <template v-if="poolClazzId">
+      <el-table :data="poolRows" v-loading="poolLoading" height="300" size="small" style="margin-top: 8px">
+        <el-table-column prop="courseName" label="课程" min-width="140" show-overflow-tooltip />
+        <el-table-column prop="teacherName" label="教师" width="110">
+          <template #default="{ row }">{{ row.teacherName || '未定' }}</template>
+        </el-table-column>
+        <el-table-column label="教学周" width="130">
+          <template #default="{ row }">第 {{ row.weekFrom ?? 1 }} 周起 · {{ row.weekCount ?? '—' }} 周</template>
+        </el-table-column>
+        <el-table-column label="已排" width="120">
+          <template #default="{ row }">
+            <span :class="{ muted: !poolFull(row) }">{{ row.scheduledCount ?? 0 }} 次</span>
+            <el-tag v-if="poolFull(row)" size="small" type="success" style="margin-left: 6px">已排满</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="96">
+          <template #default="{ row }">
+            <el-button
+              link
+              type="primary"
+              size="small"
+              :loading="poolRunningKey === String(row.offeringId)"
+              :disabled="!!poolRunningKey && poolRunningKey !== String(row.offeringId)"
+              @click="runPoolRow(row)"
+            >排课</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <p v-if="!poolLoading && !poolRows.length" class="small muted" style="margin: 8px 0 0">
+        本学期没有面向「{{ poolClazzName || '该班' }}」的必修开课记录（先到课程管理给课程登记面向班级与开课）。
+      </p>
+      <ul v-if="poolResults.length" class="small" style="padding-left: 18px; line-height: 2; margin: 10px 0 0">
+        <li v-for="(t, i) in poolResults" :key="'pr' + i">{{ t }}</li>
+      </ul>
+    </template>
+    <template #footer>
+      <el-button @click="poolVisible = false">关闭</el-button>
     </template>
   </el-dialog>
 

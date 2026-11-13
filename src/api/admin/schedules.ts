@@ -220,3 +220,30 @@ export async function listCourseOfferings(courseId: string | number) {
   });
   return Array.isArray(data) ? data : [];
 }
+
+/* ---------------- B-9 按班成池（批次5，后端 f3118e42，2026-11-13） ----------------
+ * 录音口径（11-11）：「必修课按行政班直接分进去，不让学生选；只有选修课才开放选课」。
+ * 选一个行政班 → 拉本学期面向该班的必修开课清单（offering.target_classes json_contains 精确匹配），
+ * 排课动作仍复用 autoArrange（逐门下发），本接口只负责按班成池。
+ * scheduledCount = 该开课已排课次数（deleted=0），满周前端提示「已排完」，避免重复自动排课全被幂等跳过。
+ */
+export interface ClazzPoolItem {
+  offeringId: string;
+  courseId: string;
+  courseName: string;
+  teacherId?: string | null;
+  teacherName?: string | null;
+  weekFrom?: number | null;
+  weekCount?: number | null;
+  termId?: string | null;
+  termCode?: string | null;
+  scheduledCount?: number | null;
+}
+export async function fetchClazzPool(clazzId: string | number, termId?: string | number) {
+  const data = await request<ClazzPoolItem[]>({
+    url: '/api/v1/admin/schedules/clazz-pool',
+    method: 'get',
+    params: { clazzId: String(clazzId), ...(termId ? { termId: String(termId) } : {}) }
+  });
+  return Array.isArray(data) ? data : [];
+}
