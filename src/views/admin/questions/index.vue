@@ -16,6 +16,7 @@
 import { computed, onMounted, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
+import { useUserStore } from '@/store/user';
 import { listCourses, type AdminCourseVo } from '@/api/admin/courses';
 import {
   DIFFICULTY_OPTIONS,
@@ -60,6 +61,19 @@ const loadError = ref('');
 const query = reactive({ page: 1, pageSize: 10, qType: '', difficulty: '' as number | string, keyword: '' });
 
 const hasFilter = computed(() => !!(query.qType || query.difficulty !== '' || query.keyword.trim()));
+
+/* ---------------- 权限门禁（2026-11-15 补）
+ * 权限点与后端 `AdminQuestionController` 的 @PreAuthorize 一一对应（sys_menu 3378~3382 已登记）：
+ *   list=列表  query=详情  add=新增  edit=编辑  remove=删除
+ * 页面本身由 list 权限把门（无 list 时后端 403，列表报错），所以这里只管三个写动作。
+ * 观感与 courses 页一致：无权限直接不出按钮，而不是 disabled —— 免得用户反复点一个永远点不动的按钮。
+ */
+const userStore = useUserStore();
+const canAdd = computed(() => userStore.hasPermi('admin:questions:add'));
+const canEdit = computed(() => userStore.hasPermi('admin:questions:edit'));
+const canRemove = computed(() => userStore.hasPermi('admin:questions:remove'));
+/** 三个写权限一个都没有 ⇒ 页头挂「只读」徽标，说明为什么看不到新增/编辑/删除 */
+const readOnly = computed(() => !canAdd.value && !canEdit.value && !canRemove.value);
 
 async function fetchList() {
   if (!courseId.value) {
@@ -189,6 +203,10 @@ function resetForm() {
 }
 
 function openCreate() {
+  if (!canAdd.value) {
+    ElMessage.warning('当前账号没有新增题目的权限');
+    return;
+  }
   if (!courseId.value) {
     ElMessage.warning('先选一门课程，题目要挂在课程下');
     return;
@@ -199,6 +217,10 @@ function openCreate() {
 }
 
 async function openEdit(row: QuestionVo) {
+  if (!canEdit.value) {
+    ElMessage.warning('当前账号没有编辑题目的权限');
+    return;
+  }
   editingId.value = row.questionId;
   resetForm();
   dialogVisible.value = true;
@@ -351,6 +373,10 @@ async function submitForm() {
 
 /* ---------------- 删除 ---------------- */
 async function doRemove(row: QuestionVo) {
+  if (!canRemove.value) {
+    ElMessage.warning('当前账号没有删除题目的权限');
+    return;
+  }
   try {
     await ElMessageBox.confirm(
       `删除后各学期同一课程都不可见（题库基于基础课程，不是只影响当前学期）。确认删除「${contentBrief(row.content).slice(0, 20)}…」？`,
@@ -381,7 +407,10 @@ onMounted(async () => {
   <div class="page-head">
     <h1>题库管理</h1>
     <div class="actions">
-      <el-button v-if="courseId" type="primary" @click="openCreate">
+      <el-tag v-if="readOnly" size="small" type="info" effect="plain" style="margin-right: 8px">
+        只读：当前账号无题库编辑权限
+      </el-tag>
+      <el-button v-if="courseId && canAdd" type="primary" @click="openCreate">
         <ZkIcon name="plus" :size="15" style="margin-right: 4px" />新增题目
       </el-button>
     </div>
@@ -449,11 +478,11 @@ onMounted(async () => {
       <el-table-column label="创建时间" width="160">
         <template #default="{ row }">{{ row.createTime || '—' }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="150" fixed="right">
+      <el-table-column label="操作" :width="canEdit || canRemove ? 150 : 80" fixed="right">
         <template #default="{ row }">
           <el-button link size="small" @click="openDetail(row)">查看</el-button>
-          <el-button link size="small" @click="openEdit(row)">编辑</el-button>
-          <el-button link size="small" type="danger" @click="doRemove(row)">删除</el-button>
+          <el-button v-if="canEdit" link size="small" @click="openEdit(row)">编辑</el-button>
+          <el-button v-if="canRemove" link size="small" type="danger" @click="doRemove(row)">删除</el-button>
         </template>
       </el-table-column>
 
@@ -466,11 +495,12 @@ onMounted(async () => {
           <div v-if="!courseId" class="small muted">题库按课程存放，选好课程后这里会列出它的全部题目。</div>
           <div v-else-if="loadError" class="small muted">{{ loadError }}</div>
           <div v-else-if="hasFilter" class="small muted">题型 / 难度 / 关键词可能把结果排除了，清空条件即可看到全部。</div>
-          <div v-else class="small muted">点右上角「新增题目」录入第一道题。</div>
+          <div v-else-if="canAdd" class="small muted">点右上角「新增题目」录入第一道题。</div>
+          <div v-else class="small muted">这门课还没有题目；当前账号无新增权限，请联系有权限的同事录入。</div>
           <div class="empty-actions">
             <el-button v-if="loadError" size="small" @click="fetchList">重新加载</el-button>
             <el-button v-else-if="hasFilter" size="small" @click="resetQuery">清空筛选</el-button>
-            <el-button v-else-if="courseId" size="small" @click="openCreate">新增题目</el-button>
+            <el-button v-else-if="courseId && canAdd" size="small" @click="openCreate">新增题目</el-button>
           </div>
         </div>
       </template>

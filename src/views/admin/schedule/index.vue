@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
+import { useUserStore } from '@/store/user';
 import { autoArrange, createSchedule, deleteSchedule, fetchClazzPool, listCourseOfferings, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules, updateLessonStatus } from '@/api/admin/schedules';
 import type { ClazzPoolItem, OfferingBrief, ScheduleCreateBody, ScheduleSwapBody, ScheduleUpdateBody } from '@/api/admin/schedules';
 import { deleteCourse } from '@/api/admin/courses';
@@ -154,6 +155,43 @@ const loadError = ref(false);
 const filters = reactive({ courseId: '', teacherId: '', clazzName: '', classroomId: '', major: '', termId: '', schoolId: '' });
 /** 任一维度处于筛选中 ⇒ 工具栏出现「清空筛选」总入口 */
 const anyFilter = computed(() => Object.values(filters).some(v => v !== ''));
+
+/* ---------------- 权限门禁（2026-11-15 补）
+ * 权限点与后端 `AdminScheduleController` 的 @PreAuthorize 一一对应（sys_menu 3280/3290~3295/3302/
+ * 3349/3368/3369/3370 已登记）。后端 10 个里前端用到 9 个：
+ *   create=新建课次/手动排课/点空格/拖入新课程   update=拖动已有课次·改详情·撤销
+ *   swap=两节课互换   remove=放回待排（单个/批量）   auto=自动排课
+ *   clazzPool=按班排课   publish=发布课表   lessonStatus=课次状态调整（停课/补课）
+ *   batch 后端的批量排课端点前端没有调用入口，故不设门禁，免得留一个永远 false 的开关。
+ * 「删除课程」走的是 AdminCourseController 的 remove（admin:courses:remove），不是 schedules 的。
+ * 观感与 courses/questions 一致：无权限直接不出按钮；拖拽这类无按钮入口在函数开头拦并说明原因。
+ */
+const userStore = useUserStore();
+const canCreate = computed(() => userStore.hasPermi('admin:schedules:create'));
+const canUpdate = computed(() => userStore.hasPermi('admin:schedules:update'));
+const canSwap = computed(() => userStore.hasPermi('admin:schedules:swap'));
+const canRemoveSch = computed(() => userStore.hasPermi('admin:schedules:remove'));
+const canAuto = computed(() => userStore.hasPermi('admin:schedules:auto'));
+const canClazzPool = computed(() => userStore.hasPermi('admin:schedules:clazzPool'));
+const canPublish = computed(() => userStore.hasPermi('admin:schedules:publish'));
+const canLessonStatus = computed(() => userStore.hasPermi('admin:schedules:lessonStatus'));
+const canCourseRemove = computed(() => userStore.hasPermi('admin:courses:remove'));
+/** 「所有教室」弹窗里改容量/位置走 AdminBasicDataController 的 classrooms 编辑端点 */
+const canRoomEdit = computed(() => userStore.hasPermi('admin:classrooms:edit'));
+/** 一个写权限都没有 ⇒ 顶部挂只读提示，解释为什么既没有按钮也拖不动 */
+const readOnly = computed(
+  () =>
+    !canCreate.value &&
+    !canUpdate.value &&
+    !canSwap.value &&
+    !canRemoveSch.value &&
+    !canAuto.value &&
+    !canClazzPool.value &&
+    !canPublish.value &&
+    !canLessonStatus.value &&
+    !canCourseRemove.value &&
+    !canRoomEdit.value
+);
 function clearFilters() {
   filters.courseId = '';
   filters.teacherId = '';
@@ -331,6 +369,10 @@ const roomEditForm = reactive<Classroom>({
   remark: ''
 });
 function openRoomEdit(row: Classroom) {
+  if (!canRoomEdit.value) {
+    ElMessage.warning('当前账号没有编辑教室的权限（admin:classrooms:edit）');
+    return;
+  }
   Object.assign(roomEditForm, {
     classroomId: row.classroomId,
     name: row.name ?? '',
@@ -1673,6 +1715,16 @@ async function handleDrop(weekday: number, periodNo: number, targetCardId: strin
   draggingCourse.value = null;
 
   if (!movingCell && !newCourse) return;
+  // ★ 权限闸（2026-11-15）：拖拽是最主要的写入口，没有按钮可隐藏 ⇒ 在落点统一判，
+  //   且必须在改任何本地状态之前返回（上面已清空 dragging，视图状态无副作用）。
+  if (movingCell && !canUpdate.value) {
+    ElMessage.warning('当前账号没有调整课次的权限（admin:schedules:update），这次拖动没生效');
+    return;
+  }
+  if (newCourse && !canCreate.value) {
+    ElMessage.warning('当前账号没有新建课次的权限（admin:schedules:create），拖入未生效');
+    return;
+  }
   // ★ 写请求进行中：不静默丢弃，明确告诉用户这次为什么没生效
   //   （窗口已缩小到只剩写请求本身，回读不再算"保存中"）
   if (busy.value) {
@@ -1862,6 +1914,11 @@ async function applyUndoEntry(entry: UndoAction): Promise<UndoStep> {
 async function undoLast() {
   const entry = historyStack.value[historyStack.value.length - 1];
   if (!entry || busy.value) return;
+  // 撤销是按条目类型回放（move/edit→update、create→remove），两类权限都没有就没法撤
+  if (!canUpdate.value && !canRemoveSch.value) {
+    ElMessage.warning('当前账号没有调整课次的权限，无法撤回');
+    return;
+  }
   busy.value = true;
   const r = await applyUndoEntry(entry);
   if (r.state === 'failed') {
@@ -1965,6 +2022,11 @@ async function doMove(cell: ScheduleCell, weekday: number, periodNo: number) {
  * ★ 同样不做乐观更新：后端可能因第三方冲突整体不写，先落库再刷新。
  */
 async function doSwap(from: ScheduleCell, to: ScheduleCell) {
+  // 互换走的是另一个端点（admin:schedules:swap），与「移动」分开授权；入口在拖到已占用卡片时
+  if (!canSwap.value) {
+    ElMessage.warning('当前账号没有互换课次的权限（admin:schedules:swap），这次互换没生效');
+    return;
+  }
   const fromLabel = from.courseName ?? '该课次';
   const toLabel = to.courseName ?? '该课次';
   const fromSlot = `周${CN[(from.weekday ?? 1) - 1]} ${PERIODS.find(p => p.seq === from.periodNo)?.label ?? ''}`;
@@ -2001,6 +2063,10 @@ async function doSwap(from: ScheduleCell, to: ScheduleCell) {
 /** C-22 放回待排：**两道确认** → 软删课次 → 课程自动回到待排池 */
 const returning = ref(false);
 async function returnToPool(cell: ScheduleCell) {
+  if (!canRemoveSch.value) {
+    ElMessage.warning('当前账号没有放回待排的权限（admin:schedules:remove）');
+    return;
+  }
   if (!cell || returning.value) return;
   const name = cell.courseName || '该课次';
   const slot = `周${CN[(cell.weekday ?? 1) - 1]} ${PERIODS.find(p => p.seq === cell.periodNo)?.label ?? ''}`;
@@ -2064,6 +2130,10 @@ async function returnToPool(cell: ScheduleCell) {
 const deletingCourse = ref(false);
 async function confirmCourseDelete(courseId: string | number, name: string) {
   if (deletingCourse.value) return;
+  if (!canCourseRemove.value) {
+    ElMessage.warning('当前账号没有删除课程的权限（admin:courses:remove）。如需下线课程请用「停用」');
+    return;
+  }
   if (!courseId) {
     ElMessage.warning('该课次没有关联的课程ID，无法删除课程');
     return;
@@ -2207,6 +2277,10 @@ function lessonStatusText(cell: ScheduleCell) {
 
 async function saveLessonStatus() {
   if (!detailCell.value) return;
+  if (!canLessonStatus.value) {
+    ElMessage.warning('当前账号没有课次状态调整的权限（admin:schedules:lessonStatus）');
+    return;
+  }
   lessonSaving.value = true;
   try {
     await updateLessonStatus(detailCell.value.scheduleId, {
@@ -2241,6 +2315,10 @@ async function saveLessonStatus() {
  * ★ 改教室可能撞车（同一时间该教室已被别的课占用）⇒ 后端不落库并回 conflict。
  */
 async function saveDetail() {
+  if (!canUpdate.value) {
+    ElMessage.warning('当前账号没有调整课次的权限（admin:schedules:update）');
+    return;
+  }
   const c = detailCell.value;
   if (!c || !detailDirty.value) return;
   const period = PERIODS.find(p => p.seq === c.periodNo);
@@ -2522,6 +2600,11 @@ async function openCreate(
   periodNo: number | null,
   preset: { courseId?: string; classroomId?: string } = {}
 ) {
+  // 权限闸：点空白格、待排池「+」、拖入新课程都会走到这里，统一在此拦（2026-11-15）
+  if (!canCreate.value) {
+    ElMessage.warning('当前账号没有新建课次的权限（admin:schedules:create）');
+    return;
+  }
   // 课程/教师/班级下拉强制刷新：别处（基础数据/审核/账号）刚新增的无需刷新页面即可选到
   courseList.value = [];
   poolCourses.value = [];
@@ -3095,6 +3178,10 @@ function pickAllEntries(v: boolean) {
 }
 
 function openAuto() {
+  if (!canAuto.value) {
+    ElMessage.warning('当前账号没有自动排课的权限（admin:schedules:auto）');
+    return;
+  }
   if (!poolEntries.value.length) {
     // 池子空有两因：真的没课 / 全被外层筛选挡掉。分开提示，否则用户会以为库里没课。
     if (poolFilterExcluded.value > 0) {
@@ -3399,6 +3486,10 @@ function poolFull(r: ClazzPoolItem) {
 }
 
 async function openClazzPool() {
+  if (!canClazzPool.value) {
+    ElMessage.warning('当前账号没有按班排课的权限（admin:schedules:clazzPool）');
+    return;
+  }
   poolVisible.value = true;
   poolResults.value = [];
   poolRows.value = [];
@@ -3516,6 +3607,10 @@ async function loadReturnGroups() {
 }
 
 async function openReturn() {
+  if (!canRemoveSch.value) {
+    ElMessage.warning('当前账号没有放回待排的权限（admin:schedules:remove）');
+    return;
+  }
   returnPicked.value = [];
   returnGroups.value = [];
   returnCellIds.value = {};
@@ -3538,6 +3633,10 @@ const returnPickCount = computed(() =>
 /** 执行放回：两道确认 → 6 路并发软删 → 回读刷新（失败条目如实计入，不假装成功） */
 async function runReturn() {
   if (returnRunning.value) return;
+  if (!canRemoveSch.value) {
+    ElMessage.warning('当前账号没有放回待排的权限（admin:schedules:remove）');
+    return;
+  }
   const ids = returnPicked.value.flatMap(cid => returnCellIds.value[cid] ?? []);
   if (!ids.length) return;
   try {
@@ -3583,6 +3682,10 @@ async function runReturn() {
  * ★ 新建课次 = 未发布（学生/教师端不可见，卡片带「未发布」灰标）；
  *   点发布后其他端才可见。已发布课次再改动保持已发布（2026-10-19 拍板）。 */
 async function onPublish() {
+  if (!canPublish.value) {
+    ElMessage.warning('当前账号没有发布课表的权限（admin:schedules:publish）');
+    return;
+  }
   try {
     await ElMessageBox.confirm(
       '将把全部未发布的课次设为已发布（整学期范围），学生端/教师端即可看到。已发布过的课次不受影响。确定发布？',
@@ -3677,6 +3780,12 @@ watch(
     <ZkIcon name="info" :size="15" style="flex: none" />
     <span>{{ PERIODS_FALLBACK_TIP }}</span>
   </div>
+  <!-- 只读提示（2026-11-15 补权限门禁）：排课页主交互是拖动，无权限时按钮会消失、拖动会被拦，
+       「东西不见了但没解释」比报错更让人迷惑 ⇒ 页面顶部直接说明缺什么 -->
+  <div v-if="readOnly" class="readonly-banner" role="status">
+    <ZkIcon name="lock" :size="15" style="flex: none" />
+    <span>当前账号对课表为<b>只读</b>：没有排课 / 调整 / 发布权限，拖动与相关按钮均不可用。如需编辑，请管理员在「角色管理」授予排课相关权限。</span>
+  </div>
   <div class="page-head">
     <h1>智能排课</h1>
     <div class="actions">
@@ -3698,6 +3807,7 @@ watch(
            字段正好是录音点名的 课程 / 教师 / 班级 / 教室 / 节次 / 星期，不另做第二套表单；
            教师下拉已放开为全量教师（录音「手动排课也要覆盖所有老师」）。 -->
       <button
+        v-if="canCreate"
         class="btn btn-outline"
         type="button"
         title="手动排课：逐门指定课程、教师、班级、教室与节次星期（也可把下方待排课程直接拖进课表格子）"
@@ -3705,11 +3815,12 @@ watch(
       >
         <ZkIcon name="pencil" :size="16" style="margin-right: 4px" />手动排课
       </button>
-      <button class="btn btn-primary" title="把待排课程自动找空闲时段排入课表" @click="openAuto">
+      <button v-if="canAuto" class="btn btn-primary" title="把待排课程自动找空闲时段排入课表" @click="openAuto">
         <ZkIcon name="zap" :size="16" style="margin-right: 4px" />自动排课
       </button>
       <!-- 按班排课（批次5 B-9）：录音「必修课按行政班直接分进去」——选班拉必修课清单，逐门自动排 -->
       <button
+        v-if="canClazzPool"
         class="btn btn-outline"
         type="button"
         title="按行政班整建制排课：选一个班，拉出本学期面向该班的必修课清单，逐门自动排入课表"
@@ -3821,7 +3932,7 @@ watch(
       </button>
       <!-- 「添加课程」原按钮名会让人以为在加基础课程（实际上是新建 1 节课次），与页头「手动排课」
            同一个动作 ⇒ 改名对齐，避免两处按钮看着是两个功能 -->
-      <button class="btn btn-outline btn-sm" title="新建 1 节课次（等同页头「手动排课」）" @click="openCreate(null, null)">
+      <button v-if="canCreate" class="btn btn-outline btn-sm" title="新建 1 节课次（等同页头「手动排课」）" @click="openCreate(null, null)">
         <ZkIcon name="plus" :size="13" style="margin-right: 4px" />新建课次
       </button>
       <span v-if="draggingCourse" class="badge badge-info">
@@ -3836,8 +3947,8 @@ watch(
         v-for="c in poolEntries"
         :key="c.key"
         class="pool-chip"
-        draggable="true"
-        :title="`拖动排课（${c.key.startsWith('lesson') ? '排回这 1 节' : '新建 1 节课次'}），或点击打开新增表单：${c.courseName}`"
+        :draggable="canCreate"
+        :title="canCreate ? `拖动排课（${c.key.startsWith('lesson') ? '排回这 1 节' : '新建 1 节课次'}），或点击打开新增表单：${c.courseName}` : '只读：当前账号无新建课次权限'"
         @dragstart="onDragStart(c, $event)"
         @dragend="onDragEnd"
         @click="openCreate(null, null, { courseId: String(c.courseId) })"
@@ -4002,7 +4113,7 @@ watch(
                       ? { top: idx * 3 + 'px', zIndex: c.list.length - idx, height: deckGeom(c.list.length).cardH + 'px' }
                       : undefined
                   "
-                  draggable="true"
+                  :draggable="canUpdate"
                   role="button"
                   :tabindex="cardTabindex(c.weekday, row.period.seq, s.scheduleId)"
                   :aria-label="cardAria(s, c.list.length)"
@@ -4216,6 +4327,7 @@ watch(
       <span class="small muted">拖动调课：拖到空格即移动 · 拖到已有课可并入或互换（同一教师只能互换）</span>
       <span class="spacer" style="flex: 1"></span>
       <button
+        v-if="canRemoveSch"
         class="btn btn-outline"
         :disabled="!allCells.length"
         title="按课程把课次批量退回待排池（可选整学期 / 本周），与单节放回同一个软删端点"
@@ -4223,7 +4335,7 @@ watch(
       >
         <ZkIcon name="undo-2" :size="13" style="margin-right: 4px" />批量放回
       </button>
-      <button class="btn btn-primary" @click="onPublish">发布课表</button>
+      <button v-if="canPublish" class="btn btn-primary" @click="onPublish">发布课表</button>
     </div>
   </div>
 
@@ -4382,7 +4494,7 @@ watch(
         <span class="detail-k">课次状态</span>
         <div style="flex: 1; min-width: 0">
           <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
-            <el-radio-group v-model="lessonForm.lessonStatus" size="small">
+            <el-radio-group v-model="lessonForm.lessonStatus" size="small" :disabled="!canLessonStatus">
               <el-radio-button value="normal">正常</el-radio-button>
               <el-radio-button value="canceled">停课</el-radio-button>
               <el-radio-button value="makeup">补课</el-radio-button>
@@ -4394,11 +4506,11 @@ watch(
               filterable
               size="small"
               style="width: 158px"
-              :disabled="lessonForm.lessonStatus === 'canceled'"
+              :disabled="!canLessonStatus || lessonForm.lessonStatus === 'canceled'"
             >
               <el-option v-for="t in teacherList" :key="t.value" :label="t.label" :value="t.value" />
             </el-select>
-            <el-button size="small" type="primary" plain :loading="lessonSaving" @click="saveLessonStatus">
+            <el-button v-if="canLessonStatus" size="small" type="primary" plain :loading="lessonSaving" @click="saveLessonStatus">
               保存状态
             </el-button>
           </div>
@@ -4409,6 +4521,7 @@ watch(
             maxlength="200"
             size="small"
             style="margin-top: 6px"
+            :disabled="!canLessonStatus"
           />
           <div
             v-if="detailCell.lessonStatus && detailCell.lessonStatus !== 'normal'"
@@ -4419,7 +4532,7 @@ watch(
           </div>
         </div>
       </div>
-      <p class="move-hint">
+      <p v-if="canUpdate || canSwap" class="move-hint">
         <ZkIcon name="move" :size="14" />
         <span>拖动这张卡片即可改上课时间：<b>拖到空格即移动 · 拖到别的教师的课可并入或互换 · 拖到同一教师的课只能互换</b></span>
       </p>
@@ -4429,20 +4542,20 @@ watch(
         <span style="display: inline-flex; gap: 8px">
           <!-- C-23 删除课程：删的是课程主记录（级联删全部课次），双重确认 -->
           <el-button
-            v-if="detailCell?.courseId !== undefined && detailCell?.courseId !== null"
+            v-if="canCourseRemove && detailCell?.courseId !== undefined && detailCell?.courseId !== null"
             type="danger"
             :loading="deletingCourse"
             @click="confirmCourseDelete(detailCell.courseId, detailCell.courseName || '该课程')"
           >
             <ZkIcon name="trash-2" :size="14" style="margin-right: 4px" />删除
           </el-button>
-          <el-button type="danger" plain :loading="returning" @click="detailCell && returnToPool(detailCell)">
+          <el-button v-if="canRemoveSch" type="danger" plain :loading="returning" @click="detailCell && returnToPool(detailCell)">
             <ZkIcon name="undo-2" :size="14" style="margin-right: 4px" />放回待排
           </el-button>
         </span>
         <span>
           <el-button @click="detailVisible = false">关闭</el-button>
-          <el-button type="primary" :loading="detailSaving" :disabled="!detailDirty" @click="saveDetail">
+          <el-button v-if="canUpdate" type="primary" :loading="detailSaving" :disabled="!detailDirty" @click="saveDetail">
             保存调整
           </el-button>
         </span>
@@ -4509,8 +4622,8 @@ watch(
         v-for="c in panelEntries"
         :key="c.key"
         class="panel-card"
-        draggable="true"
-        :title="`拖到课表格子完成排课：${c.courseName}`"
+        :draggable="canCreate"
+        :title="canCreate ? `拖到课表格子完成排课：${c.courseName}` : '只读：当前账号无新建课次权限'"
         @dragstart="onDragStart(c, $event)"
         @dragend="onDragEnd"
       >
@@ -4526,6 +4639,7 @@ watch(
         >已在课表</span>
         </div>
         <button
+          v-if="canCreate"
           class="btn btn-outline btn-sm"
           @click="openCreate(null, null, { courseId: String(c.courseId) }); poolPanelVisible = false"
         >排课</button>
@@ -5054,7 +5168,7 @@ watch(
       <el-table-column prop="remark" label="备注" min-width="100" show-overflow-tooltip>
         <template #default="{ row }">{{ row.remark || '—' }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="70" align="center" fixed="right">
+      <el-table-column v-if="canRoomEdit" label="操作" width="70" align="center" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" @click="openRoomEdit(row)">编辑</el-button>
         </template>
@@ -6250,6 +6364,22 @@ watch(
   border-radius: 8px;
   background: var(--warn-50, #fdf8ec);
   color: var(--warn-700, #8a6116);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+/* 只读提示（2026-11-15）：排课页无写权限时按钮会消失、拖拽被拦，用中性信息色说明原因，
+   不用红/黄警示色——「只读」是权限配置的常态结果，不是错误 */
+.readonly-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 16px 8px;
+  padding: 8px 12px;
+  border: 1px solid #ccd8e8;
+  border-radius: 8px;
+  background: #f3f7fc;
+  color: #3d5573;
   font-size: 12.5px;
   line-height: 1.6;
 }
