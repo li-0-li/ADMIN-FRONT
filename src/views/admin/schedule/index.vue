@@ -221,6 +221,12 @@ const clazzIdByName = ref<Record<string, string>>({});
  */
 /** 请求序号：翻周 / 换筛选会并发多个 load，只让最后一次的结果落盘（旧响应后到会盖掉新周的数据） */
 let loadSeq = 0;
+/**
+ * 学期口径自愈（2026-11-16 P0 的兜底）：只在首次加载、且「带 termId 查 0 行 / 不带 termId 同周有课」时降级一次。
+ * 这个组合正是「学期归属字段接错了表」的症状 —— 真没课的情况（两查都空）不降级，不会把用户骗到别的学期。
+ * 只做一次：用户之后手动选空学期，看到空态是合理预期。
+ */
+let termFallbackTried = false;
 async function load(soft = false) {
   const my = ++loadSeq;
   if (soft) refreshing.value = true;
@@ -243,6 +249,24 @@ async function load(soft = false) {
     });
     if (my !== loadSeq) return;
     const rows = res?.list ?? [];
+    if (!rows.length && filters.termId && !soft && !termFallbackTried) {
+      termFallbackTried = true;
+      const probe = await listSchedules({
+        startDate: weekStartStr.value,
+        endDate: weekEndStr.value,
+        schoolId: filters.schoolId || undefined,
+        page: 1,
+        pageSize: PAGE_SIZE,
+        includeDeleted: true
+      });
+      if (my !== loadSeq) return;
+      if ((probe?.list ?? []).length > 0) {
+        filters.termId = '';
+        ElMessage.warning('按所选学期查不到课次，但同一周其它学期有课 —— 已切到「全部学期」');
+        void load();
+        return;
+      }
+    }
     allCells.value = rows.filter(c => !c.deleted);
     // 软删行 = 本周被放回待排的课次：每条 = 待排池里的一张签（1 节课 1 签，可拖 1 次）
     returnedCells.value = rows.filter(c => !!c.deleted);
@@ -794,6 +818,14 @@ type PoolCourse = CourseBrief & {
   major?: string;
   targetClasses?: string[];
   /**
+   * 课程性质（后端 `AdminCourseVo.courseType`：required 必修 / elective 选修 / core 专业核心 /
+   * public 公共基础 / practice 实验实践 / general 通识选修）。
+   * ★ 2026-11-16 新增：业主口径「**选修课可以没有面向班级，必修课必须面向班级**」——
+   *   「已配置」判定要据此区别对待班级这一项，否则选修课永远进不了自动排课。
+   * ★ `CourseBrief` 契约里没有这个字段（课程池复用该类型），这里就地加宽，不跨界改共享类型。
+   */
+  courseType?: string;
+  /**
    * 三项认证是否全过（后端 AdminCourseVo.certPassed，2026-11-05 新增）。
    * ★ 可选：旧包不下发该字段，certPassed() 里有回退分支，不能按必填用。
    */
@@ -980,6 +1012,38 @@ function certPassed(courseId: string | number | undefined | null): boolean {
  *      宁可先按旧口径归类，也不要把课误塞进未配置栏造成「课都不见了」；
  *   ③ 旧包连 `offeringUnconfigured` 都没有 ⇒ `unknown`（按已配置兜底，理由同 ②）。
  */
+/**
+ * 课程性质 → 是否**不要求**面向班级（2026-11-16 业主口径）。
+ *
+ * 业主原话：「选修课可以没有面向班级，必修课必须面向班级」。
+ * 落地成**白名单放宽**：只有明确登记为选修类（`elective` 选修 / `general` 通识选修）才免班级要求；
+ * `required` 必修 / `core` 专业核心 / `public` 公共基础 / `practice` 实验实践，
+ * 以及**字段为空或历史脏值**，一律按必修严格要求。
+ * ★ 为什么脏值往严里判：库里 `course.course_type` 目前只有 required(13) / elective(8)，
+ *   但缺值随时可能出现（教师端建课不传即为空）。漏判一门选修只是多要一项配置，
+ *   误放一门必修则是「必修课没班级也能自动排课」——课次排出来没有班级归属，前面刚修过这个坑。
+ */
+const ELECTIVE_COURSE_TYPES = new Set(['elective', 'general']);
+function isElectiveCourse(courseType?: string | null): boolean {
+  return ELECTIVE_COURSE_TYPES.has(String(courseType ?? '').trim().toLowerCase());
+}
+
+/**
+ * 「无班级」的占位值（2026-11-16）。
+ *
+ * 历史上没有班级的课次被写成 `未分班` 这类字符串（后端 11-13 起无班级落 NULL，但历史行还在，
+ * 本机库里就有 `schedule.target_class = '未分班'` 的选修课）。它**不是班级名**：
+ * 出现在卡片上会让选修课看起来「有班级」，与「选修 · 可不配班级」自相矛盾；
+ * 参与「必修课必须有班级」的判定时更会放走一门本该补班级的必修课。展示与判定都要先归一。
+ */
+const NO_CLAZZ_TOKENS = new Set([
+  '未分班', '未分班级', '未填班级', '未指定班级', '未指定', '无班级', '无', '-', '—', 'null', 'unknown'
+]);
+function isNoClazzName(name?: string | null): boolean {
+  const s = String(name ?? '').trim();
+  return !s || NO_CLAZZ_TOKENS.has(s.toLowerCase());
+}
+
 type CfgGap = 'rhythm' | 'teacher' | 'clazz';
 interface CfgVerdict {
   cfg: PoolEntry['cfg'];
@@ -990,6 +1054,8 @@ interface CfgVerdict {
 
 function cfgVerdictOf(c: PoolCourse): CfgVerdict {
   const total = Number(c.offeringCount ?? 0);
+  // 班级这一项按课程性质区别对待（2026-11-16 业主口径）：选修课可以没有面向班级
+  const needClazz = !isElectiveCourse(c.courseType);
   const offs = offeringByCourse.value[String(c.courseId)];
   if (offs?.length) {
     const gaps = new Set<CfgGap>();
@@ -1001,8 +1067,12 @@ function cfgVerdictOf(c: PoolCourse): CfgVerdict {
         gaps.add('rhythm');
       }
       if (!o.teacherId) gaps.add('teacher');
-      const clazzes = Array.isArray(o.targetClasses) ? o.targetClasses.filter(x => String(x ?? '').trim()) : [];
-      if (!clazzes.length && !String(o.classKey ?? '').trim()) gaps.add('clazz');
+      // 占位值（`未分班` 等）不算班级：它正是「没登记班级」的历史写法（见 isNoClazzName）
+      const clazzes = (Array.isArray(o.targetClasses) ? o.targetClasses : [])
+        .map(x => String(x ?? '').trim())
+        .filter(x => !isNoClazzName(x));
+      const key = String(o.classKey ?? '').trim();
+      if (needClazz && !clazzes.length && isNoClazzName(key)) gaps.add('clazz');
     }
     const list = [...gaps];
     // 只缺节奏且只缺一部分 ⇒ partial（角标仍写「未配 1/2」，两栏都不进已配置）
@@ -1040,6 +1110,8 @@ interface PoolEntry extends CourseBrief {
   key: string;
   /** 专业（来自课程行，见 `PoolCourse`）：外层「专业」筛选靠它落到池子上 */
   major?: string;
+  /** 课程性质（来自课程行，见 `PoolCourse`）：选修课不要求面向班级，卡片据此解释「为什么它没班级也算配齐」 */
+  courseType?: string;
   /** 课程登记的面向班级（来自课程行，见 `PoolCourse`）：整门没排过的课靠它参与「按班级筛课」 */
   targetClasses?: string[];
   /**
@@ -1297,13 +1369,13 @@ const poolColumns = computed(() => {
     {
       key: 'configured' as PoolColKey,
       title: '已配置课程',
-      hint: '教师、班级、排课设置都齐，可自动排课',
+      hint: '教师、排课设置齐（必修课还要面向班级），可自动排课',
       icon: 'check',
       blank: !total
         ? '本周课程已全部排入课表'
         : cfgChips.length
           ? '没有匹配的课程（清掉栏内搜索/筛选）'
-          : '没有已配置的课——都在右栏，先去补教师 / 班级 / 排课设置',
+          : '没有已配置的课——都在右栏，先去补教师 / 排课设置（必修课补班级）',
       // 徽标数 = 门（一张卡一门），不是节；节的条数在池子 head 上统一报
       count: cfgChips.length,
       entries: cfgChips.filter(e => matchPoolColumn(e, 'configured'))
@@ -1311,13 +1383,13 @@ const poolColumns = computed(() => {
     {
       key: 'unconfigured' as PoolColKey,
       title: '未配置课程',
-      hint: '可手动排课；配好教师·班级·排课设置后才可自动排课',
+      hint: '可手动排课；配好教师·排课设置（必修课还要面向班级）后才可自动排课',
       icon: 'alert-triangle',
       blank: !total
         ? '本周课程已全部排入课表'
         : unChips.length
           ? '没有匹配的课程（清掉栏内搜索/筛选）'
-          : '所有待排课程都已配齐（教师 / 班级 / 排课设置）',
+          : '所有待排课程都已配齐（教师 / 排课设置，必修课还含面向班级）',
       count: unChips.length,
       entries: unChips.filter(e => matchPoolColumn(e, 'unconfigured'))
     }
@@ -1350,7 +1422,7 @@ const poolGapSummary = computed(() => {
     if (g.includes('rhythm')) rhythm += 1;
   }
   const parts: string[] = [];
-  if (clazz) parts.push(`缺班级 ${clazz} 门`);
+  if (clazz) parts.push(`缺班级（必修课）${clazz} 门`);
   if (teacher) parts.push(`缺教师 ${teacher} 门`);
   if (rhythm) parts.push(`缺排课设置 ${rhythm} 门`);
   if (noOffering) parts.push(`无开课记录 ${noOffering} 门`);
@@ -1415,8 +1487,12 @@ function cfgGapTip(e: PoolEntry): string {
   if (gaps.includes('rhythm')) parts.push(`${CFG_GAP_FULL.rhythm}${un && un < total ? `（${total} 条开课记录里 ${un} 条没配）` : ''} 未配`);
   if (gaps.includes('teacher')) parts.push('授课教师未选');
   if (gaps.includes('clazz')) parts.push('面向班级未选');
+  // 判定规则随课程性质不同（2026-11-16）：选修课免班级要求，说明里不能再说成「三项齐备」
+  const rule = isElectiveCourse(e.courseType)
+    ? '节奏、教师两项齐备（选修课不要求面向班级）'
+    : '节奏、教师、班级三项齐备';
   return (
-    `未配置课程：${parts.join('、')} ⇒ 自动排课不收录（节奏、教师、班级三项齐备才进「已配置课程」）；` +
+    `未配置课程：${parts.join('、')} ⇒ 自动排课不收录（${rule}才进「已配置课程」）；` +
     '手动排课不受影响。补：课程管理 → 课程详情 → 开课记录（选授课教师 / 面向班级）与「排课设置」'
   );
 }
@@ -3642,8 +3718,14 @@ function poolSubLabel(entry: PoolEntry): string {
   }
   const sem = (entry.semester ?? '').trim();
   if (sem) parts.push(sem);
-  const clazzes = declaredClazzesOf(entry);
-  if (clazzes?.length) parts.push(clazzes.join('、'));
+  // 占位班级（`未分班`）当「没填」处理：否则选修课卡片会显示成「未分班」，
+  // 看着像真有班级，和下一行的「选修 · 可不配班级」对不上
+  const rawClazzes = declaredClazzesOf(entry) ?? [];
+  const clazzes = rawClazzes.filter(n => !isNoClazzName(n));
+  if (clazzes.length) parts.push(clazzes.join('、'));
+  // 选修课没有面向班级是合法配置（2026-11-16 业主口径）：写出来，免得管理员看到「已配置却没有班级」又犯疑
+  else if (isElectiveCourse(entry.courseType)) parts.push('选修 · 可不配班级');
+  else if (rawClazzes.length) parts.push('班级未填');
   return parts.join(' · ');
 }
 
@@ -5146,7 +5228,7 @@ watch(
         >
           该课属于「未配置课程」（{{ cfgGapSentence(createCourseCfg.gaps) }}）：
           <b>手动排课不受影响</b>，按下面选好时间与周范围即可保存；
-          想以后用「自动排课」省事，到「课程管理 → 课程详情 → 开课记录」补齐授课教师与面向班级，并保存「排课设置」。
+          想以后用「自动排课」省事，到「课程管理 → 课程详情 → 开课记录」补齐授课教师与面向班级（<b>选修课可不填班级</b>），并保存「排课设置」。
         </div>
       </el-form-item>
       <el-form-item label="授课教师" required>
@@ -5416,9 +5498,9 @@ watch(
       <div v-if="autoNotConfigured" class="detail-row">
         <span class="detail-k">未配置</span>
         <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">
-          还有 <b>{{ autoNotConfigured }}</b> 条课属于「未配置课程」（缺教师 / 缺班级 / 缺排课设置 / 没有开课记录），
+          还有 <b>{{ autoNotConfigured }}</b> 条课属于「未配置课程」（缺教师 / 必修课缺班级 / 缺排课设置 / 没有开课记录），
           <b>不在本次候选里</b>；这些课<b>仍可手动排课</b>（待排池里点它或直接拖到格子）。
-          想让它们参与自动排课：到「课程管理 → 课程详情 → 开课记录」给每条记录选好<b>授课教师</b>与<b>面向班级</b>，
+          想让它们参与自动排课：到「课程管理 → 课程详情 → 开课记录」给每条记录选好<b>授课教师</b>与<b>面向班级</b>（<b>选修课可不配班级</b>），
           再保存「排课设置」（总节次 / 每周节次 / 周范围）。
         </div>
       </div>
