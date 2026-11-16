@@ -408,6 +408,16 @@ async function submitOffering() {
   }
 }
 
+/** 标题：外部入口（列表点「未配置」/ 抽屉「新增配置」）直接落在第 2 步，
+ *  此时并没有在「新建课程」，标题再说新建会让人以为要重复建课。 */
+const dialogTitle = computed(() => {
+  if (step.value === 1) return '新建课程 · 第 1 步（基础信息）';
+  if (!created.value) return '新建课程';
+  return props.startCourse
+    ? `课程配置 ·「${created.value.courseName}」`
+    : `新建课程 · 第 2 步（「${created.value.courseName}」课程配置）`;
+});
+
 function close() {
   emit('update:visible', false);
 }
@@ -416,7 +426,7 @@ function close() {
 <template>
   <el-dialog
     v-model="visible"
-    :title="step === 1 ? '新建课程 · 第 1 步（基础信息）' : created ? `新建课程 · 第 2 步（「${created.courseName}」课程配置）` : '新建课程'"
+    :title="dialogTitle"
     width="560px"
     :close-on-click-modal="false"
   >

@@ -1153,6 +1153,15 @@ onMounted(async () => {
           <template #default="{ row }">
             <span v-if="row.offeringCount === null || row.offeringCount === undefined" class="muted small">—</span>
             <span v-else-if="row.offeringCount > 0" class="badge badge-success">已配置</span>
+            <!-- 2026-11-16 业主：「未配置」本身就要能点进去配。
+                 改前只能「查看」→ 抽屉里再点「新增配置」，两步且入口不显眼；
+                 现在点徽标直接进配置表单（向导第 2 步），抽屉那条路保持不动。
+                 无 admin:offerings:add 权限时退化成静态徽标，不给死入口。 -->
+            <el-tooltip v-else-if="canOffer" content="点此配置学期 / 授课教师 / 上课班级" placement="top">
+              <button type="button" class="badge badge-neutral badge-action" @click.stop="openOfferFor(row)">
+                未配置<ZkIcon name="chevron-right" :size="11" />
+              </button>
+            </el-tooltip>
             <span v-else class="badge badge-neutral">未配置</span>
           </template>
         </el-table-column>
@@ -1509,6 +1518,32 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+/* 「未配置」徽标本身就是配置入口（2026-11-16 业主：未配置可以直接点未配置进入配置界面）。
+   button 重置成徽标外观：文字走品牌色（状态是"待配置"，品牌色说明可操作）、尾随箭头暗示可点；
+   透明边框占位，hover/focus 换成品牌底，避免整列看起来都是静态文本；
+   padding 右收窄 3px 是为了塞进箭头图标后仍和左边「已配置」徽标同宽同级。 */
+.badge-action {
+  appearance: none;
+  gap: 1px;
+  padding: 2px 6px 2px 9px;
+  border: 1px solid transparent;
+  background: var(--bg-soft);
+  color: var(--brand-600, #2563eb);
+  font-family: inherit;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.badge-action:hover,
+.badge-action:focus-visible {
+  background: var(--brand-50, #eef4ff);
+  border-color: var(--brand-200, #b9d0ff);
+  color: var(--brand-700, #1d4ed8);
+  outline: none;
+}
+.badge-action:active {
+  background: var(--brand-100, #dbe8ff);
+}
+
 /* 失败提示条与空态块：与账号页同款视觉（同类语义在不同页应长得一样） */
 .load-fail {
   display: flex;
