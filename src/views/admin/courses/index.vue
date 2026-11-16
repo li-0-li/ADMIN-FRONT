@@ -50,14 +50,14 @@ const canOffer = computed(() => userStore.hasPermi('admin:offerings:add'));
 /* ---------------- 两步建课向导 ---------------- */
 const dialogVisible = ref(false);
 /** 传给向导的起点：null = 从第 1 步开始；有值 = 直接进第 2 步（为已有课程开课） */
-const dialogCourse = ref<{ courseId: string; courseName: string } | null>(null);
+const dialogCourse = ref<{ courseId: string; courseName: string; hours?: number | null } | null>(null);
 
 function openCreate() {
   dialogCourse.value = null;
   dialogVisible.value = true;
 }
 
-function openOfferFor(course: { courseId: string; courseName: string }) {
+function openOfferFor(course: { courseId: string; courseName: string; hours?: number | null }) {
   dialogCourse.value = course;
   dialogVisible.value = true;
 }
@@ -1324,7 +1324,7 @@ onMounted(async () => {
             type="primary"
             plain
             style="margin-left: 8px"
-            @click="openOfferFor({ courseId: detailCourse.courseId, courseName: detailCourse.courseName })"
+            @click="openOfferFor({ courseId: detailCourse.courseId, courseName: detailCourse.courseName, hours: detailData?.hours ?? detailCourse.hours ?? null })"
           >
             <ZkIcon name="plus" :size="13" style="margin-right: 3px" />{{ (detailData?.offerings ?? []).length ? '追加配置' : '新增配置' }}
           </el-button>

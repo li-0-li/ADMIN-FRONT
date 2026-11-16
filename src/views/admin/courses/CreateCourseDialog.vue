@@ -7,7 +7,8 @@ import {
   checkJoinCode,
   createCourse,
   createOffering,
-  nextCourseNo
+  nextCourseNo,
+  updateOfferingScheduleConfig
 } from '@/api/admin/courses';
 import type { CourseCreateBo } from '@/api/admin/courses';
 import { autoArrange } from '@/api/admin/schedules';
@@ -28,14 +29,15 @@ import type { AdminUserVo } from '@/types/admin';
  * - 同名课只警告不阻断：出参 duplicateName=true 时弹一条可关闭的提示。
  * - step2：term 下拉（GET /terms）、教师下拉（GET /users?roleKey=teacher）、
  *   班级多选（GET /classes）、joinCode 可空（自动 JM+6 位，手填失焦预检）、
- *   weekCount 默认 18（1~30，校验在后端）。
+ *   排课节奏（周范围 / 每周节次 / 总节次，与智能排课同一组字段；
+ *   周跨度即 offering.week_count，不再单列「教学周数」）。
  */
 
 const props = defineProps<{
   /** v-model:visible */
   visible: boolean;
-  /** 传入时直接从 step2 开始（详情抽屉「为这门课开课」入口） */
-  startCourse?: { courseId: string; courseName: string } | null;
+  /** 传入时直接从 step2 开始（详情抽屉「为这门课开课」入口）；hours 用于「按学时算」 */
+  startCourse?: { courseId: string; courseName: string; hours?: number | null } | null;
 }>();
 
 const emit = defineEmits<{
@@ -68,6 +70,11 @@ watch(
     }
     courseNoError.value = '';
     joinCodeError.value = '';
+    // 每次打开都从「整学期、每周 1 节、按周数铺满」起算，避免带上一次填的节奏
+    schedForm.weekFrom = 1;
+    schedForm.weekTo = 18;
+    schedForm.lessonsPerWeek = 1;
+    schedForm.totalLessons = null;
   }
 );
 
@@ -195,8 +202,7 @@ const offerForm = reactive({
   termId: '',
   teacherId: '',
   clazzIds: [] as string[],
-  joinCode: '',
-  weekCount: 18
+  joinCode: ''
 });
 const offerSaving = ref(false);
 const joinChecking = ref(false);
@@ -214,6 +220,63 @@ const offerRules = {
   termId: [{ required: true, message: '请选择学期', trigger: 'change' }],
   teacherId: [{ required: true, message: '请选择授课教师', trigger: 'change' }]
 };
+
+/* ================= step2 · 排课节奏（2026-11-16 业主：配置要和智能排课那边一样） =================
+ * 智能排课的「自动排课」只认 offering 上的这套节奏：week_from / week_count /
+ * lessons_per_week / total_lessons（见「已配置 / 未配置排课节奏」两栏的判定）。
+ * 以前只能在课程详情里对每条已建配置再点「修改配置」补一遍，配一次要跑两趟；
+ * 现在建配置时一并填，POST offerings 成功后立刻 PUT schedule-config，
+ * 配完就能直接进智能排课的「已配置」栏。
+ * 量纲与详情页一致：1 节次 = 2 学时（50 分钟 × 2 + 10 分钟课间）；total_lessons 存【节次】。
+ */
+const HOURS_PER_PERIOD = 2;
+
+const schedForm = reactive({
+  weekFrom: 1,
+  weekTo: 18,
+  lessonsPerWeek: 1,
+  totalLessons: null as number | null
+});
+
+/** 课程学时：详情抽屉带进来的，或 step1 刚填的 */
+const courseHours = computed<number | null>(() => {
+  const h = props.startCourse?.hours ?? baseForm.hours;
+  return h == null || h === ('' as unknown) ? null : Number(h);
+});
+
+const schedPreview = computed(() => {
+  const perWeek = Math.max(1, Math.floor(Number(schedForm.lessonsPerWeek) || 1));
+  const spanWeeks = Math.max(0, (schedForm.weekTo || 0) - (schedForm.weekFrom || 0) + 1);
+  const hours = courseHours.value;
+  const derivedPeriods = hours && hours > 0 ? Math.ceil(hours / HOURS_PER_PERIOD) : null;
+  const periods = schedForm.totalLessons ?? spanWeeks * perWeek;
+  const needWeeks = Math.ceil(Math.max(0, periods) / perWeek);
+  return {
+    hours,
+    perWeek,
+    spanWeeks,
+    periods,
+    needWeeks,
+    derivedPeriods,
+    /** 填的周跨度 ≠ 节次数 ÷ 每周节次（不阻断，只提示） */
+    mismatch: spanWeeks > 0 && needWeeks !== spanWeeks
+  };
+});
+
+function applyHoursDerived() {
+  const { derivedPeriods, perWeek } = schedPreview.value;
+  if (derivedPeriods == null) {
+    ElMessage.warning('该课程未填学时，无法按学时换算，请手工填节次数');
+    return;
+  }
+  schedForm.totalLessons = derivedPeriods;
+  const from = schedForm.weekFrom || 1;
+  const need = Math.ceil(derivedPeriods / perWeek);
+  schedForm.weekTo = Math.min(from + need - 1, 30);
+  ElMessage.success(
+    `已按 ${schedPreview.value.hours} 学时换算：${derivedPeriods} 节次 ÷ 每周 ${perWeek} 节 = ${need} 周`
+  );
+}
 
 /** 下拉数据懒加载：进 step2 才拉一次（terms / teachers(roleKey=teacher) / classes） */
 async function loadOptions() {
@@ -280,6 +343,13 @@ async function submitOffering() {
     ElMessage.warning('请先解决加课码的问题再提交');
     return;
   }
+  // 排课节奏：结束周必须落在学期内，且不早于开始周（与详情页「修改配置」同口径）
+  if (schedForm.weekTo < schedForm.weekFrom) {
+    ElMessage.warning('排课节奏：结束周不能早于开始周');
+    return;
+  }
+  // 周跨度就是这条配置的教学周数（后端 schedule-config 也按 weekCount 写 offering.week_count）
+  const spanWeeks = schedForm.weekTo - schedForm.weekFrom + 1;
   offerSaving.value = true;
   try {
     const res = await createOffering(created.value.courseId, {
@@ -287,19 +357,40 @@ async function submitOffering() {
       teacherId: offerForm.teacherId,
       clazzIds: offerForm.clazzIds.length ? offerForm.clazzIds : undefined,
       joinCode: offerForm.joinCode.trim() ? offerForm.joinCode.trim().toUpperCase() : undefined,
-      weekCount: offerForm.weekCount
+      weekCount: spanWeeks
     });
+    // 紧接着把排课节奏写到这条新配置上（PUT schedule-config），
+    // 否则智能排课那边它仍算「未配置排课节奏」，还得再回详情补一遍。
+    let schedSaved = false;
+    try {
+      await updateOfferingScheduleConfig(res.offeringId, {
+        weekFrom: schedForm.weekFrom,
+        weekCount: spanWeeks,
+        lessonsPerWeek: schedForm.lessonsPerWeek,
+        totalLessons: schedForm.totalLessons
+      });
+      schedSaved = true;
+    } catch {
+      /* request.ts 已弹后端原话；配置本身已落库，不因此回退 */
+    }
     ElMessage.success(
-      `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}`
+      schedSaved
+        ? `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}；排课节奏 第 ${schedForm.weekFrom}~${schedForm.weekTo} 周 · 每周 ${schedForm.lessonsPerWeek} 节`
+        : `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}；排课节奏未保存，可在课程详情里补`
     );
     // 开课成功：清 step2 表单，允许继续为同一门课开第二个学期/班级组合
     offerForm.termId = '';
     offerForm.teacherId = '';
     offerForm.clazzIds = [];
     offerForm.joinCode = '';
-    offerForm.weekCount = 18;
+    schedForm.weekFrom = 1;
+    schedForm.weekTo = 18;
+    schedForm.lessonsPerWeek = 1;
+    schedForm.totalLessons = null;
     joinCodeError.value = '';
     emit('created');
+    // 排课节奏没写进去就别问「要不要自动排课」——后端会按「未配置节奏」跳过，问了必失败
+    if (!schedSaved) return;
     // B-7 / 会议 A3（2026-11-10 接线）：开课成功后询问是否立即自动排课。
     // ★ auto-arrange 失败不影响开课结果（开课已落库，仅提示可去排课页手动处理）；
     //   排课成功则关窗并引导去智能排课页查看。业主拍板「新增的课给他重新排一次」。
@@ -442,9 +533,68 @@ function close() {
         <div v-if="joinCodeError" class="field-error">{{ joinCodeError }}</div>
         <div v-else class="field-tip">学生凭加课码加入；2~20 位大写字母/数字/连字符</div>
       </el-form-item>
-      <el-form-item label="教学周数">
-        <el-input-number v-model="offerForm.weekCount" :min="1" :max="30" style="width: 140px" />
-        <span class="field-tip" style="margin-left: 8px">默认 18，1~30</span>
+      <!-- 排课节奏：与「智能排课」判定用的是同一组字段（周范围 / 每周节次 / 总节次）。
+           它同时就是这条配置的教学周数（offering.week_count = 周跨度），
+           所以不再单列一个「教学周数」输入，避免两处各写一遍互相覆盖。 -->
+      <el-form-item label="排课节奏">
+        <div style="width: 100%">
+          <div class="sched-row">
+            <span class="small">第</span>
+            <el-input-number
+              v-model="schedForm.weekFrom"
+              :min="1"
+              :max="30"
+              size="small"
+              style="width: 84px"
+              controls-position="right"
+            />
+            <span class="small">~ 第</span>
+            <el-input-number
+              v-model="schedForm.weekTo"
+              :min="1"
+              :max="30"
+              size="small"
+              style="width: 84px"
+              controls-position="right"
+            />
+            <span class="small">周　每周</span>
+            <el-input-number
+              v-model="schedForm.lessonsPerWeek"
+              :min="1"
+              :max="7"
+              size="small"
+              style="width: 84px"
+              controls-position="right"
+            />
+            <span class="small">节　共</span>
+            <el-input-number
+              v-model="schedForm.totalLessons"
+              :min="1"
+              :max="500"
+              size="small"
+              style="width: 104px"
+              controls-position="right"
+              placeholder="留空铺满"
+            />
+            <span class="small">节次</span>
+            <el-button size="small" plain @click="applyHoursDerived">按学时算</el-button>
+          </div>
+          <div class="small" :class="schedPreview.mismatch ? 'sched-warn' : 'field-tip'">
+            <template v-if="schedPreview.derivedPeriods !== null">
+              本课 {{ schedPreview.hours }} 学时 = {{ schedPreview.derivedPeriods }} 节次（1 节次 = 2 学时：50 分钟 × 2 + 10
+              分钟课间）；当前 {{ schedPreview.periods }} 节次 ÷ 每周 {{ schedPreview.perWeek }} 节 ⇒ 需
+              {{ schedPreview.needWeeks }} 周，周跨度 {{ schedPreview.spanWeeks }} 周<template v-if="schedPreview.mismatch"
+                >（不一致，点「按学时算」对齐）</template
+              >。
+            </template>
+            <template v-else>
+              本课未填学时，节次数按周跨度 × 每周节次铺满（{{ schedPreview.periods }} 节次）。
+            </template>
+          </div>
+          <div class="field-tip">
+            节次留空 = 按周数 × 每周节次自然铺满；这段节奏会随配置一起保存，智能排课即可直接自动排这门课。
+          </div>
+        </div>
       </el-form-item>
       <!-- 教学大纲不在这里填：它是「认证材料」里的一类，由教师在自己端上传，
            管理端只做配置（学期/教师/班级/加课码/周数），不代填教学材料。 -->
@@ -517,5 +667,20 @@ function close() {
   margin-top: 4px;
   font-size: 12px;
   color: var(--ink-400, #9aa3b2);
+}
+/* 排课节奏：一行控件排布（窄屏自动换行，避免数字框被压扁） */
+.sched-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+/* 节次数与周跨度对不上时的提示（只提示不阻断，与详情页同口径） */
+.sched-warn {
+  width: 100%;
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--warn-700, #8a6116);
 }
 </style>
