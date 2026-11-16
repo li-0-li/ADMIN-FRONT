@@ -196,8 +196,7 @@ const offerForm = reactive({
   teacherId: '',
   clazzIds: [] as string[],
   joinCode: '',
-  weekCount: 18,
-  outline: ''
+  weekCount: 18
 });
 const offerSaving = ref(false);
 const joinChecking = ref(false);
@@ -288,8 +287,7 @@ async function submitOffering() {
       teacherId: offerForm.teacherId,
       clazzIds: offerForm.clazzIds.length ? offerForm.clazzIds : undefined,
       joinCode: offerForm.joinCode.trim() ? offerForm.joinCode.trim().toUpperCase() : undefined,
-      weekCount: offerForm.weekCount,
-      outline: offerForm.outline.trim() || undefined
+      weekCount: offerForm.weekCount
     });
     ElMessage.success(
       `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}`
@@ -300,7 +298,6 @@ async function submitOffering() {
     offerForm.clazzIds = [];
     offerForm.joinCode = '';
     offerForm.weekCount = 18;
-    offerForm.outline = '';
     joinCodeError.value = '';
     emit('created');
     // B-7 / 会议 A3（2026-11-10 接线）：开课成功后询问是否立即自动排课。
@@ -449,8 +446,10 @@ function close() {
         <el-input-number v-model="offerForm.weekCount" :min="1" :max="30" style="width: 140px" />
         <span class="field-tip" style="margin-left: 8px">默认 18，1~30</span>
       </el-form-item>
-      <el-form-item label="教学大纲">
-        <el-input v-model="offerForm.outline" type="textarea" :rows="3" placeholder="本学期大纲，可空" />
+      <!-- 教学大纲不在这里填：它是「认证材料」里的一类，由教师在自己端上传，
+           管理端只做配置（学期/教师/班级/加课码/周数），不代填教学材料。 -->
+      <el-form-item label="教学材料">
+        <span class="field-tip">说课视频、教学教案、教学进度表、教学大纲由教师在教师端上传，此处不填</span>
       </el-form-item>
     </el-form>
 

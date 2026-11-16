@@ -881,6 +881,29 @@ async function openDetail(row: AdminCourseVo) {
   }
 }
 
+/* ---------------- 配置保存后的回读（2026-11-16）----------------
+ * 背景：建课向导 emit('created') 原先只接了 fetchList()，列表刷新了、抽屉里的
+ * `detailData.offerings` 没刷 ⇒ 从抽屉点「新增配置」存完后，抽屉仍停在
+ * 「该课程还没有配置…点上方「新增配置」」的空态，看起来像没保存成功。
+ * 这里在列表刷新之外，若抽屉还开着就按当前课程重拉一次详情。
+ */
+async function onOfferingSaved() {
+  await fetchList();
+  const courseId = detailCourse.value?.courseId;
+  if (!detailVisible.value || !courseId) return;
+  // 顺带把抽屉顶部读的那行快照（配置数等）换成列表里的最新值
+  const fresh = rows.value.find((r) => String(r.courseId) === String(courseId));
+  if (fresh) detailCourse.value = fresh;
+  detailOfferLoading.value = true;
+  try {
+    detailData.value = await getCourse(courseId);
+  } catch {
+    /* 拉不到就保留旧数据，不打断抽屉 */
+  } finally {
+    detailOfferLoading.value = false;
+  }
+}
+
 /* ---------------- 删除课程（C-23 · G5 定案语义，2026-11-06）----------------
  * 后端语义（AdminCourseServiceImpl.deleteCourse 重写后）：查开课记录数与课次数，
  * 任一 > 0 ⇒ 业务码 40904 拒绝（"该课程已有开课记录/课次，不可删除；如需下线请使用停用"）；
@@ -1303,7 +1326,7 @@ onMounted(async () => {
             style="margin-left: 8px"
             @click="openOfferFor({ courseId: detailCourse.courseId, courseName: detailCourse.courseName })"
           >
-            <ZkIcon name="plus" :size="13" style="margin-right: 3px" />新增配置
+            <ZkIcon name="plus" :size="13" style="margin-right: 3px" />{{ (detailData?.offerings ?? []).length ? '追加配置' : '新增配置' }}
           </el-button>
         </div>
         <div v-loading="detailOfferLoading">
@@ -1446,7 +1469,7 @@ onMounted(async () => {
 
   <!-- 两步建课向导（T-01）：page-head「新建课程」从第 1 步进；
        抽屉「新增课程配置」带 startCourse 直接进第 2 步 -->
-  <CreateCourseDialog v-model:visible="dialogVisible" :start-course="dialogCourse" @created="fetchList" />
+  <CreateCourseDialog v-model:visible="dialogVisible" :start-course="dialogCourse" @created="onOfferingSaved" />
 </template>
 
 <style scoped>
