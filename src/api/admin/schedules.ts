@@ -11,14 +11,9 @@ import type {
 } from '@/types/admin';
 
 /**
- * ★ 后端接口路径有两个版本并存（实测踩到，不是猜的）：
- *   · `/api/v1/schedules` —— 当前本机运行的 jar（旧产物）只认这个；
- *   · `/api/v1/admin/schedules` —— 团队仓源码里 `AdminScheduleController` 已改成带 admin 前缀
- *     （类注释：「与学生端 ScheduleController 同仓共存需错开」），但还没重新打包。
- *   `/api/v1/courses` 同理（dashboard.ts 的注释早就记过同一现象）。
- *
- *   ⇒ 不做「赌哪一版」，改为**首次调用一次性探测并缓存**：按候选顺序试，命中「无此资源」再回退。
- *     后端以后重打包成哪一版，前端都不用改。
+ * ★ 端点路径：曾经两个版本并存（`/api/v1/schedules` 旧包 / `/api/v1/admin/schedules` 新源码），
+ *   靠「首次调用探测 + 缓存」兜底。2026-11-16 已定版 admin 前缀，排课端点固定走常量 `SCHEDULE_BASE`；
+ *   课程端点（`coursePath`）仍保留探测，因为它也挂在同一批旧 jar 上，收敛需随换包进行。
  */
 const SUCCESS = new Set([0, 200]);
 
@@ -75,23 +70,25 @@ function pathResolver(candidates: readonly string[], probeParams: Record<string,
   };
 }
 
-const schedulePath = pathResolver(['/api/v1/admin/schedules', '/api/v1/schedules'], {
-  startDate: '1970-01-01',
-  endDate: '1970-01-01',
-  page: 1,
-  pageSize: 1
-});
-
 const coursePath = pathResolver(['/api/v1/admin/courses', '/api/v1/courses'], { page: 1, pageSize: 1 });
+
+/**
+ * 排课端点定版为 admin 前缀（2026-11-16 · 报告 P2-3）。
+ * ★ 原来这里挂的是「一次性探测并缓存」的双候选（`/api/v1/admin/schedules` 与 `/api/v1/schedules`），
+ *   探测会把真正的 0 行 / 500 一起吞掉：旧路径恒返回 0 行时，页面看着像「本周没课」而不是「调错了端点」。
+ *   现已确认真实端点为 `/api/v1/admin/schedules`（`AdminScheduleController` 类级 @RequestMapping），
+ *   候选列表整个删掉，调用失败就直接暴露。
+ */
+const SCHEDULE_BASE = '/api/v1/admin/schedules';
 
 /** C-16 周课表查询。★ startDate / endDate 必填，缺则后端 code=422 */
 export async function listSchedules(query: ScheduleQuery) {
-  return request<PageResult<ScheduleCell>>({ url: await schedulePath(), method: 'get', params: query });
+  return request<PageResult<ScheduleCell>>({ url: SCHEDULE_BASE, method: 'get', params: query });
 }
 
 /** C-17 新建课次（带冲突检查）。★ 命中冲突时后端**不落库**，返回 conflict=true */
 export async function createSchedule(body: ScheduleCreateBody) {
-  return request<ScheduleCreateResult>({ url: await schedulePath(), method: 'post', data: body });
+  return request<ScheduleCreateResult>({ url: SCHEDULE_BASE, method: 'post', data: body });
 }
 
 /**
@@ -101,7 +98,7 @@ export async function createSchedule(body: ScheduleCreateBody) {
  */
 export async function moveSchedule(scheduleId: string | number, body: ScheduleUpdateBody) {
   return request<ScheduleCreateResult>({
-    url: `${await schedulePath()}/${scheduleId}`,
+    url: `${SCHEDULE_BASE}/${scheduleId}`,
     method: 'put',
     data: body
   });
@@ -114,7 +111,7 @@ export async function moveSchedule(scheduleId: string | number, body: ScheduleUp
  */
 export async function swapSchedules(body: ScheduleSwapBody) {
   return request<ScheduleCreateResult>({
-    url: `${await schedulePath()}/swap`,
+    url: `${SCHEDULE_BASE}/swap`,
     method: 'put',
     data: body
   });
@@ -123,7 +120,7 @@ export async function swapSchedules(body: ScheduleSwapBody) {
 /** C-22 放回待排：软删课次，课程随「本周未出现」口径自动回到待排池 */
 export async function deleteSchedule(scheduleId: string | number) {
   return request<{ removed: boolean }>({
-    url: `${await schedulePath()}/${scheduleId}`,
+    url: `${SCHEDULE_BASE}/${scheduleId}`,
     method: 'delete'
   });
 }
@@ -133,7 +130,7 @@ export async function deleteSchedule(scheduleId: string | number) {
  * ★ 发布后学生/教师端才可见新排课次；已发布课次再改动保持已发布。
  */
 export async function publishSchedules() {
-  return request<{ published: number }>({ url: `${await schedulePath()}/publish`, method: 'post' });
+  return request<{ published: number }>({ url: `${SCHEDULE_BASE}/publish`, method: 'post' });
 }
 
 /**
@@ -160,7 +157,7 @@ export async function autoArrange(body: AutoArrangeBody) {
   return request<
     Array<{ offeringId: string; courseId: string; courseName?: string; totalWeeks?: number; arranged?: number; weeksPlaced?: number[]; skipped?: Array<{ week?: number; weekNo?: number; reason?: string }> }>
   >({
-    url: `${await schedulePath()}/auto-arrange`,
+    url: `${SCHEDULE_BASE}/auto-arrange`,
     method: 'post',
     data: {
       ...(body.offeringId !== undefined ? { offeringId: String(body.offeringId) } : {}),
@@ -273,7 +270,7 @@ export interface LessonStatusBody {
 }
 export async function updateLessonStatus(scheduleId: string | number, body: LessonStatusBody) {
   return request<number>({
-    url: `${await schedulePath()}/${String(scheduleId)}/lesson-status`,
+    url: `${SCHEDULE_BASE}/${String(scheduleId)}/lesson-status`,
     method: 'put',
     data: {
       lessonStatus: body.lessonStatus,
