@@ -108,62 +108,40 @@ async function onRearrange(o: { offeringId: string; termCode?: string }) {
  *   超出学期周数被截断，后段课时永远排不进去。故界面一律标「节次」并括注等值学时。 */
 const HOURS_PER_PERIOD = 2;
 
-/** 学时 → 节次数（向上取整；学时缺失/非法返回 null） */
-function periodsFromHours(hours?: number | null): number | null {
-  const h = Number(hours);
-  if (hours == null || !Number.isFinite(h) || h <= 0) return null;
-  return Math.ceil(h / HOURS_PER_PERIOD);
-}
-
-/** 节次数 ÷ 每周节次 → 需要几周（向上取整；每周节次非法按 1 计） */
-function weeksFromPeriods(periods: number, perWeek: number): number {
-  const p = Number(perWeek);
-  const safePerWeek = Number.isFinite(p) && p >= 1 ? Math.floor(p) : 1;
-  return Math.ceil(Math.max(0, periods) / safePerWeek);
-}
-
 const schedCfgId = ref('');
 const schedCfgSaving = ref(false);
+/* 2026-11-16 业主：「按学时算」按钮不要，直接输入总学时就行。
+ * 抽屉里这条「修改配置」与建课向导同口径：只填 起始周 / 每周节次 / 总学时，
+ * 节次数（= 学时 ÷ 2）与结束周全部派生，不再让人手填节次再点按钮对齐。 */
 const schedCfgForm = reactive({
   weekFrom: 1,
-  weekTo: 16,
   lessonsPerWeek: 1,
-  totalLessons: null as number | null
+  /** 总学时（可编辑；默认取该配置已有节次×2，否则取课程学时） */
+  hours: null as number | null
 });
 
-/** 表单内实时换算：学时 → 节次 → 需要几周，并与用户填的周跨度比对 */
+/** 表单内实时换算：总学时 → 节次 → 结束周（全部是派生值，不落库） */
 const schedCfgPreview = computed(() => {
-  const hours = detailData.value?.hours ?? null;
-  const perWeek = schedCfgForm.lessonsPerWeek;
-  const spanWeeks = Math.max(0, (schedCfgForm.weekTo || 0) - (schedCfgForm.weekFrom || 0) + 1);
-  const periods = schedCfgForm.totalLessons ?? spanWeeks * Math.max(1, perWeek);
-  const needWeeks = weeksFromPeriods(periods, perWeek);
+  const perWeek = Math.max(1, Math.floor(Number(schedCfgForm.lessonsPerWeek) || 1));
+  const from = Math.max(1, Math.floor(Number(schedCfgForm.weekFrom) || 1));
+  const h = Number(schedCfgForm.hours);
+  const hours = Number.isFinite(h) && h > 0 ? h : null;
+  const periods = hours === null ? null : Math.ceil(hours / HOURS_PER_PERIOD);
+  const weeks = periods === null ? null : Math.ceil(periods / perWeek);
+  const rawTo = weeks === null ? null : from + weeks - 1;
+  const weekTo = rawTo === null ? null : Math.min(rawTo, 30);
   return {
     hours,
+    perWeek,
     periods,
-    perWeek: Math.max(1, perWeek),
-    needWeeks,
-    spanWeeks,
-    /** 填的周跨度与「节次数÷每周节次」算出的周数不一致 */
-    mismatch: spanWeeks > 0 && needWeeks !== spanWeeks,
-    /** 学时换算出的节次数（用于「按学时算」按钮与偏差提示） */
-    derivedPeriods: periodsFromHours(hours)
+    weeks,
+    from,
+    weekTo,
+    spanWeeks: weekTo === null ? null : weekTo - from + 1,
+    /** 算出来的结束周超出 30 周上限（会被截断 ⇒ 后段节次排不进去） */
+    overflow: rawTo !== null && rawTo > 30
   };
 });
-
-/** 按课程学时一键换算：节次数 = 学时÷2，周跨度 = 节次数÷每周节次 */
-function applyHoursDerived() {
-  const { derivedPeriods, perWeek } = schedCfgPreview.value;
-  if (derivedPeriods == null) {
-    ElMessage.warning('该课程未填学时（course.hours 为空），无法按学时换算，请手工填节次数');
-    return;
-  }
-  schedCfgForm.totalLessons = derivedPeriods;
-  const from = schedCfgForm.weekFrom || 1;
-  const need = weeksFromPeriods(derivedPeriods, perWeek);
-  schedCfgForm.weekTo = from + need - 1;
-  ElMessage.success(`已按 ${schedCfgPreview.value.hours} 学时换算：${derivedPeriods} 节次 ÷ 每周 ${perWeek} 节 = ${need} 周`);
-}
 
 function schedCfgLabel(o: AdminOfferingVo) {
   const from = o.weekFrom ?? 1;
@@ -178,26 +156,34 @@ function schedCfgLabel(o: AdminOfferingVo) {
 
 function openSchedCfg(o: AdminOfferingVo) {
   schedCfgId.value = o.offeringId;
-  const weeks = o.weekCount ?? 16;
   schedCfgForm.weekFrom = o.weekFrom ?? 1;
-  schedCfgForm.weekTo = (o.weekFrom ?? 1) + weeks - 1;
   schedCfgForm.lessonsPerWeek = o.lessonsPerWeek ?? 1;
-  schedCfgForm.totalLessons = o.totalLessons ?? null;
+  // 总学时默认取课程本身的学时（学时是课程权威属性，配置只是把它摊到周次上）；
+  // 课程没填学时才用已存配置反推（周跨度 × 每周节次 × 2）。
+  schedCfgForm.hours = detailData.value?.hours ?? (o.weekCount ? o.weekCount * (o.lessonsPerWeek ?? 1) * HOURS_PER_PERIOD : null);
 }
 
+/** 当前编辑的这条配置库里存的周跨度（用于提示「保存后会按学时改成几周」） */
+const schedCfgStoredWeeks = computed(() => {
+  const o = (detailData.value?.offerings ?? []).find((x) => x.offeringId === schedCfgId.value);
+  return o?.weekCount ?? null;
+});
+
 async function saveSchedCfg(o: AdminOfferingVo) {
-  const { weekFrom, weekTo, lessonsPerWeek, totalLessons } = schedCfgForm;
-  if (weekTo < weekFrom) {
-    ElMessage.warning('结束周不能早于开始周');
+  const { hours, periods, weekTo, spanWeeks } = schedCfgPreview.value;
+  const weekFrom = schedCfgForm.weekFrom;
+  const lessonsPerWeek = schedCfgForm.lessonsPerWeek;
+  if (hours === null || periods === null || weekTo === null || spanWeeks === null) {
+    ElMessage.warning('请先填写该配置的总学时，节次数与结束周会自动算出');
     return;
   }
   schedCfgSaving.value = true;
   try {
     await updateOfferingScheduleConfig(o.offeringId, {
-      weekFrom,
-      weekCount: weekTo - weekFrom + 1,
+      weekFrom: schedCfgForm.weekFrom,
+      weekCount: spanWeeks,
       lessonsPerWeek,
-      totalLessons
+      totalLessons: periods
     });
     ElMessage.success('排课配置已保存，自动排课将按新节奏执行');
     schedCfgId.value = '';
@@ -1388,51 +1374,60 @@ onMounted(async () => {
                 </div>
                 <div v-if="schedCfgId === o.offeringId" class="cfg-block">
                   <!-- 抽屉只有 ~240px 可用宽，改成单列「定宽标签 + 数字框」网格：
-                       四个框左右边缘对齐，按钮单独一行右对齐，不再各自折行。 -->
+                       填三个值即可，结束周与节次数由总学时自动派生（不再有「按学时算」按钮）。 -->
                   <div class="cfg-grid">
                     <div class="cfg-cell">
                       <span class="cfg-lab">起始周</span>
                       <el-input-number v-model="schedCfgForm.weekFrom" class="cfg-num" :min="1" :max="30" size="small" controls-position="right" />
                     </div>
                     <div class="cfg-cell">
-                      <span class="cfg-lab">结束周</span>
-                      <el-input-number v-model="schedCfgForm.weekTo" class="cfg-num" :min="1" :max="30" size="small" controls-position="right" />
-                    </div>
-                    <div class="cfg-cell">
                       <span class="cfg-lab">每周节次</span>
                       <el-input-number v-model="schedCfgForm.lessonsPerWeek" class="cfg-num" :min="1" :max="7" size="small" controls-position="right" />
                     </div>
                     <div class="cfg-cell">
-                      <span class="cfg-lab">总节次</span>
+                      <span class="cfg-lab">总学时</span>
                       <el-input-number
-                        v-model="schedCfgForm.totalLessons"
+                        v-model="schedCfgForm.hours"
                         class="cfg-num"
-                        :min="1"
+                        :min="2"
                         :max="500"
                         size="small"
                         controls-position="right"
-                        placeholder="留空铺满"
+                        placeholder="填本课学时"
                       />
+                    </div>
+                    <div class="cfg-cell">
+                      <span class="cfg-lab">结束周</span>
+                      <span class="cfg-auto">
+                        <template v-if="schedCfgPreview.weekTo !== null">第 {{ schedCfgPreview.weekTo }} 周</template>
+                        <span v-else class="muted">待填学时</span>
+                      </span>
                     </div>
                   </div>
                   <div class="cfg-actions">
-                    <el-button size="small" plain @click="applyHoursDerived">按学时算</el-button>
                     <el-button size="small" type="primary" :loading="schedCfgSaving" @click="saveSchedCfg(o)">保存</el-button>
                   </div>
                   <div
                     class="small"
                     style="margin-top: 6px"
-                    :style="schedCfgPreview.mismatch ? 'color: var(--warn-700, #8a6116)' : 'color: var(--text-3, #667085)'"
+                    :style="
+                      schedCfgPreview.hours === null || schedCfgPreview.overflow
+                        ? 'color: var(--warn-700, #8a6116)'
+                        : 'color: var(--text-3, #667085)'
+                    "
                   >
-                    <template v-if="schedCfgPreview.derivedPeriods !== null">
-                      本课 {{ schedCfgPreview.hours }} 学时 = <b>{{ schedCfgPreview.derivedPeriods }}</b> 节次（1 节次 08:00–09:50 = 2 学时：50 分钟 × 2 + 10 分钟课间）；当前填
-                      <b>{{ schedCfgPreview.periods }}</b> 节次 ÷ 每周 {{ schedCfgPreview.perWeek }} 节 ⇒ 需
-                      <b>{{ schedCfgPreview.needWeeks }}</b> 周，而周跨度填的是 {{ schedCfgPreview.spanWeeks }} 周<template v-if="schedCfgPreview.mismatch">（不一致：点「按学时算」自动对齐）</template>。
+                    <template v-if="schedCfgPreview.periods !== null">
+                      {{ schedCfgPreview.hours }} 学时 = <b>{{ schedCfgPreview.periods }}</b> 节次（1 节次 08:00–09:50 = 2 学时：50 分钟 × 2 + 10 分钟课间）；每周
+                      {{ schedCfgPreview.perWeek }} 节 ⇒ 第 {{ schedCfgPreview.from }}~{{ schedCfgPreview.weekTo }} 周，共
+                      {{ schedCfgPreview.spanWeeks }} 教学周<template v-if="schedCfgPreview.overflow">（超出 30 周上限，已截到第 30 周；请加每周节次）</template><template
+                        v-if="schedCfgStoredWeeks !== null && schedCfgStoredWeeks !== schedCfgPreview.spanWeeks"
+                        >（当前配置存的是 {{ schedCfgStoredWeeks }} 教学周，保存后按学时改为 {{ schedCfgPreview.spanWeeks }} 周）</template
+                      >。
                     </template>
-                    <template v-else>本课未填学时（course.hours 为空），节次数只能手工确定。</template>
+                    <template v-else>请填写该配置的总学时，节次数与结束周会自动算出。</template>
                   </div>
                   <div class="small muted" style="margin-top: 4px">
-                    节次留空 = 按 周数 × 每周节次 自然铺满；填了则排满该节次总数即停（重复排课幂等补差额，已停课的节次不计入）。
+                    节次数 = 总学时 ÷ 2，结束周 = 起始周 + 节次数 ÷ 每周节次 − 1；保存后自动排课按此节奏执行（重复排课幂等补差额，已停课的节次不计入）。
                   </div>
                 </div>
               </div>
@@ -1897,6 +1892,22 @@ onMounted(async () => {
   flex: 1 1 auto;
   width: 100%;
   min-width: 0;
+}
+/* 只读派生值（结束周）：做成和数字框同宽同高的「假输入框」，保持这一列对齐 */
+.cfg-auto {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px dashed var(--line, #e4e7ec);
+  border-radius: 4px;
+  background: var(--fill-2, #fff);
+  font-size: 12px;
+  color: var(--text, #344054);
+  white-space: nowrap;
+  overflow: hidden;
 }
 .cfg-actions {
   display: flex;
