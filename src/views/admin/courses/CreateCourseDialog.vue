@@ -292,7 +292,7 @@ async function submitOffering() {
       outline: offerForm.outline.trim() || undefined
     });
     ElMessage.success(
-      `已为「${created.value.courseName}」开课（${res.termCode}），加课码 ${res.joinCode}`
+      `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}`
     );
     // 开课成功：清 step2 表单，允许继续为同一门课开第二个学期/班级组合
     offerForm.termId = '';
@@ -308,7 +308,7 @@ async function submitOffering() {
     //   排课成功则关窗并引导去智能排课页查看。业主拍板「新增的课给他重新排一次」。
     try {
       await ElMessageBox.confirm(
-        `「${created.value.courseName}」已开课（${res.termCode}）。是否立即按教学周自动排课？`,
+        `「${created.value.courseName}」配置已保存（${res.termCode}）。是否立即按教学周自动排课？`,
         '自动排课',
         { confirmButtonText: '立即排课', cancelButtonText: '暂不，手动排', type: 'info' }
       );
@@ -321,7 +321,7 @@ async function submitOffering() {
       close();
     } catch {
       /* request.ts 已弹后端原话；开课不受影响 */
-      ElMessage.warning('开课已保存，但自动排课未完成——可到「智能排课」页手动排课');
+      ElMessage.warning('配置已保存，但自动排课未完成——可到「智能排课」页手动排课');
     }
   } catch {
     /* request.ts 已弹后端原话（40902/40903/422 等） */
@@ -338,7 +338,7 @@ function close() {
 <template>
   <el-dialog
     v-model="visible"
-    :title="step === 1 ? '新建课程 · 第 1 步（基础信息）' : created ? `新建课程 · 第 2 步（为「${created.courseName}」开课）` : '新建课程'"
+    :title="step === 1 ? '新建课程 · 第 1 步（基础信息）' : created ? `新建课程 · 第 2 步（「${created.courseName}」课程配置）` : '新建课程'"
     width="560px"
     :close-on-click-modal="false"
   >
@@ -346,7 +346,7 @@ function close() {
     <div class="steps">
       <div class="step" :class="{ on: step >= 1, done: step > 1 }">1 基础课程</div>
       <div class="step-arrow">→</div>
-      <div class="step" :class="{ on: step >= 2 }">2 开课</div>
+      <div class="step" :class="{ on: step >= 2 }">2 课程配置</div>
       <span class="steps-note">两步各自独立提交，第 1 步成功后可直接关闭</span>
     </div>
 
@@ -464,7 +464,7 @@ function close() {
       <template v-else>
         <el-button @click="close">完成并关闭</el-button>
         <el-button type="primary" :loading="offerSaving" @click="submitOffering">
-          <ZkIcon name="plus" :size="14" style="margin-right: 4px" />开课
+          <ZkIcon name="plus" :size="14" style="margin-right: 4px" />保存配置
         </el-button>
       </template>
     </template>

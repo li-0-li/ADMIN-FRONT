@@ -6,11 +6,11 @@ import type { TableInstance } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import { changeCourseStatus, deleteCourse, exportCourses, getCourse, listCourses, updateOfferingScheduleConfig } from '@/api/admin/courses';
 import type { AdminCourseOrderBy, AdminCourseVo } from '@/api/admin/courses';
-import { getCertDetail, reviewCertification } from '@/api/admin/certifications';
+import { getCertDetail } from '@/api/admin/certifications';
 import { autoArrange, listSchedules } from '@/api/admin/schedules';
 import { listTerms } from '@/api/admin/basicdata';
 import { useUserStore } from '@/store/user';
-import type { AdminCourseDetailVo, AdminOfferingVo, CertDetail } from '@/types/admin';
+import type { AdminCourseDetailVo, AdminOfferingVo, CertDetail, CertMaterial } from '@/types/admin';
 import CreateCourseDialog from './CreateCourseDialog.vue';
 
 /**
@@ -549,7 +549,7 @@ const COLUMN_DEFS: ColumnDef[] = [
   { key: 'courseNo', label: '课程编号' },
   { key: 'courseName', label: '课程名称', locked: true },
   { key: 'status', label: '状态' },
-  { key: 'offeringCount', label: '开课数' },
+  { key: 'offeringCount', label: '配置数' },
   { key: 'scheduleCount', label: '排课情况' }
 ];
 const COLUMN_STORAGE_KEY = 'zk_courses_columns_t01';
@@ -917,131 +917,40 @@ async function doDelete(row: AdminCourseVo) {
   }
 }
 
-/* ---------------- 撤销通过（承接原「课程审核」页的重新驳回）----------------
- * 为什么搬到这里：审核页 10-29 起只承载待审队列，已通过的课程不在那儿了，
- * 「重新驳回」这个既有能力必须跟着课程一起移到课程总览，否则撤销通道就断了。
- * 口径与原实现完全一致（双重确认 + 必填原因）；后端 C-15 不校验当前状态可直接驳回，
- * reject 分支会把 course.status 从 active 回退为 certifying ⇒ 本页刷新后该课程消失。
- * certId 只能从 C-14 详情拿（课程列表不含 certId），所以撤销入口放在详情抽屉里。
+/* ---------------- 认证材料清单（2026-11-16 取消审核裁决）----------------
+ * 口径变更：管理端不再对认证做通过/驳回（原 P-3 就地裁决、页脚「撤销通过」一并下线）。
+ * 认证只剩「材料是否齐全」一个用途，AI 初审结论作为参考展示，不产生任何裁决。
+ * 4 个槽位固定展示，缺哪项就明确标「未上传」，不再用「审核结论」这类裁决措辞。
+ *
+ * ⚠ 后端 CertMaterialVo.type 把 cert_type 归一成 video/doc/table（outline 原值被丢掉），
+ *   所以「教学大纲」只能靠 title 里的 大纲/outline 识别；后端补 certType 原值后可改精确匹配。
  */
-const revoking = ref(false);
+const CERT_SLOTS: { key: string; title: string; icon: string; match: (m: CertMaterial) => boolean }[] = [
+  { key: 'video', title: '说课视频', icon: 'video', match: (m) => m.type === 'video' },
+  { key: 'plan', title: '教学教案', icon: 'file-text', match: (m) => m.type === 'doc' && !/大纲|outline/i.test(m.title || '') },
+  { key: 'schedule', title: '教学进度表', icon: 'table', match: (m) => m.type === 'table' },
+  { key: 'outline', title: '教学大纲', icon: 'file-text', match: (m) => /大纲|outline/i.test(m.title || '') }
+];
 
-async function revokeApprove() {
-  const course = detailCourse.value;
-  const cert = detail.value;
-  if (!course) return;
-  if (!cert?.certId) {
-    ElMessage.warning('该课程没有可用的认证记录，无法撤销通过；如需下架请用「删除」');
-    return;
-  }
-  let reason = '';
-  try {
-    const { value } = await ElMessageBox.prompt(
-      '将驳回该课程全部三项认证，教师需修改后重新提审。请输入驳回原因：',
-      '撤销通过（驳回）',
-      {
-        confirmButtonText: '下一步',
-        cancelButtonText: '取消',
-        inputPlaceholder: '驳回原因（必填）',
-        inputValidator: (v: string) => (v && v.trim().length > 0 ? true : '驳回原因不能为空')
-      }
-    );
-    reason = value.trim();
-  } catch {
-    return;
-  }
-  try {
-    await ElMessageBox.confirm(
-      `最终确认：课程「${course.courseName}」将退回「认证中」，已解锁的备课同步收回。确定执行？`,
-      '最终确认',
-      { type: 'warning', confirmButtonText: '确认驳回', cancelButtonText: '再想想' }
-    );
-  } catch {
-    return;
-  }
-  revoking.value = true;
-  try {
-    await reviewCertification(cert.certId, { action: 'reject', rejectReason: reason });
-    ElMessage.success(`已撤销通过：课程「${course.courseName}」已退回「认证中」`);
-    detailVisible.value = false;
-    // 该课程 status 已回退，本页固定查 active ⇒ 重查后自然消失
-    await fetchList();
-  } catch {
-    /* request.ts 已提示后端原话 */
-  } finally {
-    revoking.value = false;
-  }
-}
+const AI_RESULT_LABEL: Record<string, string> = {
+  pass: 'AI 初审通过',
+  doubt: 'AI 存疑',
+  none: '未做 AI 初审'
+};
 
-/* ---------------- 待审裁决（P-3：原「课程审核」页并入本抽屉，2026-11-10）----------------
- * certStatus=pending 且有 certId 时，「认证材料」区显示 通过/驳回 按钮。
- * 口径与原审核页完全一致：通过前确认"解锁教师备课"；驳回必填原因（C-15 按课程整体裁决）。
- * 驳回后 course.status 回退 certifying，本页 active 列表查不到它 ⇒ 关抽屉；
- * 通过后就地刷新认证详情（pending→approved），列表保持可见。
- */
-const reviewing = ref(false);
+/** 4 个固定槽位：匹配上的显示「已上传」，没匹配上的槽位就是「未上传」 */
+const certSlots = computed(() => {
+  const list = detail.value?.materials ?? [];
+  const used = new Set<number>();
+  return CERT_SLOTS.map((slot) => {
+    const hit = list.find((m) => !used.has(m.materialId) && slot.match(m));
+    if (hit) used.add(hit.materialId);
+    return { ...slot, material: hit, uploaded: !!hit };
+  });
+});
 
-async function submitDrawerReview(action: 'approve' | 'reject') {
-  const cert = detail.value;
-  const course = detailCourse.value;
-  if (!cert?.certId || !course) return;
-  let rejectReason: string | undefined;
-  if (action === 'approve') {
-    try {
-      await ElMessageBox.confirm(
-        `确认课程「${course.courseName}」审核通过？通过后教师即可开始备课。`,
-        '审核通过确认',
-        { type: 'warning', confirmButtonText: '确认通过', cancelButtonText: '再想想' }
-      );
-    } catch {
-      return;
-    }
-  } else {
-    try {
-      const { value } = await ElMessageBox.prompt(
-        '将驳回该课程全部三项认证，教师需修改后重新提审。请输入驳回原因：',
-        '驳回认证',
-        {
-          confirmButtonText: '下一步',
-          cancelButtonText: '取消',
-          inputPlaceholder: '驳回原因（必填）',
-          inputValidator: (v: string) => (v && v.trim().length > 0 ? true : '驳回原因不能为空')
-        }
-      );
-      rejectReason = value.trim();
-    } catch {
-      return;
-    }
-  }
-  reviewing.value = true;
-  try {
-    await reviewCertification(cert.certId, { action, rejectReason });
-    ElMessage.success(
-      action === 'approve'
-        ? `已通过：课程「${course.courseName}」审核完成，教师可开始备课`
-        : `已驳回：课程「${course.courseName}」已退回「认证中」`
-    );
-    if (action === 'reject') {
-      detailVisible.value = false;
-      await fetchList();
-    } else {
-      // 就地刷新认证详情（pending→approved），不关抽屉
-      detailLoading.value = true;
-      try {
-        detail.value = await getCertDetail(Number(course.courseId));
-      } catch {
-        /* 保留旧数据 */
-      } finally {
-        detailLoading.value = false;
-      }
-      await fetchList();
-    }
-  } catch {
-    /* request.ts 已提示后端原话 */
-  } finally {
-    reviewing.value = false;
-  }
-}
+/** 已上传项数（页面顶部「已上传 N / 4」） */
+const uploadedCount = computed(() => certSlots.value.filter((s) => s.uploaded).length);
 
 onMounted(async () => {
   void loadTerms();
@@ -1222,10 +1131,10 @@ onMounted(async () => {
             <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
           </template>
         </el-table-column>
-        <!-- 开课数（T-01 新列）：0 = 只建了基础课程还没开课（两步建课第一步完成后的合法状态） -->
+        <!-- 配置数（2026-11-16 由「开课数」改名）：0 = 只建了基础课程还没配过学期/教师/班级 -->
         <el-table-column
           v-if="columnVisible.offeringCount"
-          label="开课数"
+          label="配置数"
           width="90"
           align="center"
           prop="offeringCount"
@@ -1370,7 +1279,7 @@ onMounted(async () => {
           <span class="k">状态</span>
           <span class="badge" :class="statusBadge(detailCourse.status)">{{ statusLabel(detailCourse.status) }}</span>
         </div>
-        <div class="pf-row"><span class="k">开课数</span><span>{{ detailCourse.offeringCount ?? '—' }}</span></div>
+        <div class="pf-row"><span class="k">配置数</span><span>{{ detailCourse.offeringCount ?? '—' }}</span></div>
         <div class="pf-row">
           <span class="k">排课情况</span>
           <span>
@@ -1385,7 +1294,7 @@ onMounted(async () => {
            「为这门课开课」直达两步向导第 2 步 -->
       <div>
         <div class="section-title">
-          开课记录
+          课程配置
           <el-button
             v-if="canOffer"
             size="small"
@@ -1394,7 +1303,7 @@ onMounted(async () => {
             style="margin-left: 8px"
             @click="openOfferFor({ courseId: detailCourse.courseId, courseName: detailCourse.courseName })"
           >
-            <ZkIcon name="plus" :size="13" style="margin-right: 3px" />为这门课开课
+            <ZkIcon name="plus" :size="13" style="margin-right: 3px" />新增配置
           </el-button>
         </div>
         <div v-loading="detailOfferLoading">
@@ -1427,7 +1336,7 @@ onMounted(async () => {
                     type="primary"
                     style="margin-left: 6px"
                     @click="schedCfgId === o.offeringId ? (schedCfgId = '') : openSchedCfg(o)"
-                  >{{ schedCfgId === o.offeringId ? '收起' : '修改' }}</el-button>
+                  >{{ schedCfgId === o.offeringId ? '收起' : '修改配置' }}</el-button>
                 </div>
                 <div
                   v-if="schedCfgId === o.offeringId"
@@ -1478,7 +1387,7 @@ onMounted(async () => {
             </div>
           </div>
           <div v-else-if="!detailOfferLoading" class="small muted">
-            该课程还没有开课记录（只建了基础课程）。点上方「为这门课开课」完成第二步。
+            该课程还没有配置（只建了基础课程）。点上方「新增配置」为它指定学期、授课教师与班级。
           </div>
         </div>
       </div>
@@ -1487,56 +1396,56 @@ onMounted(async () => {
         <div class="section-title">认证材料</div>
         <div v-loading="detailLoading">
           <template v-if="detail">
-            <!-- C-14 出参只有 certStatus + aiSuggestion（没有逐材料的 aiDecision，那在 materials[].aiResult） -->
+            <!-- 2026-11-16 取消审核：不再有通过/驳回，这里只报「材料齐不齐」。
+                 4 个槽位固定展示，缺的槽位显式标「未上传」，避免"没记录"被读成"已通过"。 -->
             <div class="small muted" style="margin-bottom: 8px">
-              审核结论：{{ detail.certStatus === 'approved' ? '已通过' : detail.certStatus === 'rejected' ? '已驳回' : detail.certStatus === 'pending' ? '待审核' : detail.certStatus || '—' }}
-              <span v-if="detail.aiSuggestion">　AI 初审：{{ detail.aiSuggestion }}</span>
+              材料齐全度：已上传
+              <b :style="uploadedCount === 4 ? '' : 'color: var(--warn-700, #8a6116)'">{{ uploadedCount }}</b> / 4
+              <span v-if="uploadedCount < 4" class="cert-hint">　缺 {{ 4 - uploadedCount }} 项，教师补齐后即可上课</span>
+              <span v-else class="cert-hint" style="color: var(--success-strong, #1f7a4d)">　材料已齐</span>
             </div>
-            <!-- P-3：原「课程审核」页的裁决操作并入抽屉（2026-11-10）——待审课程就地通过/驳回 -->
-            <div v-if="detail.certStatus === 'pending' && detail.certId" style="margin-bottom: 10px">
-              <!-- 裁决按钮横向并排：原先套 .stack（flex-column）竖排，EP 的
-                   `.el-button + .el-button { margin-left: 12px }` 在竖排下变成水平偏移，
-                   「驳回」比「审核通过」整体右移 12px、宽度也不一致 ⇒ 看起来没对齐。 -->
-              <div class="cert-actions">
-                <el-button type="primary" size="small" :loading="reviewing" @click="submitDrawerReview('approve')">
-                  <ZkIcon name="badge-check" :size="14" style="margin-right: 3px" />审核通过
-                </el-button>
-                <el-button type="danger" plain size="small" :loading="reviewing" @click="submitDrawerReview('reject')">
-                  <ZkIcon name="x" :size="14" style="margin-right: 3px" />驳回
-                </el-button>
-              </div>
-              <div class="small muted" style="margin-top: 6px">通过后教师即可开始备课；驳回需填写原因，课程退回「认证中」。</div>
-            </div>
-            <div v-if="(detail.materials ?? []).length" class="stack" style="gap: 8px">
-              <div v-for="m in detail.materials" :key="m.materialId" class="material-row">
-                <ZkIcon :name="m.type === 'video' ? 'video' : m.type === 'doc' ? 'file-text' : 'table'" :size="15" />
-                <div>
-                  <div style="font-weight: 600">{{ m.title || m.type }}</div>
-                  <div v-if="m.desc" class="small muted">{{ m.desc }}</div>
+            <div class="stack" style="gap: 8px">
+              <div
+                v-for="s in certSlots"
+                :key="s.key"
+                class="material-row"
+                :class="{ 'material-missing': !s.uploaded }"
+              >
+                <ZkIcon :name="s.icon" :size="15" />
+                <div style="min-width: 0">
+                  <div style="font-weight: 600">
+                    {{ s.title }}
+                    <span class="badge" :class="s.uploaded ? 'badge-success' : 'badge-warning'" style="margin-left: 6px">
+                      {{ s.uploaded ? '已上传' : '未上传' }}
+                    </span>
+                  </div>
+                  <div v-if="s.uploaded && s.material?.desc" class="small muted">{{ s.material.desc }}</div>
+                  <div v-if="s.uploaded" class="small muted">
+                    {{ AI_RESULT_LABEL[s.material?.aiResult || 'none'] ?? s.material?.aiResult }}
+                  </div>
+                  <div v-else class="small" style="color: var(--warn-700, #8a6116)">
+                    教师尚未上传，可在教师端备课管理补齐
+                  </div>
                 </div>
               </div>
             </div>
-            <div v-else class="small muted">该课程认证记录下没有材料明细。</div>
+            <div v-if="detail.aiSuggestion" class="small muted" style="margin-top: 8px">
+              AI 初审意见：{{ detail.aiSuggestion }}（仅作参考，不参与准入判定）
+            </div>
           </template>
           <div v-else-if="!detailLoading" class="small muted">{{ detailNote || '无认证材料记录' }}</div>
         </div>
       </div>
     </div>
     <template #footer>
-      <!-- 只在确认该课程确实处于已通过状态时给撤销入口，避免对没有认证记录的历史课误点 -->
-      <el-button
-        v-if="detail?.certStatus === 'approved'"
-        type="warning"
-        plain
-        :loading="revoking"
-        @click="revokeApprove"
-      >撤销通过（驳回）</el-button>
+      <!-- 2026-11-16 取消审核裁决：「撤销通过（驳回）」随通过/驳回一起下线，
+           认证只剩材料齐全度展示，页脚只保留关闭。 -->
       <el-button @click="detailVisible = false">关闭</el-button>
     </template>
   </el-drawer>
 
   <!-- 两步建课向导（T-01）：page-head「新建课程」从第 1 步进；
-       抽屉「为这门课开课」带 startCourse 直接进第 2 步 -->
+       抽屉「新增课程配置」带 startCourse 直接进第 2 步 -->
   <CreateCourseDialog v-model:visible="dialogVisible" :start-course="dialogCourse" @created="fetchList" />
 </template>
 
@@ -1880,16 +1789,15 @@ onMounted(async () => {
   font-size: 13px;
 }
 
-/* 认证材料区的裁决按钮行：横向等距排列。
-   EP 默认给相邻 .el-button 加 margin-left: 12px，横向用 gap 后必须把它清零，
-   否则第一个按钮与第二个之间会变成 8 + 12 = 20px，和其它行距不齐。 */
-.cert-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+/* 未上传槽位：虚线边框 + 浅警示底色，与「已上传」的实线卡明确区分，
+   避免用户把"缺材料"看成"没有这一项"（2026-11-16 取消审核后改为材料齐全度视图）。 */
+.material-row.material-missing {
+  border-style: dashed;
+  border-color: var(--warning-strong, #b7791f);
+  background: var(--warning-soft, #fdf6e7);
 }
-.cert-actions :deep(.el-button + .el-button) {
-  margin-left: 0;
+.cert-hint {
+  color: var(--warn-700, #8a6116);
 }
 
 /* 编号 68 同根因（基础数据页 2026-10-30 定性）：EP 分页器「当前页」两层规则叠加
