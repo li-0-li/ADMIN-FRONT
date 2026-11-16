@@ -1182,7 +1182,15 @@ onMounted(async () => {
             <span :title="scheduleHeaderTitle">排课情况</span>
           </template>
           <template #default="{ row }">
-            <span v-if="scheduledCount(row) === null" class="muted small">—</span>
+            <!-- 未配置的课没有 offering，排课页的待排池里根本看不到它 ⇒ 这里不给「去排课」入口（死路），
+                 只提示先配置。判据用 offeringCount（列表接口透出的配置条数），不靠 scheduleCount 推断。 -->
+            <span
+              v-if="!(Number(row.offeringCount) > 0)"
+              class="muted small"
+              title="该课程还没有配置学期/教师/班级，先去「课程配置」完成配置才能排课"
+              >—</span
+            >
+            <span v-else-if="scheduledCount(row) === null" class="muted small">—</span>
             <!-- 未排课给直达入口：这列最常见的用途就是"挑一门没排的课去排" -->
             <div v-else-if="scheduledCount(row) === 0" class="sched-cell">
               <span class="badge badge-neutral">未排课</span>
@@ -1317,7 +1325,9 @@ onMounted(async () => {
         <div class="pf-row">
           <span class="k">排课情况</span>
           <span>
-            <template v-if="scheduledCount(detailCourse) === null">—</template>
+            <!-- 未配置时不存在可排的课次：显示「—」而不是「未排课」，避免误以为排一下就有了 -->
+            <template v-if="!(detailData?.offerings ?? []).length">—</template>
+            <template v-else-if="scheduledCount(detailCourse) === null">—</template>
             <template v-else-if="scheduledCount(detailCourse) === 0">未排课</template>
             <template v-else>已排 {{ scheduledCount(detailCourse) }} 节</template>
           </span>
