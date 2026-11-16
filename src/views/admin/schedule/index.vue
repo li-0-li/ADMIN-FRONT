@@ -965,13 +965,57 @@ function certPassed(courseId: string | number | undefined | null): boolean {
  *   一门没有开课记录的课，点了自动排课只会得到空结果——让它落进「未配置」栏并提示先建开课记录才对。
  * ★ 字段缺失（旧包）一律 `unknown`，回落旧行为，绝不因为前端拿不到状态就把课判成「不能排」。
  */
-function cfgStateOf(c: PoolCourse): PoolEntry['cfg'] {
-  if (typeof c.offeringUnconfigured !== 'number') return 'unknown';
+/**
+ * 「已配置课程」缺什么（2026-11-16 业主口径）。
+ *
+ * ★ 业主原话：「已配置里面课程有些连教师和班级都没选，怎么会进已配置」。
+ *   根因：判定只看 `schedule_configured`（排课节奏是否保存），而排课节奏、授课教师、
+ *   面向班级是三件独立的事 —— 演示库里 8 门「已配置」课有 6 门 `target_classes` 为空，
+ *   自动排课照样能把它们排出来，只是课次没有班级归属（`target_class` 落 NULL）。
+ *   所以「已配置」必须三项齐备：节奏（总节次/每周节次/周范围）+ 授课教师 + 面向班级。
+ *
+ * 判定优先级：
+ *   ① 有开课明细（`offeringByCourse`）⇒ 逐条查，最准；
+ *   ② 明细还没拉到 / 接口失败 ⇒ 退回课程行的 `offeringUnconfigured`（只知道节奏这一维），
+ *      宁可先按旧口径归类，也不要把课误塞进未配置栏造成「课都不见了」；
+ *   ③ 旧包连 `offeringUnconfigured` 都没有 ⇒ `unknown`（按已配置兜底，理由同 ②）。
+ */
+type CfgGap = 'rhythm' | 'teacher' | 'clazz';
+interface CfgVerdict {
+  cfg: PoolEntry['cfg'];
+  gaps: CfgGap[];
+  /** 缺排课节奏的开课条数（角标「未配 1/2」的分子） */
+  missingRhythm: number;
+}
+
+function cfgVerdictOf(c: PoolCourse): CfgVerdict {
   const total = Number(c.offeringCount ?? 0);
+  const offs = offeringByCourse.value[String(c.courseId)];
+  if (offs?.length) {
+    const gaps = new Set<CfgGap>();
+    let missingRhythm = 0;
+    for (const o of offs) {
+      // 节奏：字段缺失（旧包）按已配，只有明确为 0 才算缺
+      if (o.scheduleConfigured !== undefined && o.scheduleConfigured !== null && Number(o.scheduleConfigured) === 0) {
+        missingRhythm += 1;
+        gaps.add('rhythm');
+      }
+      if (!o.teacherId) gaps.add('teacher');
+      const clazzes = Array.isArray(o.targetClasses) ? o.targetClasses.filter(x => String(x ?? '').trim()) : [];
+      if (!clazzes.length && !String(o.classKey ?? '').trim()) gaps.add('clazz');
+    }
+    const list = [...gaps];
+    // 只缺节奏且只缺一部分 ⇒ partial（角标仍写「未配 1/2」，两栏都不进已配置）
+    const cfg: PoolEntry['cfg'] = list.length === 0 ? 'ready' : list.length === 1 && list[0] === 'rhythm' ? 'partial' : 'none';
+    return { cfg, gaps: list, missingRhythm };
+  }
+  if (typeof c.offeringUnconfigured !== 'number') return { cfg: 'unknown', gaps: [], missingRhythm: 0 };
+  if (!Number.isFinite(total) || total <= 0) return { cfg: 'none', gaps: [], missingRhythm: 0 };
   const un = Number(c.offeringUnconfigured ?? 0);
-  if (!Number.isFinite(total) || total <= 0) return 'none';
-  if (!Number.isFinite(un) || un >= total) return 'none';
-  return un > 0 ? 'partial' : 'ready';
+  if (!Number.isFinite(un) || un >= total) return { cfg: 'none', gaps: ['rhythm'], missingRhythm: total };
+  return un > 0
+    ? { cfg: 'partial', gaps: ['rhythm'], missingRhythm: un }
+    : { cfg: 'ready', gaps: [], missingRhythm: 0 };
 }
 
 /** 本周被「放回待排」的课次（软删行全集）：每条 = 待排池里的一张签 */
@@ -1024,6 +1068,14 @@ interface PoolEntry extends CourseBrief {
    *             ★ 宁可多列也不把课藏起来：旧包下若全判「未配置」，会出现「一门课都排不了」的假故障。
    */
   cfg: 'ready' | 'partial' | 'none' | 'unknown';
+  /**
+   * 没配齐的具体项（2026-11-16）：节奏 / 教师 / 班级。
+   * 角标与悬停按它写「缺班级」「缺教师·班级」「未配 1/2」，让管理员知道该去补哪一步，
+   * 而不是笼统一句「未配置」。
+   */
+  cfgGaps?: CfgGap[];
+  /** 缺排课节奏的开课条数（角标「未配 1/2」的分子） */
+  missingRhythm?: number;
   /** 该课名下的开课记录数（`AdminCourseVo.offeringCount`）：0 = 只建了基础课程，排课无从下手 */
   offeringCount?: number;
   /** 还没配排课设置的开课记录数（`AdminCourseVo.offeringUnconfigured`）：卡片角标「未配 1/2」的分子 */
@@ -1054,23 +1106,45 @@ function buildPoolEntries(): PoolEntry[] {
     else returned.set(rk, [r]);
   }
   const out: PoolEntry[] = [];
+  // 配置体检结果按 courseId 缓存：一门课多张放回签时不必重复算（判定还依赖异步拉来的开课明细）
+  const cfgByCourse = new Map<string, CfgVerdict>();
+  const verdict = (c: PoolCourse) => {
+    const k = String(c.courseId);
+    let v = cfgByCourse.get(k);
+    if (!v) {
+      v = cfgVerdictOf(c);
+      cfgByCourse.set(k, v);
+    }
+    return v;
+  };
   for (const c of poolCourses.value) {
     const rows = returned.get(String(c.courseId));
     if (rows?.length) {
       // 放回即回池：每条放回课次 1 张签（拖一次排回一节）
       for (const r of rows) {
+        const v = verdict(c);
         out.push({
           ...c,
           key: `lesson-${r.scheduleId}`,
           inSchedule: used.has(String(r.courseId)),
-          cfg: cfgStateOf(c),
+          cfg: v.cfg,
+          cfgGaps: v.gaps,
+          missingRhythm: v.missingRhythm,
           // 2026-11-05：带上原课次时间坐标，供池子卡片区分「同一门课的哪一节」
           fromWeekday: r.weekday,
           fromPeriodNo: r.periodNo
         });
       }
     } else if (!used.has(String(c.courseId))) {
-      out.push({ ...c, key: `course-${c.courseId}`, inSchedule: false, cfg: cfgStateOf(c) });
+      const v = verdict(c);
+      out.push({
+        ...c,
+        key: `course-${c.courseId}`,
+        inSchedule: false,
+        cfg: v.cfg,
+        cfgGaps: v.gaps,
+        missingRhythm: v.missingRhythm
+      });
     }
   }
   // 2026-11-11 放开认证门槛（录音 A3）：未认证课程**照常进待排池**。
@@ -1223,13 +1297,13 @@ const poolColumns = computed(() => {
     {
       key: 'configured' as PoolColKey,
       title: '已配置课程',
-      hint: '可进行自动排课',
+      hint: '教师、班级、排课设置都齐，可自动排课',
       icon: 'check',
       blank: !total
         ? '本周课程已全部排入课表'
         : cfgChips.length
           ? '没有匹配的课程（清掉栏内搜索/筛选）'
-          : '没有已配置的课——都在右栏，先去补排课设置',
+          : '没有已配置的课——都在右栏，先去补教师 / 班级 / 排课设置',
       // 徽标数 = 门（一张卡一门），不是节；节的条数在池子 head 上统一报
       count: cfgChips.length,
       entries: cfgChips.filter(e => matchPoolColumn(e, 'configured'))
@@ -1237,13 +1311,13 @@ const poolColumns = computed(() => {
     {
       key: 'unconfigured' as PoolColKey,
       title: '未配置课程',
-      hint: '可手动排课，配齐后才可自动排课',
+      hint: '可手动排课；配好教师·班级·排课设置后才可自动排课',
       icon: 'alert-triangle',
       blank: !total
         ? '本周课程已全部排入课表'
         : unChips.length
           ? '没有匹配的课程（清掉栏内搜索/筛选）'
-          : '所有待排课程都已配齐排课设置',
+          : '所有待排课程都已配齐（教师 / 班级 / 排课设置）',
       count: unChips.length,
       entries: unChips.filter(e => matchPoolColumn(e, 'unconfigured'))
     }
@@ -1252,6 +1326,38 @@ const poolColumns = computed(() => {
 
 /** 两栏合计的卡片数（= 门数）；节的条数另报，两者不混（2026-11-16 池子按课程聚合后） */
 const poolChipCount = computed(() => poolColumns.value.reduce((n, col) => n + col.count, 0));
+
+/**
+ * 未配置课程按缺口归因（2026-11-16）。
+ * ★ 业主看到「已配置只剩 2 门」第一反应必然是「其他的为什么不行」，所以在这里一句话报清
+ *   右栏那 N 门各缺什么、补哪一项最快能让它们进自动排课。按「门」统计，与栏徽标同量纲。
+ */
+const poolGapSummary = computed(() => {
+  const chips = groupChips(poolUnconfigured.value);
+  if (!chips.length) return '';
+  let noOffering = 0;
+  let clazz = 0;
+  let teacher = 0;
+  let rhythm = 0;
+  for (const c of chips) {
+    if (!Number(c.offeringCount ?? 0)) {
+      noOffering += 1;
+      continue;
+    }
+    const g = c.cfgGaps ?? [];
+    if (g.includes('clazz')) clazz += 1;
+    if (g.includes('teacher')) teacher += 1;
+    if (g.includes('rhythm')) rhythm += 1;
+  }
+  const parts: string[] = [];
+  if (clazz) parts.push(`缺班级 ${clazz} 门`);
+  if (teacher) parts.push(`缺教师 ${teacher} 门`);
+  if (rhythm) parts.push(`缺排课设置 ${rhythm} 门`);
+  if (noOffering) parts.push(`无开课记录 ${noOffering} 门`);
+  // 各项会重叠（一门课可能同时缺班级与排课设置），不注明的话 16+13 > 19 会让人以为数错了
+  const overlap = parts.length > 1 ? '（同一门可能同时缺多项）' : '';
+  return `右栏 ${chips.length} 门未配置：${parts.join(' · ')}${overlap}——补齐后自动进「已配置课程」`;
+});
 
 /** 两栏各多少门（池子 head 上一句话报清；按门不按节，与「共 N 门课」同一量纲） */
 const poolCfgCounts = computed(() => ({
@@ -1264,19 +1370,64 @@ const poolColumnFiltered = computed(() =>
   poolColumns.value.reduce((n, col) => n + (col.count - col.entries.length), 0)
 );
 
+/** 缺口短名（角标用）：尽量短，两列卡片里不能把课程名挤没 */
+const CFG_GAP_SHORT: Record<CfgGap, string> = { rhythm: '排课设置', teacher: '教师', clazz: '班级' };
+/** 缺口全称（悬停说明用） */
+const CFG_GAP_FULL: Record<CfgGap, string> = { rhythm: '排课设置（总节次/每周节次/周范围）', teacher: '授课教师', clazz: '面向班级' };
+
+/**
+ * 未配置卡片的角标文案（2026-11-16）。
+ * 业主口径：连教师 / 班级都没选的课不该进「已配置」，所以角标必须说清**缺哪一项**，
+ * 否则管理员只看到「未配置」三个字，不知道该去课程详情改什么。
+ */
+function cfgGapLabel(e: PoolEntry): string {
+  if (!Number(e.offeringCount ?? 0)) return '未建开课';
+  const gaps = e.cfgGaps ?? [];
+  if (!gaps.length) return '未配置';
+  // 只缺节奏：沿用「未配 1/2」这种带分子分母的写法，管理员能立刻知道是几条开课记录没配
+  if (gaps.length === 1 && gaps[0] === 'rhythm') {
+    const un = Number(e.missingRhythm ?? e.offeringUnconfigured ?? 0);
+    const total = Number(e.offeringCount ?? 0);
+    return un >= total ? '缺排课设置' : `未配 ${un}/${total}`;
+  }
+  // 固定「班级 → 教师 → 排课设置」的书写顺序：业务属性在前、配置项在后，读起来更顺
+  const ordered = (['clazz', 'teacher', 'rhythm'] as CfgGap[]).filter(g => gaps.includes(g));
+  return `缺${ordered.map(g => CFG_GAP_SHORT[g]).join('·')}`;
+}
+
+/** 缺口短句（表单提示用）：缺排课设置、教师 */
+function cfgGapSentence(gaps: CfgGap[] | undefined): string {
+  if (!gaps?.length) return '配置不全';
+  const ordered = (['clazz', 'teacher', 'rhythm'] as CfgGap[]).filter(g => gaps.includes(g));
+  return '缺' + ordered.map(g => CFG_GAP_SHORT[g]).join('、');
+}
+
+/** 未配置原因的悬停说明：逐项列缺口 + 指路到具体页面 */
+function cfgGapTip(e: PoolEntry): string {
+  const total = Number(e.offeringCount ?? 0);
+  if (!total) {
+    return '未配置课程：还没有开课记录（谁教、面向哪个班都没登记）⇒ 自动排课无从下手；手动排课仍可直接建课次。补：课程管理 → 课程详情 → 开课记录，先建一条并选好授课教师与面向班级';
+  }
+  const gaps = e.cfgGaps ?? [];
+  if (!gaps.length) return '未配置课程';
+  const un = Number(e.missingRhythm ?? e.offeringUnconfigured ?? 0);
+  const parts: string[] = [];
+  if (gaps.includes('rhythm')) parts.push(`${CFG_GAP_FULL.rhythm}${un && un < total ? `（${total} 条开课记录里 ${un} 条没配）` : ''} 未配`);
+  if (gaps.includes('teacher')) parts.push('授课教师未选');
+  if (gaps.includes('clazz')) parts.push('面向班级未选');
+  return (
+    `未配置课程：${parts.join('、')} ⇒ 自动排课不收录（节奏、教师、班级三项齐备才进「已配置课程」）；` +
+    '手动排课不受影响。补：课程管理 → 课程详情 → 开课记录（选授课教师 / 面向班级）与「排课设置」'
+  );
+}
+
 /** 课程池的签标题：把「能不能自动排课」写进悬停说明，不让人靠颜色猜 */
 function poolChipTitle(e: PoolEntry) {
   if (!canCreate.value) return '只读：当前账号无新建课次权限';
   const base = e.key.startsWith('lesson-') ? '拖动排回这 1 节' : '拖动新建 1 节课次';
   const cnt = (e as PoolChip).count ?? 0;
   const countTip = cnt > 1 ? `；该课共 ${cnt} 节待排，拖一次排回一节` : '';
-  const cfgTip = !isCfgReady(e.cfg)
-    ? !Number(e.offeringCount ?? 0)
-      ? '；未配置课程：还没有开课记录（谁教、面向哪个班都还没登记），自动排课无从下手；手动排课照常可用'
-      : e.cfg === 'partial'
-        ? `；未配置课程：${Number(e.offeringCount ?? 0)} 条开课记录里还有 ${Number(e.offeringUnconfigured ?? 0)} 条没配排课设置，要全部配齐才进「已配置课程」；手动排课照常可用`
-        : '；未配置课程：开课记录还没保存排课设置（总节次 / 每周节次 / 周范围），自动排课不收录；手动排课照常可用'
-    : '';
+  const cfgTip = isCfgReady(e.cfg) ? '' : `；${cfgGapTip(e)}`;
   return `${base}${countTip}，或点击打开新增表单：${e.courseName}${cfgTip}`;
 }
 
@@ -2574,9 +2725,9 @@ const selectionCourseOptions = computed(() =>
  *   `AdminScheduleServiceImpl.doCreate` 只校验 courseId / teacherId / classTime / durationMin / 周号，
  *   **不校验排课设置**。所以这里给一行中性提示，而不是禁用「保存课次」。
  */
-const createCourseCfg = computed(() => {
+const createCourseCfg = computed<CfgVerdict | null>(() => {
   const c = form.courseId ? courseById.value.get(String(form.courseId)) : undefined;
-  return c ? cfgStateOf(c) : '';
+  return c ? cfgVerdictOf(c) : null;
 });
 
 /** 课程自带的认证教师——只作**默认值**，不再是唯一可选值（2026-11-11） */
@@ -3398,7 +3549,7 @@ function openAuto() {
   if (!autoEntries.value.length) {
     ElMessage.warning(
       autoNotConfigured.value
-        ? `待排池里的 ${autoNotConfigured.value} 条课都属于「未配置课程」：自动排课只收已配置的课，本次没有可自动排的对象。这些课可以直接在待排池里手动排（点卡片打开表单，或拖到课表格子）；想批量自动排，先到「课程管理 → 课程详情 → 开课记录 → 排课设置」把该课每条开课记录都配齐`
+        ? `待排池里的 ${autoNotConfigured.value} 条课都属于「未配置课程」：自动排课只收教师、班级、排课设置都齐的课，本次没有可自动排的对象。这些课可以直接在待排池里手动排（点卡片打开表单，或拖到课表格子）；想批量自动排，先到「课程管理 → 课程详情 → 开课记录」给每条记录选好授课教师与面向班级，再保存「排课设置」`
         : '待排池里的签都对应「课程已在课表上」的放回记录，没有需要排的课；若要整门重排，先把该课全部节次放回'
     );
     return;
@@ -4244,22 +4395,15 @@ watch(
                   class="badge chip-badge chip-count"
                   :title="`该课有 ${c.count} 节待排（来自「放回」的课次记录）：拖一次排回一节，点卡片可只排其中一节`"
                 >×{{ c.count }} 节</span>
-                <!-- 未配置原因角标（2026-11-16）：未配置栏里的卡分三种情况，用一枚角标说清缺到哪一步——
-                     ① 根本没开课记录；② 开课记录只配了一部分（写「未配 1/2」）；③ 一条都没配。
-                     两列卡片只留这一枚，课程名才不会被角标挤没。 -->
+                <!-- 未配置原因角标（2026-11-16）：从「未配置」三个字改成**缺什么就写什么**——
+                     缺排课设置 / 未配 1/2 / 缺教师 / 缺班级 / 缺教师·班级 / 未建开课。
+                     起因：业主发现「已配置课程」里有课连教师和班级都没选，说明只判排课节奏不够；
+                     归到未配置栏之后，角标必须指明该去补哪一步。 -->
                 <span
                   v-else-if="!isCfgReady(c.cfg)"
                   class="badge badge-warning chip-badge"
-                  :title="!Number(c.offeringCount ?? 0)
-                    ? '未配置课程：还没有开课记录（谁教、面向哪个班都没登记）⇒ 自动排课无从下手；手动排课仍可直接建课次'
-                    : c.cfg === 'partial'
-                      ? `未配置课程：${Number(c.offeringCount ?? 0)} 条开课记录里有 ${Number(c.offeringUnconfigured ?? 0)} 条还没保存排课设置，要全部配齐才进「已配置课程」；手动排课不受影响`
-                      : '未配置课程：开课记录还没保存排课设置（总节次 / 每周节次 / 周范围）⇒ 自动排课不收录；手动排课不受影响'"
-                >{{ !Number(c.offeringCount ?? 0)
-                  ? '未建开课'
-                  : c.cfg === 'partial'
-                    ? `未配 ${Number(c.offeringUnconfigured ?? 0)}/${Number(c.offeringCount ?? 0)}`
-                    : '未配置' }}</span>
+                  :title="cfgGapTip(c)"
+                >{{ cfgGapLabel(c) }}</span>
               </div>
               <div class="chip-bottom">
                 <span class="chip-meta">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
@@ -4279,6 +4423,12 @@ watch(
         <div v-else class="pool-empty">
           <ZkIcon :name="col.key === 'configured' ? 'check' : 'info'" :size="14" />
           {{ col.blank }}
+        </div>
+        <!-- 已配置栏脚下的归因（2026-11-16）：严格口径下只剩少数几门时，左栏会空出一块，
+             这里一句话说明「其余课各缺什么」，避免管理员以为筛选坏了或者课丢了 -->
+        <div v-if="col.key === 'configured' && poolGapSummary" class="pool-gap-foot">
+          <ZkIcon name="info" :size="12" />
+          <span>{{ poolGapSummary }}</span>
         </div>
       </section>
     </div>
@@ -4943,8 +5093,8 @@ watch(
         <span
           v-if="!isCfgReady(c.cfg)"
           class="badge badge-warning"
-          title="未配置课程：只影响自动排课；手动拖拽或点「排课」照常可用。到「课程管理 → 课程详情 → 开课记录 → 排课设置」把每条开课记录都配齐后，才会进「已配置课程」"
-        >未配置课程</span>
+          :title="cfgGapTip(c)"
+        >{{ cfgGapLabel(c) }}</span>
         </div>
         <button
           v-if="canCreate"
@@ -4989,9 +5139,14 @@ watch(
         </el-select>
         <!-- 未配置课程 ≠ 不能排（2026-11-16）：只提示「自动排课不会收录」，说明手动排照常可用，
              并给出补配置的路径。绝不因此禁用保存——那会把「没配节奏」变成「排不了课」。 -->
-        <div v-if="createCourseCfg && !isCfgReady(createCourseCfg)" class="small" style="color: var(--warning, #b45309); width: 100%">
-          该课还没配齐排课设置（总节次 / 每周节次 / 周范围）：<b>手动排课不受影响</b>，按下面选好时间与周范围即可保存；
-          想以后用「自动排课」省事，到「课程管理 → 课程详情 → 开课记录 → 排课设置」把每条开课记录都配齐。
+        <div
+          v-if="createCourseCfg && !isCfgReady(createCourseCfg.cfg)"
+          class="small"
+          style="color: var(--warning, #b45309); width: 100%"
+        >
+          该课属于「未配置课程」（{{ cfgGapSentence(createCourseCfg.gaps) }}）：
+          <b>手动排课不受影响</b>，按下面选好时间与周范围即可保存；
+          想以后用「自动排课」省事，到「课程管理 → 课程详情 → 开课记录」补齐授课教师与面向班级，并保存「排课设置」。
         </div>
       </el-form-item>
       <el-form-item label="授课教师" required>
@@ -5261,9 +5416,10 @@ watch(
       <div v-if="autoNotConfigured" class="detail-row">
         <span class="detail-k">未配置</span>
         <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">
-          还有 <b>{{ autoNotConfigured }}</b> 条课属于「未配置课程」（没配 / 只配了一部分 / 没有开课记录），
+          还有 <b>{{ autoNotConfigured }}</b> 条课属于「未配置课程」（缺教师 / 缺班级 / 缺排课设置 / 没有开课记录），
           <b>不在本次候选里</b>；这些课<b>仍可手动排课</b>（待排池里点它或直接拖到格子）。
-          想让它们参与自动排课：到「课程管理 → 课程详情 → 开课记录 → 排课设置」把该课每条开课记录都配齐。
+          想让它们参与自动排课：到「课程管理 → 课程详情 → 开课记录」给每条记录选好<b>授课教师</b>与<b>面向班级</b>，
+          再保存「排课设置」（总节次 / 每周节次 / 周范围）。
         </div>
       </div>
       <!-- 班级缺口（2026-11-02）：课程不带班级、放回签也没原班级时，不选班级就会排成空班级课次 -->
@@ -6573,6 +6729,25 @@ watch(
   border: 1px dashed var(--border);
   border-radius: 8px;
   padding: 10px;
+}
+/* 已配置栏脚下的缺口归因（2026-11-16）：严格口径下这栏常只剩几门，空出的地方放一句
+   「其余课各缺什么」，比一片白更能解释现状；贴底显示，不抢列表注意力 */
+.pool-gap-foot {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  flex: none;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  color: var(--ink-500);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.pool-gap-foot svg,
+.pool-gap-foot .zk-icon {
+  flex: none;
+  margin-top: 2px;
 }
 .legend-dot {
   width: 12px;

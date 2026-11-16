@@ -208,6 +208,13 @@ export interface OfferingBrief {
   studentCount?: number | null;
   status?: string | null;
   weekCount?: number | null;
+  /**
+   * 这条开课记录是否已保存排课设置（`course_offering.schedule_configured`，1=已配）。
+   * ★ 2026-11-16 新增：待排池要判「已配置课程」，光看课程行的 `offeringUnconfigured`
+   *   只知道**几条**没配，不知道缺的是节奏、教师还是班级；逐条明细才判得准。
+   * ★ 可选：旧包不下发 ⇒ 缺省按「已配」处理（不许因此把课全打成未配置）。
+   */
+  scheduleConfigured?: number | boolean | null;
 }
 
 /**
