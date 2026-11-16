@@ -378,22 +378,15 @@ async function submitOffering() {
         ? `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}；排课节奏 第 ${schedForm.weekFrom}~${schedForm.weekTo} 周 · 每周 ${schedForm.lessonsPerWeek} 节`
         : `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}；排课节奏未保存，可在课程详情里补`
     );
-    // 开课成功：清 step2 表单，允许继续为同一门课开第二个学期/班级组合
-    offerForm.termId = '';
-    offerForm.teacherId = '';
-    offerForm.clazzIds = [];
-    offerForm.joinCode = '';
-    schedForm.weekFrom = 1;
-    schedForm.weekTo = 18;
-    schedForm.lessonsPerWeek = 1;
-    schedForm.totalLessons = null;
-    joinCodeError.value = '';
-    emit('created');
-    // 排课节奏没写进去就别问「要不要自动排课」——后端会按「未配置节奏」跳过，问了必失败
-    if (!schedSaved) return;
+    // 一门课只允许一条配置（业主 2026-11-16：「配置完就是配置完了」）：
+    // 保存即结束，不再清空表单准备第二条，也不再留着弹窗让人接着配。
+    // 排课节奏没写进去就别问「要不要自动排课」——后端会按「未配置节奏」跳过，问了必失败。
+    if (!schedSaved) {
+      close();
+      return;
+    }
     // B-7 / 会议 A3（2026-11-10 接线）：开课成功后询问是否立即自动排课。
-    // ★ auto-arrange 失败不影响开课结果（开课已落库，仅提示可去排课页手动处理）；
-    //   排课成功则关窗并引导去智能排课页查看。业主拍板「新增的课给他重新排一次」。
+    // ★ auto-arrange 失败不影响开课结果（开课已落库，仅提示可去排课页手动处理）。
     try {
       await ElMessageBox.confirm(
         `「${created.value.courseName}」配置已保存（${res.termCode}）。是否立即按教学周自动排课？`,
@@ -401,15 +394,17 @@ async function submitOffering() {
         { confirmButtonText: '立即排课', cancelButtonText: '暂不，手动排', type: 'info' }
       );
     } catch {
-      return; // 用户选「暂不」：保持弹窗可继续开下一门
+      close(); // 选「暂不」也直接关窗：配置已是一条，没有第二条要配
+      return;
     }
     try {
       await autoArrange({ offeringId: res.offeringId });
       ElMessage.success('自动排课完成，可到「智能排课」页查看与微调');
-      close();
     } catch {
       /* request.ts 已弹后端原话；开课不受影响 */
       ElMessage.warning('配置已保存，但自动排课未完成——可到「智能排课」页手动排课');
+    } finally {
+      close();
     }
   } catch {
     /* request.ts 已弹后端原话（40902/40903/422 等） */
@@ -537,47 +532,55 @@ function close() {
            它同时就是这条配置的教学周数（offering.week_count = 周跨度），
            所以不再单列一个「教学周数」输入，避免两处各写一遍互相覆盖。 -->
       <el-form-item label="排课节奏">
-        <div style="width: 100%">
-          <div class="sched-row">
-            <span class="small">第</span>
-            <el-input-number
-              v-model="schedForm.weekFrom"
-              :min="1"
-              :max="30"
-              size="small"
-              style="width: 84px"
-              controls-position="right"
-            />
-            <span class="small">~ 第</span>
-            <el-input-number
-              v-model="schedForm.weekTo"
-              :min="1"
-              :max="30"
-              size="small"
-              style="width: 84px"
-              controls-position="right"
-            />
-            <span class="small">周　每周</span>
-            <el-input-number
-              v-model="schedForm.lessonsPerWeek"
-              :min="1"
-              :max="7"
-              size="small"
-              style="width: 84px"
-              controls-position="right"
-            />
-            <span class="small">节　共</span>
-            <el-input-number
-              v-model="schedForm.totalLessons"
-              :min="1"
-              :max="500"
-              size="small"
-              style="width: 104px"
-              controls-position="right"
-              placeholder="留空铺满"
-            />
-            <span class="small">节次</span>
-            <el-button size="small" plain @click="applyHoursDerived">按学时算</el-button>
+        <div class="cfg-block">
+          <!-- 2 列网格：标签定宽右对齐、数字框同宽左对齐。
+               原来是「第[]~第[]周 每周[]节 共[]节次 [按学时算]」一句流式排布，
+               560px 弹窗里必然折行，且每个框左边缘各不相同 ⇒ 看着全散着。 -->
+          <div class="cfg-grid">
+            <div class="cfg-cell">
+              <span class="cfg-lab">起始周</span>
+              <el-input-number
+                v-model="schedForm.weekFrom"
+                class="cfg-num"
+                :min="1"
+                :max="30"
+                controls-position="right"
+              />
+            </div>
+            <div class="cfg-cell">
+              <span class="cfg-lab">结束周</span>
+              <el-input-number
+                v-model="schedForm.weekTo"
+                class="cfg-num"
+                :min="1"
+                :max="30"
+                controls-position="right"
+              />
+            </div>
+            <div class="cfg-cell">
+              <span class="cfg-lab">每周节次</span>
+              <el-input-number
+                v-model="schedForm.lessonsPerWeek"
+                class="cfg-num"
+                :min="1"
+                :max="7"
+                controls-position="right"
+              />
+            </div>
+            <div class="cfg-cell">
+              <span class="cfg-lab">总节次</span>
+              <el-input-number
+                v-model="schedForm.totalLessons"
+                class="cfg-num"
+                :min="1"
+                :max="500"
+                controls-position="right"
+                placeholder="留空铺满"
+              />
+            </div>
+            <div class="cfg-actions">
+              <el-button plain @click="applyHoursDerived">按学时算</el-button>
+            </div>
           </div>
           <div class="small" :class="schedPreview.mismatch ? 'sched-warn' : 'field-tip'">
             <template v-if="schedPreview.derivedPeriods !== null">
@@ -668,12 +671,45 @@ function close() {
   font-size: 12px;
   color: var(--ink-400, #9aa3b2);
 }
-/* 排课节奏：一行控件排布（窄屏自动换行，避免数字框被压扁） */
-.sched-row {
+/* 排课节奏：2 列定宽网格。
+   每个 cell 是「定宽标签 + 等宽数字框」，四行的框左右边缘完全对齐；
+   按钮单独占一行、右对齐，不再和输入框挤在同一行折行。 */
+.cfg-block {
+  width: 100%;
+}
+.cfg-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 16px;
+  align-items: center;
+}
+.cfg-cell {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
+  min-width: 0;
+}
+.cfg-lab {
+  flex: 0 0 56px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-3, #667085);
+  text-align: right;
+  white-space: nowrap;
+}
+.cfg-num {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+}
+.cfg-actions {
+  grid-column: 2;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.cfg-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
 }
 /* 节次数与周跨度对不上时的提示（只提示不阻断，与详情页同口径） */
 .sched-warn {

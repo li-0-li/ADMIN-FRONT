@@ -549,7 +549,7 @@ const COLUMN_DEFS: ColumnDef[] = [
   { key: 'courseNo', label: '课程编号' },
   { key: 'courseName', label: '课程名称', locked: true },
   { key: 'status', label: '状态' },
-  { key: 'offeringCount', label: '配置数' },
+  { key: 'offeringCount', label: '配置' },
   { key: 'scheduleCount', label: '排课情况' }
 ];
 const COLUMN_STORAGE_KEY = 'zk_courses_columns_t01';
@@ -1154,16 +1154,21 @@ onMounted(async () => {
             <span class="badge" :class="statusBadge(row.status)">{{ statusLabel(row.status) }}</span>
           </template>
         </el-table-column>
-        <!-- 配置数（2026-11-16 由「开课数」改名）：0 = 只建了基础课程还没配过学期/教师/班级 -->
+        <!-- 配置（2026-11-16 由「配置数」改为二态）：一门课只允许一条配置，
+             所以数字列没有意义，直接显示 已配置 / 未配置；未配置 = 只建了基础课程 -->
         <el-table-column
           v-if="columnVisible.offeringCount"
-          label="配置数"
+          label="配置"
           width="90"
           align="center"
           prop="offeringCount"
           :sortable="canServerSort ? 'custom' : false"
         >
-          <template #default="{ row }">{{ row.offeringCount ?? '—' }}</template>
+          <template #default="{ row }">
+            <span v-if="row.offeringCount === null || row.offeringCount === undefined" class="muted small">—</span>
+            <span v-else-if="row.offeringCount > 0" class="badge badge-success">已配置</span>
+            <span v-else class="badge badge-neutral">未配置</span>
+          </template>
         </el-table-column>
         <!-- 排课情况：三种状态必须可辨：— = 统计没拿到 / 未排课 = 真的 0 节 / N 节 = 已排 -->
         <el-table-column
@@ -1302,7 +1307,13 @@ onMounted(async () => {
           <span class="k">状态</span>
           <span class="badge" :class="statusBadge(detailCourse.status)">{{ statusLabel(detailCourse.status) }}</span>
         </div>
-        <div class="pf-row"><span class="k">配置数</span><span>{{ detailCourse.offeringCount ?? '—' }}</span></div>
+        <div class="pf-row">
+          <span class="k">配置</span>
+          <span>
+            <span v-if="(detailData?.offerings ?? []).length" class="badge badge-success">已配置</span>
+            <span v-else class="badge badge-neutral">未配置</span>
+          </span>
+        </div>
         <div class="pf-row">
           <span class="k">排课情况</span>
           <span>
@@ -1318,16 +1329,20 @@ onMounted(async () => {
       <div>
         <div class="section-title">
           课程配置
+          <!-- 一门课只允许一条配置（业主 2026-11-16）：配过就不再给「追加」入口，
+               否则同一个学期/班级会多出重复配置，课程总览也分不清哪条是真的。
+               需要换学期/教师/班级时改现有配置（或删课重建）。 -->
           <el-button
-            v-if="canOffer"
+            v-if="canOffer && !(detailData?.offerings ?? []).length"
             size="small"
             type="primary"
             plain
             style="margin-left: 8px"
             @click="openOfferFor({ courseId: detailCourse.courseId, courseName: detailCourse.courseName, hours: detailData?.hours ?? detailCourse.hours ?? null })"
           >
-            <ZkIcon name="plus" :size="13" style="margin-right: 3px" />{{ (detailData?.offerings ?? []).length ? '追加配置' : '新增配置' }}
+            <ZkIcon name="plus" :size="13" style="margin-right: 3px" />新增配置
           </el-button>
+          <span v-else-if="(detailData?.offerings ?? []).length" class="small muted" style="margin-left: 8px">已配置完成</span>
         </div>
         <div v-loading="detailOfferLoading">
           <div v-if="(detailData?.offerings ?? []).length" class="stack" style="gap: 8px">
@@ -1361,22 +1376,38 @@ onMounted(async () => {
                     @click="schedCfgId === o.offeringId ? (schedCfgId = '') : openSchedCfg(o)"
                   >{{ schedCfgId === o.offeringId ? '收起' : '修改配置' }}</el-button>
                 </div>
-                <div
-                  v-if="schedCfgId === o.offeringId"
-                  style="margin-top: 8px; padding: 10px 12px; background: var(--fill-1, #f5f6f7); border-radius: 8px"
-                >
-                  <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center">
-                    <span class="small">第 <el-input-number v-model="schedCfgForm.weekFrom" :min="1" :max="30" size="small" style="width: 84px" controls-position="right" /> ~
-                      第 <el-input-number v-model="schedCfgForm.weekTo" :min="1" :max="30" size="small" style="width: 84px" controls-position="right" /> 周</span>
-                    <span class="small">每周 <el-input-number v-model="schedCfgForm.lessonsPerWeek" :min="1" :max="7" size="small" style="width: 84px" controls-position="right" /> 节</span>
-                    <span class="small">共 <el-input-number v-model="schedCfgForm.totalLessons" :min="1" :max="500" size="small" style="width: 100px" controls-position="right" placeholder="留空铺满" /> 节次</span>
+                <div v-if="schedCfgId === o.offeringId" class="cfg-block">
+                  <!-- 抽屉只有 ~240px 可用宽，改成单列「定宽标签 + 数字框」网格：
+                       四个框左右边缘对齐，按钮单独一行右对齐，不再各自折行。 -->
+                  <div class="cfg-grid">
+                    <div class="cfg-cell">
+                      <span class="cfg-lab">起始周</span>
+                      <el-input-number v-model="schedCfgForm.weekFrom" class="cfg-num" :min="1" :max="30" size="small" controls-position="right" />
+                    </div>
+                    <div class="cfg-cell">
+                      <span class="cfg-lab">结束周</span>
+                      <el-input-number v-model="schedCfgForm.weekTo" class="cfg-num" :min="1" :max="30" size="small" controls-position="right" />
+                    </div>
+                    <div class="cfg-cell">
+                      <span class="cfg-lab">每周节次</span>
+                      <el-input-number v-model="schedCfgForm.lessonsPerWeek" class="cfg-num" :min="1" :max="7" size="small" controls-position="right" />
+                    </div>
+                    <div class="cfg-cell">
+                      <span class="cfg-lab">总节次</span>
+                      <el-input-number
+                        v-model="schedCfgForm.totalLessons"
+                        class="cfg-num"
+                        :min="1"
+                        :max="500"
+                        size="small"
+                        controls-position="right"
+                        placeholder="留空铺满"
+                      />
+                    </div>
+                  </div>
+                  <div class="cfg-actions">
                     <el-button size="small" plain @click="applyHoursDerived">按学时算</el-button>
-                    <el-button
-                      size="small"
-                      type="primary"
-                      :loading="schedCfgSaving"
-                      @click="saveSchedCfg(o)"
-                    >保存</el-button>
+                    <el-button size="small" type="primary" :loading="schedCfgSaving" @click="saveSchedCfg(o)">保存</el-button>
                   </div>
                   <div
                     class="small"
@@ -1821,6 +1852,50 @@ onMounted(async () => {
 }
 .cert-hint {
   color: var(--warn-700, #8a6116);
+}
+
+/* 抽屉内「修改配置」的排课节奏：单列定宽网格。
+   抽屉内容区只有 ~240px，原来四个输入框混在文字里 flex-wrap，
+   一行一个、左边缘还各不相同（第/每周/共 起始位置不同）⇒ 看着全没对齐。 */
+.cfg-block {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--fill-1, #f5f6f7);
+  border-radius: 8px;
+}
+.cfg-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+.cfg-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cfg-lab {
+  flex: 0 0 56px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-3, #667085);
+  text-align: right;
+  white-space: nowrap;
+}
+.cfg-num {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+}
+.cfg-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+.cfg-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
 }
 
 /* 编号 68 同根因（基础数据页 2026-10-30 定性）：EP 分页器「当前页」两层规则叠加
