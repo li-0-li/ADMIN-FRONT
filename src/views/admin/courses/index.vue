@@ -1491,14 +1491,19 @@ onMounted(async () => {
               <span v-if="detail.aiSuggestion">　AI 初审：{{ detail.aiSuggestion }}</span>
             </div>
             <!-- P-3：原「课程审核」页的裁决操作并入抽屉（2026-11-10）——待审课程就地通过/驳回 -->
-            <div v-if="detail.certStatus === 'pending' && detail.certId" class="stack" style="gap: 8px; margin-bottom: 10px">
-              <el-button type="primary" size="small" :loading="reviewing" @click="submitDrawerReview('approve')">
-                <ZkIcon name="badge-check" :size="14" style="margin-right: 3px" />审核通过
-              </el-button>
-              <el-button type="danger" plain size="small" :loading="reviewing" @click="submitDrawerReview('reject')">
-                <ZkIcon name="x" :size="14" style="margin-right: 3px" />驳回
-              </el-button>
-              <div class="small muted">通过后教师即可开始备课；驳回需填写原因，课程退回「认证中」。</div>
+            <div v-if="detail.certStatus === 'pending' && detail.certId" style="margin-bottom: 10px">
+              <!-- 裁决按钮横向并排：原先套 .stack（flex-column）竖排，EP 的
+                   `.el-button + .el-button { margin-left: 12px }` 在竖排下变成水平偏移，
+                   「驳回」比「审核通过」整体右移 12px、宽度也不一致 ⇒ 看起来没对齐。 -->
+              <div class="cert-actions">
+                <el-button type="primary" size="small" :loading="reviewing" @click="submitDrawerReview('approve')">
+                  <ZkIcon name="badge-check" :size="14" style="margin-right: 3px" />审核通过
+                </el-button>
+                <el-button type="danger" plain size="small" :loading="reviewing" @click="submitDrawerReview('reject')">
+                  <ZkIcon name="x" :size="14" style="margin-right: 3px" />驳回
+                </el-button>
+              </div>
+              <div class="small muted" style="margin-top: 6px">通过后教师即可开始备课；驳回需填写原因，课程退回「认证中」。</div>
             </div>
             <div v-if="(detail.materials ?? []).length" class="stack" style="gap: 8px">
               <div v-for="m in detail.materials" :key="m.materialId" class="material-row">
@@ -1871,6 +1876,18 @@ onMounted(async () => {
   border: 1px solid var(--line, #eceef3);
   border-radius: 8px;
   font-size: 13px;
+}
+
+/* 认证材料区的裁决按钮行：横向等距排列。
+   EP 默认给相邻 .el-button 加 margin-left: 12px，横向用 gap 后必须把它清零，
+   否则第一个按钮与第二个之间会变成 8 + 12 = 20px，和其它行距不齐。 */
+.cert-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cert-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
 }
 
 /* 编号 68 同根因（基础数据页 2026-10-30 定性）：EP 分页器「当前页」两层规则叠加
