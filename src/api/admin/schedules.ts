@@ -152,6 +152,13 @@ export interface AutoArrangeBody {
   preferredClassroomId?: string | number;
   /** 只排该学期的开课（2026-11-13）：不传则后端排除已结束学期，避免排进历史学期 */
   termId?: string | number;
+  /**
+   * 周窗口覆盖（2026-11-16「排到本周」）：与开课配置的周范围**取交集**，不是替换。
+   * weekFrom + weekCount（缺省 1）＝ 只在这一段周内找空位。
+   */
+  weekFrom?: number;
+  /** 与 weekFrom 配用；缺省 1 */
+  weekCount?: number;
 }
 export async function autoArrange(body: AutoArrangeBody) {
   return request<
@@ -167,6 +174,8 @@ export async function autoArrange(body: AutoArrangeBody) {
       weekParity: body.weekParity ?? 'all',
       ...(body.targetClass ? { targetClass: body.targetClass } : {}),
       ...(body.termId !== undefined && body.termId !== '' ? { termId: String(body.termId) } : {}),
+      ...(body.weekFrom !== undefined ? { weekFrom: body.weekFrom } : {}),
+      ...(body.weekCount !== undefined ? { weekCount: body.weekCount } : {}),
       ...(body.preferredClassroomId !== undefined && body.preferredClassroomId !== ''
         ? { preferredClassroomId: String(body.preferredClassroomId) }
         : {})
@@ -205,6 +214,8 @@ export interface OfferingBrief {
   studentCount?: number | null;
   status?: string | null;
   weekCount?: number | null;
+  /** 一周几节（`course_offering.lessons_per_week`，缺省 1；待排池按它封顶每周签数） */
+  lessonsPerWeek?: number | null;
   /**
    * 这条开课记录是否已保存排课设置（`course_offering.schedule_configured`，1=已配）。
    * ★ 2026-11-16 新增：待排池要判「已配置课程」，光看课程行的 `offeringUnconfigured`

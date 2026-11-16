@@ -1192,8 +1192,25 @@ function buildPoolEntries(): PoolEntry[] {
   for (const c of poolCourses.value) {
     const rows = returned.get(String(c.courseId));
     if (rows?.length) {
-      // 放回即回池：每条放回课次 1 张签（拖一次排回一节）
-      for (const r of rows) {
+      // ① 已兑现的签不再显示（2026-11-16 业主「×2 节只能有一节」的一半成因）：
+      //    放回后又在同一「星期+节次」排回了新课次 ⇒ 这张签已经被兑现，再挂着只会让人
+      //    以为主课有重复。按课程+星期+节次对本周在课表上的课次做差集。
+      const liveSlots = new Set(
+        inScope
+          .filter(x => String(x.courseId) === String(c.courseId))
+          .map(x => `${x.weekday}-${x.periodNo}`)
+      );
+      // ② 每周待排签数封顶 = 每周节数（2026-11-16 业主：「同一个老师同一个班级 ×2 节，只能有一节」）：
+      //    每周 1 节的课不该出现 2 张签——多出的是「建了又删」多轮留下的软删残影
+      //    （不同锚点/批次各留一条），按 scheduleId 新→旧保留前 N 张，其余不出签。库内行不动。
+      const offs = offeringByCourse.value[String(c.courseId)] ?? [];
+      const lpws = offs.map(o => Number(o.lessonsPerWeek ?? 1)).filter(n => Number.isFinite(n) && n >= 1);
+      const cap = lpws.length ? Math.max(...lpws) : 1;
+      const kept = rows
+        .filter(r => !liveSlots.has(`${r.weekday}-${r.periodNo}`))
+        .sort((a, b) => Number(b.scheduleId) - Number(a.scheduleId))
+        .slice(0, cap);
+      for (const r of kept) {
         const v = verdict(c);
         out.push({
           ...c,
@@ -1398,6 +1415,59 @@ const poolColumns = computed(() => {
 
 /** 两栏合计的卡片数（= 门数）；节的条数另报，两者不混（2026-11-16 池子按课程聚合后） */
 const poolChipCount = computed(() => poolColumns.value.reduce((n, col) => n + col.count, 0));
+
+/** 正在「排到本周」的签 key（防连点；'' = 空闲） */
+const placingKey = ref('');
+
+/**
+ * 「排到本周」（2026-11-16 业主）：不用挑具体格子，后端在本周内自动找空位
+ * （避开教师/教室/班级冲突与偏好网格）。走 auto-arrange 的 weekFrom/weekCount 覆盖，
+ * 与开课配置的周范围取交集——配置外的周后端会明确拒绝，不会把课排到窗口外。
+ */
+async function placeInCurrentWeek(c: PoolChip) {
+  if (placingKey.value) return;
+  if (!canCreate.value) {
+    ElMessage.warning('当前账号没有新建课次的权限（admin:schedules:create）');
+    return;
+  }
+  const tid = filters.termId || currentTermId.value;
+  const t = termInfoOf(tid);
+  const anchor = termAnchorOf(t);
+  if (!anchor) {
+    ElMessage.warning('该学期没有配置开始日期，算不出「本周」是第几周——请先在基础数据补全学期起止');
+    return;
+  }
+  const w = Math.floor((mondayOf(new Date()).getTime() - anchor.getTime()) / (7 * 86400000)) + 1;
+  if (w < 1) {
+    ElMessage.warning(`今天还在学期开始（${t?.startDate ?? '未知'}）之前，没有可排的「本周」`);
+    return;
+  }
+  placingKey.value = c.key;
+  try {
+    const rows = await autoArrange({
+      courseId: String(c.courseId),
+      weekFrom: w,
+      weekCount: 1,
+      termId: tid || undefined
+    });
+    const r = rows?.[0];
+    const placed = r?.arranged ?? 0;
+    const sk = r?.skipped ?? [];
+    if (placed > 0) {
+      ElMessage.success(`「${c.courseName}」已排入第 ${w} 周 ${placed} 节`);
+    } else if (sk.some(s => /幂等跳过/.test(s.reason || ''))) {
+      ElMessage.info(`「${c.courseName}」第 ${w} 周已排满，无需再排`);
+    } else {
+      ElMessage.warning(`「${c.courseName}」第 ${w} 周未排入：${sk[0]?.reason ?? '偏好网格内教师与教室均无空闲'}`);
+    }
+    // 只刷课表与池子（课次变了、开课配置没变，不必清 offerings 缓存）
+    await load(true);
+  } catch {
+    /* request.ts 已弹后端原话 */
+  } finally {
+    placingKey.value = '';
+  }
+}
 
 /**
  * 未配置课程按缺口归因（2026-11-16）。
@@ -4499,6 +4569,18 @@ watch(
                   title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
                 >已在课表</span>
               </div>
+              <!-- 排到本周（2026-11-16 业主）：不用挑具体格子，后端在这周内自动找空位。
+                   拖到格子上仍然是精确排（想指定星期/节次时用）。 -->
+              <button
+                type="button"
+                class="chip-place-week"
+                :disabled="placingKey === c.key"
+                :title="'在本周内自动找空位排 1 节（避开教师/教室/班级冲突）'"
+                @click.stop="placeInCurrentWeek(c)"
+              >
+                <ZkIcon name="zap" :size="11" />
+                {{ placingKey === c.key ? '排入中…' : '排到本周' }}
+              </button>
             </div>
           </div>
         </div>
@@ -6596,6 +6678,31 @@ watch(
   border-color: var(--brand-800);
   color: #fff;
   font-weight: 600;
+}
+/* 排到本周（2026-11-16）：签脚下的小动作按钮。不用挑格子，后端在本周内自动找位。
+   默认弱化成一行小字，hover 才浮现品牌色底；卡窄（两列布局）也不挤占元信息行。 */
+.chip-place-week {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 100%;
+  margin-top: 4px;
+  padding: 2px 0;
+  font-size: 11px;
+  color: var(--brand-800);
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, var(--brand-800) 40%, transparent);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.chip-place-week:hover {
+  background: color-mix(in srgb, var(--brand-800) 10%, transparent);
+  border-style: solid;
+}
+.chip-place-week:disabled {
+  opacity: 0.55;
+  cursor: wait;
 }
 .chip-bottom {
   display: flex;
