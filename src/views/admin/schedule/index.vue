@@ -1162,6 +1162,34 @@ const onlyClazzFiltering = computed(() =>
 const poolConfigured = computed(() => poolEntries.value.filter(e => e.cfg !== 'none'));
 const poolUnconfigured = computed(() => poolEntries.value.filter(e => e.cfg === 'none'));
 
+/**
+ * 池子里的「一张卡」= 一门课（2026-11-16 业主反馈：待排池里同一门课出现多张同名卡，像重复数据）。
+ *
+ * ★ 成因：池子条目的粒度是「1 节 = 1 签」，一门课整周 5 节被「放回」就会留下 5 张同名签。
+ *   以前靠 `poolSubLabel` 写「原 周一 1-2 节」区分，但两列布局后卡片变窄，多张同名卡挤在一栏里
+ *   看起来就是重复课程。现在按 courseId 聚合：一张卡 = 一门课，卡角标写「×N 节」，
+ *   拖拽/点击仍按「排一节」执行（点击后可在表单里选具体时间），N=1 时角标不显示。
+ */
+type PoolChip = PoolEntry & { count: number; sigKeys: string[] };
+
+function groupChips(list: PoolEntry[]): PoolChip[] {
+  const byCourse = new Map<string, PoolEntry[]>();
+  for (const e of list) {
+    const k = String(e.courseId);
+    const arr = byCourse.get(k);
+    if (arr) arr.push(e);
+    else byCourse.set(k, [e]);
+  }
+  const out: PoolChip[] = [];
+  for (const [cid, arr] of byCourse) {
+    // ★ key 保留第一张签的原 key（`lesson-*` / `course-*`）：sourceClazzOf / poolSubLabel /
+    //   poolChipTitle 都靠前缀判「是不是放回签」，改成 `grp-*` 会把原节次与原班级一起丢掉。
+    //   每门课至少一张签 ⇒ 原 key 天然唯一，可直接当 v-for 的 key。
+    out.push({ ...arr[0], count: arr.length, sigKeys: arr.map(a => a.key) });
+  }
+  return out;
+}
+
 type PoolColKey = 'configured' | 'unconfigured';
 /** 栏内筛选状态：关键字（课程名 / 教师名）+ 教师下拉 */
 const poolColKeyword = reactive<Record<PoolColKey, string>>({ configured: '', unconfigured: '' });
@@ -1180,6 +1208,8 @@ function matchPoolColumn(e: PoolEntry, col: PoolColKey) {
 
 const poolColumns = computed(() => {
   const total = poolEntries.value.length;
+  const cfgChips = groupChips(poolConfigured.value);
+  const unChips = groupChips(poolUnconfigured.value);
   return [
     {
       key: 'configured' as PoolColKey,
@@ -1188,11 +1218,12 @@ const poolColumns = computed(() => {
       icon: 'check',
       blank: !total
         ? '本周课程已全部排入课表'
-        : poolConfigured.value.length
+        : cfgChips.length
           ? '没有匹配的课程（清掉栏内搜索/筛选）'
           : '没有已配置的课——都在右栏，先去补排课设置',
-      count: poolConfigured.value.length,
-      entries: poolConfigured.value.filter(e => matchPoolColumn(e, 'configured'))
+      // 徽标数 = 门（一张卡一门），不是节；节的条数在池子 head 上统一报
+      count: cfgChips.length,
+      entries: cfgChips.filter(e => matchPoolColumn(e, 'configured'))
     },
     {
       key: 'unconfigured' as PoolColKey,
@@ -1201,14 +1232,17 @@ const poolColumns = computed(() => {
       icon: 'alert-triangle',
       blank: !total
         ? '本周课程已全部排入课表'
-        : poolUnconfigured.value.length
+        : unChips.length
           ? '没有匹配的课程（清掉栏内搜索/筛选）'
           : '所有待排课程都已配置排课节奏',
-      count: poolUnconfigured.value.length,
-      entries: poolUnconfigured.value.filter(e => matchPoolColumn(e, 'unconfigured'))
+      count: unChips.length,
+      entries: unChips.filter(e => matchPoolColumn(e, 'unconfigured'))
     }
   ];
 });
+
+/** 两栏合计的卡片数（= 门数）；节的条数另报，两者不混（2026-11-16 池子按课程聚合后） */
+const poolChipCount = computed(() => poolColumns.value.reduce((n, col) => n + col.count, 0));
 
 /** 两栏里被栏内搜索/筛选挡掉的条数（head 上如实报，避免"课怎么少了"） */
 const poolColumnFiltered = computed(() =>
@@ -1219,6 +1253,8 @@ const poolColumnFiltered = computed(() =>
 function poolChipTitle(e: PoolEntry) {
   if (!canCreate.value) return '只读：当前账号无新建课次权限';
   const base = e.key.startsWith('lesson-') ? '拖动排回这 1 节' : '拖动新建 1 节课次';
+  const cnt = (e as PoolChip).count ?? 0;
+  const countTip = cnt > 1 ? `；该课共 ${cnt} 节待排，拖一次排回一节` : '';
   const cfgTip =
     e.cfg === 'none'
       ? !Number(e.offeringCount ?? 0)
@@ -1227,20 +1263,22 @@ function poolChipTitle(e: PoolEntry) {
       : e.cfg === 'partial'
         ? '；部分开课记录未配置排课节奏（自动排课时这部分会被跳过，手动排不受影响）'
         : '';
-  return `${base}，或点击打开新增表单：${e.courseName}${cfgTip}`;
+  return `${base}${countTip}，或点击打开新增表单：${e.courseName}${cfgTip}`;
 }
 
 /* ---------- 待排课程展开浮层（非模态可拖动；内含搜索与教师筛选） ---------- */
 const poolPanelVisible = ref(false);
 const panelKeyword = ref('');
 const panelTeacherId = ref('');
-/** 面板课程列表 = 当前待排池 + 面板内筛选（关键字匹配课程名；教师下拉筛选） */
+/** 面板课程列表 = 当前待排池 + 面板内筛选（关键字匹配课程名；教师下拉筛选）；同样按课程聚合，避免同名多卡 */
 const panelEntries = computed(() =>
-  poolEntries.value.filter(c => {
-    if (panelKeyword.value && !(c.courseName ?? '').toLowerCase().includes(panelKeyword.value.trim().toLowerCase())) return false;
-    if (panelTeacherId.value && String(c.teacherId ?? '') !== panelTeacherId.value) return false;
-    return true;
-  })
+  groupChips(
+    poolEntries.value.filter(c => {
+      if (panelKeyword.value && !(c.courseName ?? '').toLowerCase().includes(panelKeyword.value.trim().toLowerCase())) return false;
+      if (panelTeacherId.value && String(c.teacherId ?? '') !== panelTeacherId.value) return false;
+      return true;
+    })
+  )
 );
 async function openPoolPanel() {
   panelKeyword.value = '';
@@ -3428,8 +3466,9 @@ function declaredClazzesOf(entry: PoolEntry): string[] | undefined {
  */
 function poolSubLabel(entry: PoolEntry): string {
   const parts: string[] = [];
-  // 放回签优先显示原课次时间：一门课整周 5 节全放回时，5 张卡靠「原 周X 第N节」区分
-  if (entry.key.startsWith('lesson-') && entry.fromWeekday && entry.fromPeriodNo) {
+  // 放回签优先显示原课次时间：一门课整周 5 节全放回时，靠「原 周X 第N节」区分是哪一节
+  // （2026-11-16 起多张签已聚合成一张卡，这里显示的是第一张的原时间，节数由卡上「×N 节」角标报）
+  if (entry.fromWeekday && entry.fromPeriodNo) {
     const wd = CN[entry.fromWeekday - 1] ?? '';
     const label = PERIODS.find(x => x.seq === entry.fromPeriodNo)?.label ?? `${entry.fromPeriodNo} 节`;
     parts.push(`原 周${wd} ${label}`);
@@ -4102,10 +4141,10 @@ watch(
     <div class="pool-head">
       <span class="card-title"><ZkIcon name="list-checks" :size="16" />待排课程</span>
       <span class="small muted">
-        共 {{ poolEntries.length }} 条待排（1 条 = 1 节课；已配置 {{ poolConfigured.length }} · 未配置
-        {{ poolUnconfigured.length }}）
-        <template v-if="poolFilterExcluded">· 另有 {{ poolFilterExcluded }} 条被筛选排除</template>
-        <template v-if="poolColumnFiltered">· 栏内筛选再挡掉 {{ poolColumnFiltered }} 条</template>
+        共 {{ poolChipCount }} 门课 / {{ poolEntries.length }} 节待排（已配置 {{ poolConfigured.length }} 节 · 未配置
+        {{ poolUnconfigured.length }} 节）
+        <template v-if="poolFilterExcluded">· 另有 {{ poolFilterExcluded }} 节被筛选排除</template>
+        <template v-if="poolColumnFiltered">· 栏内筛选再挡掉 {{ poolColumnFiltered }} 门</template>
         —— 拖到下方课表格子完成排课
       </span>
       <span class="spacer" style="flex: 1"></span>
@@ -4182,9 +4221,16 @@ watch(
             <div class="chip-body">
               <div class="chip-top">
                 <b class="chip-name">{{ c.courseName }}</b>
+                <!-- 多节待排（2026-11-16）：同课程的多张签已聚合成一张卡，这里报节数；
+                     有它时优先于配置角标（栏标题已说明配置状态），避免角标把课程名挤掉 -->
+                <span
+                  v-if="c.count > 1"
+                  class="badge chip-badge chip-count"
+                  :title="`该课有 ${c.count} 节待排（来自「放回」的课次记录）：拖一次排回一节，点卡片可只排其中一节`"
+                >×{{ c.count }} 节</span>
                 <!-- 配置状态角标：两列卡片里只留一枚最要紧的，避免角标把课程名挤没 -->
                 <span
-                  v-if="c.cfg === 'none'"
+                  v-else-if="c.cfg === 'none'"
                   class="badge badge-warning chip-badge"
                   :title="Number(c.offeringCount ?? 0)
                     ? '未配置排课节奏（总节次 / 每周节次 / 周范围）⇒ 自动排课不收录；手动排课不受影响'
@@ -6283,6 +6329,13 @@ watch(
   font-size: 10px;
   line-height: 15px;
   padding: 0 5px;
+}
+/* 多节待排角标：品牌色实心，与琥珀色的配置角标区分（一个是"有几节"，一个是"缺配置"） */
+.chip-count {
+  background: var(--brand-800);
+  border-color: var(--brand-800);
+  color: #fff;
+  font-weight: 600;
 }
 .chip-bottom {
   display: flex;
