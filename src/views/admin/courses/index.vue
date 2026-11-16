@@ -98,7 +98,9 @@ async function onRearrange(o: { offeringId: string; termCode?: string }) {
  * 每条「进行中」开课记录就地展开小表单；第X周~第Y周换算为 weekFrom + weekCount（Y-X+1）。
  * 总课时留空 = 按周数×每周节次自然铺满；填了则排满该节次总数即停（auto-arrange 幂等补差额）。
  *
- * ★ 量纲（2026-11-16 核验）：class_period 一个节次 = 「1-2 节」08:00–09:50 = 110 分钟 = 2 学时。
+ * ★ 量纲（2026-11-16 业主确认）：1 学时 = 50 分钟；class_period 一个节次 = 「1-2 节」08:00–09:50
+ *   = 110 分钟 = 2 学时 × 50 分钟 + 10 分钟课间休息。
+ *   ⇒ 一个节次算 **2 学时**、但场地/教师占用是 110 分钟（含休息），换算时两者不能混用。
  *   而 offering.total_lessons 存的是【节次】而非学时（OfferingScheduleConfigBo 原文「节次口径，排满即停」）。
  *   业务确认的对应关系：周数 = 课程学时 ÷ 2 ÷ 每周节次。
  *     64 学时 ÷ 2 = 32 节次，每周 2 节 ⇒ 16 周；56 学时 ⇒ 28 节次，每周 2 节 ⇒ 14 周。
@@ -1450,7 +1452,7 @@ onMounted(async () => {
                     :style="schedCfgPreview.mismatch ? 'color: var(--warn-700, #8a6116)' : 'color: var(--text-3, #667085)'"
                   >
                     <template v-if="schedCfgPreview.derivedPeriods !== null">
-                      本课 {{ schedCfgPreview.hours }} 学时 = <b>{{ schedCfgPreview.derivedPeriods }}</b> 节次（1 节次 08:00–09:50 = 2 学时）；当前填
+                      本课 {{ schedCfgPreview.hours }} 学时 = <b>{{ schedCfgPreview.derivedPeriods }}</b> 节次（1 节次 08:00–09:50 = 2 学时：50 分钟 × 2 + 10 分钟课间）；当前填
                       <b>{{ schedCfgPreview.periods }}</b> 节次 ÷ 每周 {{ schedCfgPreview.perWeek }} 节 ⇒ 需
                       <b>{{ schedCfgPreview.needWeeks }}</b> 周，而周跨度填的是 {{ schedCfgPreview.spanWeeks }} 周<template v-if="schedCfgPreview.mismatch">（不一致：点「按学时算」自动对齐）</template>。
                     </template>

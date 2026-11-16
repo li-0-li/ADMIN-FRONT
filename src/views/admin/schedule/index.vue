@@ -950,6 +950,24 @@ function certPassed(courseId: string | number | undefined | null): boolean {
   return c.status === 'active';
 }
 
+/**
+ * 排课节奏配置状态（2026-11-16）：把后端按 offering 汇总的两个计数翻成签上可判定的状态。
+ * 口径来自课程列表 `AdminCourseVo`：
+ *   · `offeringCount`       该课程名下开课记录数；
+ *   · `offeringUnconfigured` 其中 schedule_configured=0 的条数。
+ * ★ 课程行**没有** offerings（total=0）也判「未配置」：后端 auto-arrange 是按 offering 排的，
+ *   一门没有开课记录的课，点了自动排课只会得到空结果——让它落进「未配置」栏并提示先建开课记录才对。
+ * ★ 字段缺失（旧包）一律 `unknown`，回落旧行为，绝不因为前端拿不到状态就把课判成「不能排」。
+ */
+function cfgStateOf(c: PoolCourse): PoolEntry['cfg'] {
+  if (typeof c.offeringUnconfigured !== 'number') return 'unknown';
+  const total = Number(c.offeringCount ?? 0);
+  const un = Number(c.offeringUnconfigured ?? 0);
+  if (!Number.isFinite(total) || total <= 0) return 'none';
+  if (!Number.isFinite(un) || un >= total) return 'none';
+  return un > 0 ? 'partial' : 'ready';
+}
+
 /** 本周被「放回待排」的课次（软删行全集）：每条 = 待排池里的一张签 */
 const returnedCells = ref<ScheduleCell[]>([]);
 
@@ -990,12 +1008,17 @@ interface PoolEntry extends CourseBrief {
    */
   inSchedule: boolean;
   /**
-   * 排课节奏未配置（2026-11-13 业主口径：先在课程详情保存排课设置才能自动排课）。
-   * 后端按 offering 维度拦截（schedule_configured=0 → Skip(week=0)）；
-   * 前端在弹窗里标「未配置节奏」并**默认排除**，显式勾选才参与。
-   * 课程行无 offerings ⇒ 按课程聚合列 offeringUnconfigured>0 判，粒度是课程级近似。
+   * 排课节奏配置状态（2026-11-16 业主口径：待排池拆「已配置 / 未配置」两栏，自动排课只收已配置的课）。
+   * - `ready`   全部开课记录都配过（总节次 / 每周节次 / 周范围）⇒ 可自动排课；
+   * - `partial` 有开课记录没配完 ⇒ 归「已配置」栏、允许自动排课（后端按 offering 逐条排，
+   *             未配的那条跳过并报因），签上标「含未配置开课」如实提示；
+   * - `none`    全部开课记录都没配、或根本还没有开课记录 ⇒ 只能手动排，自动排课不列它；
+   * - `unknown` 运行包不下发 `offeringUnconfigured`（旧包）⇒ 按已配置处理，回落旧行为。
+   *             ★ 宁可多列也不把课藏起来：旧包下若全判「未配置」，会出现「一门课都排不了」的假故障。
    */
-  unconfigured?: boolean;
+  cfg: 'ready' | 'partial' | 'none' | 'unknown';
+  /** 该课名下的开课记录数（`AdminCourseVo.offeringCount`）：0 = 只建了基础课程，排课无从下手 */
+  offeringCount?: number;
 }
 
 /**
@@ -1031,14 +1054,14 @@ function buildPoolEntries(): PoolEntry[] {
           ...c,
           key: `lesson-${r.scheduleId}`,
           inSchedule: used.has(String(r.courseId)),
-          unconfigured: (c.offeringUnconfigured ?? 0) > 0,
+          cfg: cfgStateOf(c),
           // 2026-11-05：带上原课次时间坐标，供池子卡片区分「同一门课的哪一节」
           fromWeekday: r.weekday,
           fromPeriodNo: r.periodNo
         });
       }
     } else if (!used.has(String(c.courseId))) {
-      out.push({ ...c, key: `course-${c.courseId}`, inSchedule: false, unconfigured: (c.offeringUnconfigured ?? 0) > 0 });
+      out.push({ ...c, key: `course-${c.courseId}`, inSchedule: false, cfg: cfgStateOf(c) });
     }
   }
   // 2026-11-11 放开认证门槛（录音 A3）：未认证课程**照常进待排池**。
@@ -1119,6 +1142,87 @@ const poolClazzMismatch = computed(() => {
 const onlyClazzFiltering = computed(() =>
   !!filters.clazzName && !filters.courseId && !filters.teacherId && !filters.major
 );
+
+/* ---------- 待排池两栏（2026-11-16 业主口径）：已配置排课节奏 / 未配置 ----------
+ * 为什么分两栏：以前 20 多条签混在一行里，管理员看不出「哪些课排不进去是因为没配节奏」，
+ * 每次自动排课都要先在弹窗里读一遍「N 条未配置」才知道；把配置状态搬到池子外面，
+ * 一眼就能看出缺什么、该先去补哪门课的排课设置。
+ * 分工（别混）：
+ *   · 已配置栏 = 自动排课的**唯一候选来源**（含 partial，后端逐条 offering 排，未配的那条跳过并报因）；
+ *   · 未配置栏 = 只能手动拖/手动排课；不参与自动排课。
+ * 栏内筛选与搜索是**各栏独立**的（管理员常在未配置栏里找某门课去补配置，
+ * 已配置栏的筛选不该影响它）；外层工具栏的筛选则两栏同时生效，这一层不重复做。
+ */
+const poolConfigured = computed(() => poolEntries.value.filter(e => e.cfg !== 'none'));
+const poolUnconfigured = computed(() => poolEntries.value.filter(e => e.cfg === 'none'));
+
+type PoolColKey = 'configured' | 'unconfigured';
+/** 栏内筛选状态：关键字（课程名 / 教师名）+ 教师下拉 */
+const poolColKeyword = reactive<Record<PoolColKey, string>>({ configured: '', unconfigured: '' });
+const poolColTeacher = reactive<Record<PoolColKey, string>>({ configured: '', unconfigured: '' });
+
+function matchPoolColumn(e: PoolEntry, col: PoolColKey) {
+  const kw = poolColKeyword[col].trim().toLowerCase();
+  if (kw) {
+    const hay = `${e.courseName ?? ''} ${e.teacherName ?? ''}`.toLowerCase();
+    if (!hay.includes(kw)) return false;
+  }
+  const tid = poolColTeacher[col];
+  if (tid && String(e.teacherId ?? '') !== tid) return false;
+  return true;
+}
+
+const poolColumns = computed(() => {
+  const total = poolEntries.value.length;
+  return [
+    {
+      key: 'configured' as PoolColKey,
+      title: '已配置排课节奏',
+      hint: '自动排课只排这一栏',
+      icon: 'check',
+      blank: !total
+        ? '本周课程已全部排入课表'
+        : poolConfigured.value.length
+          ? '没有匹配的课程（清掉栏内搜索/筛选）'
+          : '没有已配置的课——都在右栏，先去补排课设置',
+      count: poolConfigured.value.length,
+      entries: poolConfigured.value.filter(e => matchPoolColumn(e, 'configured'))
+    },
+    {
+      key: 'unconfigured' as PoolColKey,
+      title: '未配置排课节奏',
+      hint: '只能手动排课，自动排课不收录',
+      icon: 'alert-triangle',
+      blank: !total
+        ? '本周课程已全部排入课表'
+        : poolUnconfigured.value.length
+          ? '没有匹配的课程（清掉栏内搜索/筛选）'
+          : '所有待排课程都已配置排课节奏',
+      count: poolUnconfigured.value.length,
+      entries: poolUnconfigured.value.filter(e => matchPoolColumn(e, 'unconfigured'))
+    }
+  ];
+});
+
+/** 两栏里被栏内搜索/筛选挡掉的条数（head 上如实报，避免"课怎么少了"） */
+const poolColumnFiltered = computed(() =>
+  poolColumns.value.reduce((n, col) => n + (col.count - col.entries.length), 0)
+);
+
+/** 课程池的签标题：把「能不能自动排课」写进悬停说明，不让人靠颜色猜 */
+function poolChipTitle(e: PoolEntry) {
+  if (!canCreate.value) return '只读：当前账号无新建课次权限';
+  const base = e.key.startsWith('lesson-') ? '拖动排回这 1 节' : '拖动新建 1 节课次';
+  const cfgTip =
+    e.cfg === 'none'
+      ? !Number(e.offeringCount ?? 0)
+        ? '；还没有开课记录：自动排课无从下手，需先建开课记录并保存排课设置'
+        : '；未配置排课节奏：不能自动排课，需先到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存'
+      : e.cfg === 'partial'
+        ? '；部分开课记录未配置排课节奏（自动排课时这部分会被跳过）'
+        : '';
+  return `${base}，或点击打开新增表单：${e.courseName}${cfgTip}`;
+}
 
 /* ---------- 待排课程展开浮层（非模态可拖动；内含搜索与教师筛选） ---------- */
 const poolPanelVisible = ref(false);
@@ -2830,7 +2934,6 @@ function alignParityWeek(mode: RepeatMode, weekFrom: number): number {
 
 const currentTermInfo = computed(() => termInfoOf(currentTermId.value));
 const termAnchorMonday = computed<Date | null>(() => termAnchorOf(currentTermInfo.value));
-const termStartDateLabel = computed(() => currentTermInfo.value?.startDate ? String(currentTermInfo.value.startDate).slice(0, 10) : '');
 
 /* ---------- 弹窗所属学期（A4）----------
  * 排课归属学期必须显式选，不用「页面顶部筛选的学期」隐式代入：顶部筛选是查询过滤，
@@ -3139,14 +3242,22 @@ const autoClass = ref('');
  * 真实需求如果是「整门课换时间」，正确操作是把该课全部节次放回（used 里没它了 → inSchedule 自动变 false）。
  */
 const autoIncludeScheduled = ref(false);
-/** 本次自动排课实际参与的签 */
+/**
+ * 本次自动排课实际参与的签。
+ * ★ 2026-11-16 业主口径：**只收「已配置排课节奏」的课**（`cfg !== 'none'`）。
+ *   未配置的课在待排池里单独成栏、只能手动排，压根不进候选列表——
+ *   以前是"默认不勾但列在那里"，管理员仍会看到一排灰行、也仍可能手滑勾上去，
+ *   而它们排出来必然是 Skip(week=0)，只会把报告刷满「未配置」。
+ */
 const autoEntries = computed(() =>
-  poolEntries.value.filter(e => autoIncludeScheduled.value || !e.inSchedule)
+  poolEntries.value.filter(e => (autoIncludeScheduled.value || !e.inSchedule) && e.cfg !== 'none')
 );
 /** 被护栏挡下的签数（设置视图上说明，不静默吞） */
 const autoSkippedInSchedule = computed(() =>
-  autoIncludeScheduled.value ? 0 : poolEntries.value.filter(e => e.inSchedule).length
+  autoIncludeScheduled.value ? 0 : poolEntries.value.filter(e => e.inSchedule && e.cfg !== 'none').length
 );
+/** 未配置排课节奏、不在候选里的签数（弹窗里指路到课程详情，不静默吞） */
+const autoNotConfigured = computed(() => poolEntries.value.filter(e => e.cfg === 'none').length);
 /**
  * 本次要排哪些课（2026-11-02 业主需求）：勾选粒度 = 一张签（= 一节课）。
  * 会话级状态，key = PoolEntry.key；未登记的按「参与」处理，显式取消才置 false
@@ -3155,18 +3266,10 @@ const autoSkippedInSchedule = computed(() =>
  * （这一轮只想排其中几门），两者独立计数、分开报数，不混成一句「已跳过」。
  */
 const poolPick = reactive<Record<string, boolean>>({});
-/**
- * 真正参与排课的签：过了护栏 + 用户没取消勾选。
- * ★ 未配置排课节奏的签（2026-11-13）默认**排除**——语义与普通签相反（普通=不勾才排除），
- *   显式勾选（poolPick[key] === true）才参与；后端仍有一道兜底拦截。
- */
-const autoSelected = computed(() =>
-  autoEntries.value.filter(e => (e.unconfigured ? poolPick[e.key] === true : poolPick[e.key] !== false))
-);
+/** 真正参与排课的签：过了护栏 + 用户没取消勾选（未配置的课已在 autoEntries 被挡住） */
+const autoSelected = computed(() => autoEntries.value.filter(e => poolPick[e.key] !== false));
 /** 用户手动取消的条数（与护栏跳过分开统计） */
 const autoUnpicked = computed(() => autoEntries.value.length - autoSelected.value.length);
-/** 未配置排课节奏、被默认排除的签数（设置视图明示，不静默吞） */
-const autoUnconfigured = computed(() => autoEntries.value.filter(e => e.unconfigured).length);
 
 function resetPoolPick() {
   for (const k of Object.keys(poolPick)) delete poolPick[k];
@@ -3196,7 +3299,11 @@ function openAuto() {
   // 勾选状态也每次重置为「全选」：上一轮手动取消的课不该悄悄影响这一轮
   resetPoolPick();
   if (!autoEntries.value.length) {
-    ElMessage.warning('待排池里的签都对应「课程已在课表上」的放回记录，没有需要排的课；若要整门重排，先把该课全部节次放回');
+    ElMessage.warning(
+      autoNotConfigured.value
+        ? `待排池里的 ${autoNotConfigured.value} 条课都还没配置排课节奏，自动排课只收已配置的课；先到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次，或改用「手动排课」`
+        : '待排池里的签都对应「课程已在课表上」的放回记录，没有需要排的课；若要整门重排，先把该课全部节次放回'
+    );
     return;
   }
   autoReport.value = null;
@@ -3228,7 +3335,7 @@ function clearFiltersForAuto() {
 
 /**
  * 每条签单独指定的班级（2026-11-02）：一个老师常带多个班的课，同一批待排里往往混着不同班级，
- * 用弹窗的「默认班级」一刀切会把班级归属写错。会话级状态，key = PoolEntry.key（与 poolParity 同款）。
+ * 用弹窗的「默认班级」一刀切会把班级归属写错。会话级状态，key = PoolEntry.key（签刷新后仍在）。
  */
 const poolClazz = reactive<Record<string, string>>({});
 
@@ -3327,34 +3434,12 @@ const termWeekCount = computed(() => {
   // clamp 1~25（自动排课的安全上限，与历史口径一致）；手动排课的结束周上限走 termWeeksOf 的 1~30
   return Math.max(1, Math.min(25, Math.ceil(days / 7)));
 });
-/** 本次自动排课一条课要写的次数：每周=学期周数，隔周=学期内单/双周数 */
-function autoRepeatTimes(parity: PoolParity): number {
-  return parity === 'all' ? termWeekCount.value : Math.ceil(termWeekCount.value / 2);
-}
-/* ---------- 每门课的自动排课口径（2026-10-29）：每周 / 单周 / 双周 ----------
- * 会话级状态，key = PoolEntry.key（lesson-{scheduleId} / course-{courseId}，签刷新后仍在）。
- * 残留键不清理也无副作用（签没了就查不到）；隔周展开次数 = 学期周数的一半。 */
-type PoolParity = 'all' | 'odd' | 'even';
-const PARITY_TEXT: Record<PoolParity, string> = { all: '每周', odd: '单周', even: '双周' };
-const poolParity = reactive<Record<string, PoolParity>>({});
-function parityOf(e: PoolEntry): PoolParity {
-  return poolParity[e.key] ?? 'all';
-}
-/** 点签上的口径胶囊循环切换：每周 → 单周 → 双周 → 每周 */
-function cycleParity(e: PoolEntry) {
-  const cur = parityOf(e);
-  poolParity[e.key] = cur === 'all' ? 'odd' : cur === 'odd' ? 'even' : 'all';
-}
-/** 自动排课弹窗的隔周汇总与锚定说明（存在非每周口径的课才显示）；口径按**勾选参与集**统计，不按全池 */
-const poolParitySummary = computed(() => {
-  const odd = autoSelected.value.filter(e => parityOf(e) === 'odd').length;
-  const even = autoSelected.value.filter(e => parityOf(e) === 'even').length;
-  if (!odd && !even) return '';
-  const anchorNote = termAnchorMonday.value
-    ? `隔周按学期起点锚定（学期始于 ${termStartDateLabel.value}，单周=第 1、3、5…周）`
-    : '当前学期未配开始日期，隔周以当前浏览周为锚，开始前请先翻到学期第 1 周';
-  return `单周 ${odd} 门 · 双周 ${even} 门——${anchorNote}`;
-});
+/* ---------- 每门课的自动排课口径 ----------
+ * 2026-11-16 业主口径：待排签上不再挂「每周 / 单周 / 双周」胶囊，自动排课一律**每周**铺满学期
+ * （请求体不传 weekParity，接口层默认 'all'）。手动排课的「单双周重复」仍保留在新增课次弹窗里，
+ * 那是建课次时的排课方式，与这里「自动排课口径」不是同一件事。
+ * 原实现（2026-10-29 起）按签切换隔周，隔周次数 = 学期周数 / 2；摘掉胶囊后此分支不再可达，
+ * 相关状态与汇总一并删除，避免留下「改了没生效」的死代码。 */
 /**
  * 自动排课锁定的教室（外层「教室」筛选，2026-11-03 业主口径：**硬锁，排不进就报**）。
  * ★ 教室是排课的**落点**、不是课程属性，所以它做不了「筛掉哪些课」，只能约束「排到哪儿」。
@@ -3392,17 +3477,14 @@ const autoTermRangeLabel = computed(() => {
   return `学期第 1~${termWeekCount.value} 周（${fmt(anchor)} ~ ${fmt(end)}）`;
 });
 
-/** 隔周课在本学期实际要写的次数（设置视图明示用；与 autoRepeatTimes('odd'|'even') 同值） */
-const autoOddEvenTimes = computed(() => Math.ceil(termWeekCount.value / 2));
-
 /**
  * 批次2（2026-11-12）：自动排课统一走后端 POST /schedules/auto-arrange，前端本地规划器已下线。
  * ★ 为什么不再本地规划：前端按 course 算、后端按 offering 算，两套口径并存正是录音里
  *   「课程混乱」的根因；且后端才握有教师资格闸门（capability）与学期锚点的唯一真值。
  * ★ 逐门调用 courseId 口径（后端幂等：已有课次的周自动跳过），因此「放回签」也走同一入口——
  *   后端只补缺失的周，不会重复排课。
- * ★ 班级：逐条指定的班级 > 放回签原班级 > 弹窗默认班级；单双周 parity 跟随签上胶囊；
- *   教室锁定沿用外层「教室」筛选（后端 preferredClassroomId）。
+ * ★ 班级：逐条指定的班级 > 放回签原班级 > 弹窗默认班级；教室锁定沿用外层「教室」筛选
+ *   （后端 preferredClassroomId）。口径固定每周（不传 weekParity，接口层默认 'all'）。
  */
 async function runAuto() {
   if (autoRunning.value) return;
@@ -3421,7 +3503,6 @@ async function runAuto() {
       try {
         const rows = await autoArrange({
           courseId: e.courseId,
-          weekParity: parityOf(e),
           targetClass: entryClass(e).trim() || autoClass.value || undefined,
           preferredClassroomId: autoLockRoomId.value || undefined,
           // 只排当前学期（2026-11-13）：不传时后端也会排除已结束学期，但显式传更准
@@ -3430,19 +3511,15 @@ async function runAuto() {
         for (const r of rows ?? []) {
           const name = r.courseName || e.courseName;
           const placed = r.arranged ?? r.weeksPlaced?.length ?? 0;
-          const parityWord = parityOf(e) === 'odd' ? '双' : parityOf(e) === 'even' ? '单' : '';
           const rows2 = r.skipped ?? [];
-          const paritySkips = rows2.filter(s => (s.reason || '').includes('不上（')).length;
-          const realSkips = rows2.filter(s => !(s.reason || '').includes('不上（'));
-          const parityNote = paritySkips ? `，${paritySkips} 周为${parityWord}周不上` : '';
-          if (placed > 0) ok.push(`「${name}」→ 已排 ${placed}/${r.totalWeeks ?? '?'} 周${parityNote}`);
-          for (const s of realSkips.slice(0, 3)) {
+          if (placed > 0) ok.push(`「${name}」→ 已排 ${placed}/${r.totalWeeks ?? '?'} 周`);
+          for (const s of rows2.slice(0, 3)) {
             // week=0 = 整门开课被前置校验跳过（未配置节奏/无教师），不是某一周排不上
             skip.push(s.week === 0 ? `「${name}」：${s.reason || '前置校验未通过'}` : `「${name}」第 ${s.week} 周：${s.reason || '教师/教室无空档'}`);
           }
-          if (realSkips.length > 3) skip.push(`「${name}」另有 ${realSkips.length - 3} 周排不上（教师/教室无空档）`);
-          if (placed === 0 && realSkips.length === 0 && rows2.length) {
-            skip.push(`「${name}」：本学期各周均为${parityWord}周或已有课次，未排新课次`);
+          if (rows2.length > 3) skip.push(`「${name}」另有 ${rows2.length - 3} 周排不上（教师/教室无空档）`);
+          if (placed === 0 && rows2.length === 0 && rows.length) {
+            skip.push(`「${name}」：本学期各周都已有课次，未排新课次`);
           }
         }
       } catch (err) {
@@ -3922,8 +3999,10 @@ watch(
     <div class="pool-head">
       <span class="card-title"><ZkIcon name="list-checks" :size="16" />待排课程</span>
       <span class="small muted">
-        共 {{ poolEntries.length }} 条待排（1 条 = 1 节课）
+        共 {{ poolEntries.length }} 条待排（1 条 = 1 节课；已配置 {{ poolConfigured.length }} · 未配置
+        {{ poolUnconfigured.length }}）
         <template v-if="poolFilterExcluded">· 另有 {{ poolFilterExcluded }} 条被筛选排除</template>
+        <template v-if="poolColumnFiltered">· 栏内筛选再挡掉 {{ poolColumnFiltered }} 条</template>
         —— 拖到下方课表格子完成排课
       </span>
       <span class="spacer" style="flex: 1"></span>
@@ -3942,46 +4021,96 @@ watch(
         <ZkIcon name="move" :size="12" style="margin-right: 4px" />正在拖动：{{ draggingCell.courseName }}
       </span>
     </div>
-    <div v-if="poolEntries.length" class="pool-list">
-      <div
-        v-for="c in poolEntries"
-        :key="c.key"
-        class="pool-chip"
-        :draggable="canCreate"
-        :title="canCreate ? `拖动排课（${c.key.startsWith('lesson') ? '排回这 1 节' : '新建 1 节课次'}），或点击打开新增表单：${c.courseName}` : '只读：当前账号无新建课次权限'"
-        @dragstart="onDragStart(c, $event)"
-        @dragend="onDragEnd"
-        @click="openCreate(null, null, { courseId: String(c.courseId) })"
+    <!-- 两栏（2026-11-16 业主口径）：已配置 = 自动排课的唯一候选来源；未配置 = 只能手动排。
+         每栏自带搜索（课程名/教师名）与教师筛选，互不影响；外层工具栏的筛选仍然两栏同时生效。 -->
+    <div v-if="poolCourses.length" class="pool-cols">
+      <section
+        v-for="col in poolColumns"
+        :key="col.key"
+        class="pool-col"
+        :class="`pool-col-${col.key}`"
+        :data-pool-col="col.key"
       >
-        <ZkIcon name="grip-vertical" :size="13" class="grip" />
-        <b>{{ c.courseName }}</b>
-        <span class="small muted">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
-        <!-- 同名课程区分（2026-11-05）：course 表是开课记录粒度，一师一学期一条，
-             只显示课程名会让多教学班看起来像重复数据；这里补「学期 · 面向班级」。 -->
-        <span v-if="poolSubLabel(c)" class="small muted pool-sub" :title="poolSubLabel(c)">{{ poolSubLabel(c) }}</span>
-        <!-- 重复排课入口的可视化（2026-10-30 P0-A）：这门课还在课表上，这张签是放回留下的软删记录 -->
-        <span
-          v-if="c.inSchedule"
-          class="badge badge-warning"
-          title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
-        >已在课表</span>
-        <!-- 自动排课口径胶囊（2026-10-29）：每周/单周/双周循环切换，只影响自动排课；
-             .stop 防止误触发签本体的「打开新增表单」点击与拖拽 -->
-        <button
-          type="button"
-          class="chip-parity"
-          :class="{ 'is-alt': parityOf(c) !== 'all' }"
-          :title="`自动排课口径：${PARITY_TEXT[parityOf(c)]}${parityOf(c) === 'all' ? '' : termAnchorMonday ? '（按学期起点隔周）' : '（隔周上，锚定当前浏览周）'}，点击切换`"
-          @mousedown.stop
-          @click.stop="cycleParity(c)"
-        >
-          {{ PARITY_TEXT[parityOf(c)] }}
-        </button>
-      </div>
+        <div class="pool-col-head">
+          <span class="pool-col-title">
+            <ZkIcon :name="col.icon" :size="13" />{{ col.title }}
+            <span class="pool-col-count">{{ col.entries.length }}<template v-if="col.entries.length !== col.count"> / {{ col.count }}</template></span>
+          </span>
+          <span class="spacer" style="flex: 1"></span>
+          <span class="small muted pool-col-hint">{{ col.hint }}</span>
+        </div>
+        <div class="pool-col-tools">
+          <el-input
+            v-model="poolColKeyword[col.key]"
+            placeholder="搜索课程或教师"
+            size="small"
+            clearable
+            class="pool-col-search"
+          >
+            <template #prefix><ZkIcon name="search" :size="12" /></template>
+          </el-input>
+          <el-select
+            v-model="poolColTeacher[col.key]"
+            placeholder="全部教师"
+            size="small"
+            clearable
+            filterable
+            class="pool-col-teacher"
+          >
+            <el-option v-for="o in teacherOptions" :key="o.value" :label="o.label" :value="o.value" />
+          </el-select>
+        </div>
+        <div v-if="col.entries.length" class="pool-list">
+          <div
+            v-for="c in col.entries"
+            :key="c.key"
+            class="pool-chip"
+            :class="{ 'is-unconfigured': c.cfg === 'none' }"
+            :draggable="canCreate"
+            :title="poolChipTitle(c)"
+            @dragstart="onDragStart(c, $event)"
+            @dragend="onDragEnd"
+            @click="openCreate(null, null, { courseId: String(c.courseId) })"
+          >
+            <ZkIcon name="grip-vertical" :size="13" class="grip" />
+            <b>{{ c.courseName }}</b>
+            <span class="small muted">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
+            <!-- 同名课程区分（2026-11-05）：course 表是开课记录粒度，一师一学期一条，
+                 只显示课程名会让多教学班看起来像重复数据；这里补「学期 · 面向班级」。 -->
+            <span v-if="poolSubLabel(c)" class="small muted pool-sub" :title="poolSubLabel(c)">{{ poolSubLabel(c) }}</span>
+            <!-- 重复排课入口的可视化（2026-10-30 P0-A）：这门课还在课表上，这张签是放回留下的软删记录 -->
+            <span
+              v-if="c.inSchedule"
+              class="badge badge-warning"
+              title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
+            >已在课表</span>
+            <!-- 配置状态角标（2026-11-16）：两栏已把主要状态说清，这两枚只补「这条为什么排不了 / 可能排不全」 -->
+            <span
+              v-if="c.cfg === 'none' && !Number(c.offeringCount ?? 0)"
+              class="badge badge-warning"
+              title="该课还没有开课记录（谁教、面向哪个班都没登记）⇒ 自动排课无从下手。到「课程管理 → 课程详情」先建开课记录，再保存排课设置"
+            >未建开课</span>
+            <span
+              v-else-if="c.cfg === 'none'"
+              class="badge badge-warning"
+              title="该课的开课记录还没保存排课设置（总节次 / 每周节次 / 周范围）⇒ 自动排课不会收录它，只能手动排。到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次即可"
+            >未配置节奏</span>
+            <span
+              v-else-if="c.cfg === 'partial'"
+              class="badge badge-warning"
+              title="该课程有部分开课记录还没保存排课设置：自动排课会排已配置的那部分，未配置的由后端跳过并在结果里列出原因"
+            >含未配置开课</span>
+          </div>
+        </div>
+        <div v-else class="pool-empty">
+          <ZkIcon :name="col.key === 'configured' ? 'check' : 'info'" :size="14" />
+          {{ col.blank }}
+        </div>
+      </section>
     </div>
     <div v-else class="pool-empty">
       <ZkIcon name="check" :size="14" />
-      {{ poolCourses.length ? '本周课程已全部排入课表' : '课程池为空（后端课程列表未返回数据）' }}
+      课程池为空（后端课程列表未返回数据）
     </div>
   </div>
 
@@ -4637,6 +4766,11 @@ watch(
           class="badge badge-warning"
           title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
         >已在课表</span>
+        <span
+          v-if="c.cfg === 'none'"
+          class="badge badge-warning"
+          title="未配置排课节奏：不能自动排课，只能手动拖拽或点「排课」；到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存后即可自动排"
+        >未配置节奏</span>
         </div>
         <button
           v-if="canCreate"
@@ -4939,23 +5073,16 @@ watch(
       <div class="detail-row">
         <span class="detail-k">范围</span>
         <div class="small" style="flex: 1; min-width: 0">
-          {{ autoTermRangeLabel }}；每周课写 <b>{{ termWeekCount }}</b> 条，单/双周课写
-          <b>{{ autoOddEvenTimes }}</b> 条
+          {{ autoTermRangeLabel }}；每门课按每周 1 次铺满，一门课一次写 <b>{{ termWeekCount }}</b> 条课次
         </div>
       </div>
       <!-- 排课规则说明已上移到弹窗开头（紧跟「把待排课程…」那句）：夹在「范围」与「预警」中间会打断信息流 -->
-      <!-- 重复口径在待排池每条签上单独标（2026-10-29）：每周/单周/双周点胶囊切换；原弹窗内
-           的「重复」下拉在口径与 runAuto 解耦后已是摆设，换成隔周汇总与锚定警告 -->
-      <div v-if="poolParitySummary" class="detail-row">
-        <span class="detail-k">隔周</span>
-        <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">{{ poolParitySummary }}</div>
-      </div>
-      <!-- 未配置排课节奏（2026-11-13）：默认排除，指路课程详情；显式勾选才参与 -->
-      <div v-if="autoUnconfigured" class="detail-row">
+      <!-- 未配置排课节奏（2026-11-16 业主口径）：不进候选列表，只能手动排；这里如实报数并指路 -->
+      <div v-if="autoNotConfigured" class="detail-row">
         <span class="detail-k">未配置</span>
         <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">
-          <b>{{ autoUnconfigured }}</b> 条未配置排课节奏（总课时/每周几节/周范围），已默认排除不参与自动排课。
-          到「课程详情 → 开课记录 → 排课设置」保存后重新打开即恢复；确要现在排可手动勾选。
+          还有 <b>{{ autoNotConfigured }}</b> 条课未配置排课节奏（总节次 / 每周节次 / 周范围），
+          <b>不在本次候选里</b>，只能手动排。到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存后再打开本弹窗即可参与。
         </div>
       </div>
       <!-- 班级缺口（2026-11-02）：课程不带班级、放回签也没原班级时，不选班级就会排成空班级课次 -->
@@ -5000,25 +5127,25 @@ watch(
               style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px"
             >
               <el-checkbox
-                :model-value="e.unconfigured ? poolPick[e.key] === true : poolPick[e.key] !== false"
+                :model-value="poolPick[e.key] !== false"
                 size="small"
                 style="flex: none"
                 @change="poolPick[e.key] = !!$event"
               />
               <span
                 class="small"
-                :title="`${e.courseName}${e.teacherName ? ' · ' + e.teacherName : ''}${e.unconfigured ? ' · 未配置排课节奏（默认不参与）' : ''}${e.inSchedule ? ' · 课程已在课表（勾选会重复排课）' : ''}`"
+                :title="`${e.courseName}${e.teacherName ? ' · ' + e.teacherName : ''}${e.cfg === 'partial' ? ' · 部分开课记录未配置排课节奏' : ''}${e.inSchedule ? ' · 课程已在课表（勾选会重复排课）' : ''}`"
                 :style="{
                   flex: '1 1 auto',
                   minWidth: 0,
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
-                  opacity: (e.unconfigured ? poolPick[e.key] !== true : poolPick[e.key] !== false) ? 0.4 : 1,
-                  textDecoration: (e.unconfigured ? poolPick[e.key] !== true : poolPick[e.key] !== false) ? 'line-through' : 'none'
+                  opacity: poolPick[e.key] === false ? 0.4 : 1,
+                  textDecoration: poolPick[e.key] === false ? 'line-through' : 'none'
                 }"
               >{{ e.courseName }}</span>
-              <span v-if="e.unconfigured" class="badge badge-warning" style="flex: none">未配置节奏</span>
+              <span v-if="e.cfg === 'partial'" class="badge badge-warning" style="flex: none" title="部分开课记录还没保存排课设置，自动排课时这部分会被后端跳过并报因">含未配置开课</span>
               <span v-if="e.inSchedule" class="badge badge-warning" style="flex: none">已在课表</span>
               <el-select
                 v-model="poolClazz[e.key]"
@@ -5026,7 +5153,7 @@ watch(
                 clearable
                 filterable
                 placeholder="未指定"
-                :disabled="e.unconfigured ? poolPick[e.key] !== true : poolPick[e.key] === false"
+                :disabled="poolPick[e.key] === false"
                 style="width: 148px; flex: none"
               >
                 <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
@@ -5993,26 +6120,97 @@ watch(
   font-size: 11px;
   opacity: 0.72;
 }
-/* 自动排课口径胶囊（2026-10-29）：默认淡灰示「每周」，切成隔周后亮品牌色提示这是非默认口径 */
-.chip-parity {
-  margin-left: auto;
-  flex: none;
-  padding: 0 8px;
-  height: 18px;
-  line-height: 16px;
+/* ---- 待排池两栏（2026-11-16） ----
+ * 两栏等宽并排，窄屏（<1040px，含 IDE 内置预览）自动竖排——池子是拖动排课的入口，
+ * 横排挤压到每栏 200px 宽时课名会全被截断，竖排反而更好用。 */
+.pool-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+@media (max-width: 1040px) {
+  .pool-cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  /* 竖排后每栏拿到整行宽度，给列表多留些高度，少一次滚动 */
+  .pool-col .pool-list {
+    max-height: 208px;
+  }
+}
+.pool-col {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px 10px;
+  background: var(--bg-soft);
+}
+/* 未配置栏用警示底色：一眼能看出「这部分课自动排课排不进去」，不用去读字 */
+.pool-col-unconfigured {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+  background: color-mix(in srgb, var(--warning-soft) 55%, var(--bg-soft));
+}
+.pool-col-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.pool-col-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink-800);
+}
+.pool-col-count {
+  padding: 0 7px;
   border-radius: 9px;
-  border: 1px solid color-mix(in srgb, var(--brand-800) 25%, transparent);
-  background: transparent;
+  background: var(--brand-100);
   color: var(--brand-800);
   font-size: 11px;
-  cursor: pointer;
-  user-select: none;
-}
-.chip-parity.is-alt {
-  background: var(--brand-800);
-  border-color: var(--brand-800);
-  color: #fff;
   font-weight: 600;
+  line-height: 17px;
+}
+.pool-col-unconfigured .pool-col-count {
+  background: color-mix(in srgb, var(--warning) 18%, transparent);
+  color: var(--warn-700, var(--warning));
+}
+.pool-col-hint {
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pool-col-tools {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.pool-col-tools .pool-col-search {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.pool-col-tools .pool-col-teacher {
+  flex: 0 0 118px;
+  width: 118px;
+}
+/* 栏内签：窄栏里长课名要收口，否则会把栏撑出横向滚动 */
+.pool-col .pool-chip {
+  max-width: 100%;
+}
+.pool-col .pool-chip > b {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 未配置栏的签：降饱和 + 虚线边，与「可自动排」的签区分开（仍可拖 = 手动排课不受限） */
+.pool-chip.is-unconfigured {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
+  background: color-mix(in srgb, var(--warning-soft) 70%, #fff);
+  color: var(--ink-800);
 }
 /* ---- 待排课程展开浮层 ---- */
 .panel-tools {
