@@ -1178,7 +1178,7 @@ const poolColumns = computed(() => {
     {
       key: 'configured' as PoolColKey,
       title: '已配置排课节奏',
-      hint: '自动排课只排这一栏',
+      hint: '可进行自动排课',
       icon: 'check',
       blank: !total
         ? '本周课程已全部排入课表'
@@ -1191,7 +1191,7 @@ const poolColumns = computed(() => {
     {
       key: 'unconfigured' as PoolColKey,
       title: '未配置排课节奏',
-      hint: '只能手动排课，自动排课不收录',
+      hint: '可手动排课，配置后才能自动排课',
       icon: 'alert-triangle',
       blank: !total
         ? '本周课程已全部排入课表'
@@ -1216,10 +1216,10 @@ function poolChipTitle(e: PoolEntry) {
   const cfgTip =
     e.cfg === 'none'
       ? !Number(e.offeringCount ?? 0)
-        ? '；还没有开课记录：自动排课无从下手，需先建开课记录并保存排课设置'
-        : '；未配置排课节奏：不能自动排课，需先到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存'
+        ? '；还没有开课记录：自动排课无从下手（手动排课照常可用）；到「课程管理 → 课程详情」建开课记录并保存排课设置后即可自动排'
+        : '；未配置排课节奏：只影响自动排课，手动拖拽/新建课次照常可用；到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次即可自动排'
       : e.cfg === 'partial'
-        ? '；部分开课记录未配置排课节奏（自动排课时这部分会被跳过）'
+        ? '；部分开课记录未配置排课节奏（自动排课时这部分会被跳过，手动排不受影响）'
         : '';
   return `${base}，或点击打开新增表单：${e.courseName}${cfgTip}`;
 }
@@ -2509,6 +2509,18 @@ const selectionCourseOptions = computed(() =>
   }))
 );
 
+/**
+ * 手动排课表单里「所选课程的排课节奏配置状态」（2026-11-16）。
+ * ★ 用途只有一个：**告知**，绝不阻断。业主口径是「未配置的课也要能手动排」——
+ *   `schedule_configured` 只决定后端自动排课（auto-arrange）是否按周铺课，
+ *   `AdminScheduleServiceImpl.doCreate` 只校验 courseId / teacherId / classTime / durationMin / 周号，
+ *   **不校验排课设置**。所以这里给一行中性提示，而不是禁用「保存课次」。
+ */
+const createCourseCfg = computed(() => {
+  const c = form.courseId ? courseById.value.get(String(form.courseId)) : undefined;
+  return c ? cfgStateOf(c) : '';
+});
+
 /** 课程自带的认证教师——只作**默认值**，不再是唯一可选值（2026-11-11） */
 const autoTeacherId = computed(() => {
   const hit = form.courseId ? courseById.value.get(String(form.courseId)) : undefined;
@@ -3232,7 +3244,32 @@ async function createBatch(
 const autoVisible = ref(false);
 const autoRunning = ref(false);
 const autoProgress = ref('');
-const autoReport = ref<{ ok: string[]; skip: string[] } | null>(null);
+/**
+ * 自动排课结果（2026-11-16 重构：按门聚合 + 区分「已排满」与「真排不上」）。
+ *
+ * ★ 旧结构只有 ok/skip 两桶，把后端三种性质完全不同的 skipped 混成一个红色清单：
+ *   ① `已达总课时 8 节（幂等跳过）` / `该周已排满 2 节（幂等跳过）` —— 这是**正常完成**
+ *      （配置的总节次已经排满，后面的周本来就不该再排），不是失败；
+ *   ② `偏好网格内教师与教室均无空闲` —— 这才是真排不上；
+ *   ③ `该周已排满 / 单周不上` 等 —— 幂等或口径跳过。
+ *   混在一起后，一门 8 节的课会被刷成「第5~20周都排不上（教师/教室无空档）」，
+ *   看上去像排课坏了，其实是配置的总节次只有 8 节。这里按性质分桶，并给出配置体检建议。
+ */
+interface AutoReport {
+  /** 已排入的课（一门一行） */
+  ok: string[];
+  /** 已按配置排满、无需再排的课（中性，不是失败） */
+  done: string[];
+  /** 真未排入（教师/教室冲突、缺班级等） */
+  skip: string[];
+  /** 未参与 / 需要先补配置的提示 */
+  tips: string[];
+  /** 三门计数（按「门」，不是按周次行数） */
+  okCount: number;
+  doneCount: number;
+  skipCount: number;
+}
+const autoReport = ref<AutoReport | null>(null);
 /** 本次自动排课统一写入的班级（放回签优先用各自原课次的班级） */
 const autoClass = ref('');
 /**
@@ -3301,7 +3338,7 @@ function openAuto() {
   if (!autoEntries.value.length) {
     ElMessage.warning(
       autoNotConfigured.value
-        ? `待排池里的 ${autoNotConfigured.value} 条课都还没配置排课节奏，自动排课只收已配置的课；先到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次，或改用「手动排课」`
+        ? `待排池里的 ${autoNotConfigured.value} 条课都还没配置排课节奏：自动排课只收已配置的课，本次没有可自动排的对象。这些课可以直接在待排池里手动排（点卡片打开表单，或拖到课表格子）；想批量自动排，先到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次`
         : '待排池里的签都对应「课程已在课表上」的放回记录，没有需要排的课；若要整门重排，先把该课全部节次放回'
     );
     return;
@@ -3495,8 +3532,14 @@ async function runAuto() {
   autoRunning.value = true;
   autoReport.value = null;
   const ok: string[] = [];
+  const done: string[] = [];
   const skip: string[] = [];
+  const tips: string[] = [];
   const entries = autoSelected.value;
+  // 后端 skipped 的三种性质（见 AdminAutoArrangeServiceImpl）：幂等满 / 真无空档 / 其他前置校验
+  const IDEM = /幂等跳过/;
+  const NOSLOT = /无空闲|无空档|已被占用/;
+  const CAP_RE = /已达总课时\s*(\d+)\s*节/;
   try {
     for (const [i, e] of entries.entries()) {
       autoProgress.value = `正在排「${e.courseName}」（${i + 1}/${entries.length}）`;
@@ -3511,27 +3554,71 @@ async function runAuto() {
         for (const r of rows ?? []) {
           const name = r.courseName || e.courseName;
           const placed = r.arranged ?? r.weeksPlaced?.length ?? 0;
-          const rows2 = r.skipped ?? [];
-          if (placed > 0) ok.push(`「${name}」→ 已排 ${placed}/${r.totalWeeks ?? '?'} 周`);
-          for (const s of rows2.slice(0, 3)) {
-            // week=0 = 整门开课被前置校验跳过（未配置节奏/无教师），不是某一周排不上
-            skip.push(s.week === 0 ? `「${name}」：${s.reason || '前置校验未通过'}` : `「${name}」第 ${s.week} 周：${s.reason || '教师/教室无空档'}`);
+          const weeks = r.weeksPlaced ?? [];
+          const total = r.totalWeeks ?? 0;
+          const sk = r.skipped ?? [];
+          const idem = sk.filter(s => IDEM.test(s.reason || ''));
+          const noslot = sk.filter(s => NOSLOT.test(s.reason || ''));
+          const others = sk.filter(s => !IDEM.test(s.reason || '') && !NOSLOT.test(s.reason || ''));
+          // 配置体检用：后端「已达总课时 N 节」里的 N 就是 offering.total_lessons
+          const capHit = sk.map(s => (s.reason || '').match(CAP_RE)).find(Boolean);
+          const cap = capHit ? Number(capHit[1]) : null;
+          // ★ arranged = 课次条数（后端 `setArranged(weeksPlaced.size())`，而 weeksPlaced 每插一条课次就 add 一次，
+          //   所以 8 节 / 4 周会是 [1,1,2,2,3,3,4,4]）。每周节次要用「去重后的周数」反推，不能拿数组长度当周数。
+          const uniqWeeks = new Set(weeks).size;
+          const lpw = uniqWeeks ? Math.max(1, Math.round(placed / uniqWeeks)) : 1;
+          // 一门课最多各出一行：宁可少说，也不要把 20 周逐条铺成 20 行（业主 11-16：重复太多）
+          if (placed > 0) {
+            ok.push(`「${name}」已排 ${placed} 节（${uniqWeeks || '?'} 周${weeks.length ? `：${weeksLabel(weeks)}` : ''}）`);
+          } else if (idem.length && !noslot.length) {
+            done.push(`「${name}」已按配置排满，本次无需再排（${idem.length} 周跳过）`);
+          } else if (!sk.length && rows?.length) {
+            done.push(`「${name}」本学期各周都已有课次，未排新课次`);
           }
-          if (rows2.length > 3) skip.push(`「${name}」另有 ${rows2.length - 3} 周排不上（教师/教室无空档）`);
-          if (placed === 0 && rows2.length === 0 && rows.length) {
-            skip.push(`「${name}」：本学期各周都已有课次，未排新课次`);
+          if (placed > 0 && idem.length) {
+            done.push(`「${name}」其余 ${idem.length} 周已按配置排满，无需再排`);
+          }
+          if (noslot.length) {
+            skip.push(`「${name}」教师/教室无空闲，${noslot.length} 周未排入${noslot.length <= 6 ? `（${weeksLabel(noslot.map(s => s.week).filter((w): w is number => typeof w === 'number'))}）` : ''}`);
+          }
+          // 其他原因（如「未配置节奏」「无教师」）原样带出，不兜底成「无空档」——那是猜
+          if (others.length) {
+            tips.push(`「${name}」${others[0].reason || '前置校验未通过'}${others.length > 1 ? `（同类 ${others.length} 周）` : ''}`);
+          }
+          // 配置体检（根因提示）：总节次比「学期周数 × 每周节次」小 ⇒ 后面那些周永远排不满
+          if (cap !== null && total > 0 && cap < total * lpw) {
+            tips.push(
+              `「${name}」排课设置里总节次只有 ${cap} 节（按每周 ${lpw} 节只够 ${Math.ceil(cap / lpw)} 周），本学期共 ${total} 周需 ${total * lpw} 节 —— ` +
+                `要铺满整学期，到「课程管理 → 课程详情 → 开课记录 → 排课设置」把总节次改成 ${total * lpw} 再排一次`
+            );
           }
         }
       } catch (err) {
-        skip.push(`「${e.courseName}」：${err instanceof Error ? err.message : String((err as { message?: string })?.message ?? err)}`);
+        // 抛异常 = 这门课压根没参与（如「所选学期没有开课记录」），不是「排不上」，单独归入提示
+        tips.push(`「${e.courseName}」未参与本次排课：${err instanceof Error ? err.message : String((err as { message?: string })?.message ?? err)}`);
       }
     }
-    autoReport.value = { ok, skip };
+    autoReport.value = { ok, done, skip, tips, okCount: ok.length, doneCount: done.length, skipCount: skip.length };
   } finally {
     autoRunning.value = false;
     autoProgress.value = '';
   }
   await load(true);
+}
+
+/**
+ * 周次列表 → 人话（2026-11-16）。
+ * 连续区间压成「第 1–8 周」，零散的最多列 5 个再加「等 N 周」——
+ * 后端 skipped 是按周给的，原样铺开会把弹窗刷成几十行（业主反馈「重复的课程太多」）。
+ */
+function weeksLabel(ws: number[]): string {
+  const a = [...new Set(ws)].sort((x, y) => x - y);
+  if (!a.length) return '';
+  if (a.length === 1) return `第 ${a[0]} 周`;
+  const contiguous = a.every((v, i) => i === 0 || v === a[i - 1] + 1);
+  if (contiguous) return `第 ${a[0]}–${a[a.length - 1]} 周`;
+  const head = a.slice(0, 5).join('、');
+  return a.length > 5 ? `第 ${head} 等 ${a.length} 周` : `第 ${head} 周`;
 }
 
 /* ---------- 按班成池（批次5 B-9，后端 f3118e42，2026-11-13） ----------
@@ -4073,33 +4160,39 @@ watch(
             @click="openCreate(null, null, { courseId: String(c.courseId) })"
           >
             <ZkIcon name="grip-vertical" :size="13" class="grip" />
-            <b>{{ c.courseName }}</b>
-            <span class="small muted">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
-            <!-- 同名课程区分（2026-11-05）：course 表是开课记录粒度，一师一学期一条，
-                 只显示课程名会让多教学班看起来像重复数据；这里补「学期 · 面向班级」。 -->
-            <span v-if="poolSubLabel(c)" class="small muted pool-sub" :title="poolSubLabel(c)">{{ poolSubLabel(c) }}</span>
-            <!-- 重复排课入口的可视化（2026-10-30 P0-A）：这门课还在课表上，这张签是放回留下的软删记录 -->
-            <span
-              v-if="c.inSchedule"
-              class="badge badge-warning"
-              title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
-            >已在课表</span>
-            <!-- 配置状态角标（2026-11-16）：两栏已把主要状态说清，这两枚只补「这条为什么排不了 / 可能排不全」 -->
-            <span
-              v-if="c.cfg === 'none' && !Number(c.offeringCount ?? 0)"
-              class="badge badge-warning"
-              title="该课还没有开课记录（谁教、面向哪个班都没登记）⇒ 自动排课无从下手。到「课程管理 → 课程详情」先建开课记录，再保存排课设置"
-            >未建开课</span>
-            <span
-              v-else-if="c.cfg === 'none'"
-              class="badge badge-warning"
-              title="该课的开课记录还没保存排课设置（总节次 / 每周节次 / 周范围）⇒ 自动排课不会收录它，只能手动排。到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次即可"
-            >未配置节奏</span>
-            <span
-              v-else-if="c.cfg === 'partial'"
-              class="badge badge-warning"
-              title="该课程有部分开课记录还没保存排课设置：自动排课会排已配置的那部分，未配置的由后端跳过并在结果里列出原因"
-            >含未配置开课</span>
+            <!-- 两列布局（2026-11-16 业主口径：每行显示两门课）：卡片变窄后，课程名与元信息
+                 拆成上下两行——课程名独占一行才好省略，元信息（教师/人数/原节次）放第二行，
+                 否则横向挤在一行时只剩课程名看得见。 -->
+            <div class="chip-body">
+              <div class="chip-top">
+                <b class="chip-name">{{ c.courseName }}</b>
+                <!-- 配置状态角标：两列卡片里只留一枚最要紧的，避免角标把课程名挤没 -->
+                <span
+                  v-if="c.cfg === 'none'"
+                  class="badge badge-warning chip-badge"
+                  :title="Number(c.offeringCount ?? 0)
+                    ? '未配置排课节奏（总节次 / 每周节次 / 周范围）⇒ 自动排课不收录；手动排课不受影响'
+                    : '还没有开课记录（谁教、面向哪个班都没登记）⇒ 自动排课无从下手；手动排课仍可直接建课次'"
+                >{{ Number(c.offeringCount ?? 0) ? '未配置' : '未建开课' }}</span>
+                <span
+                  v-else-if="c.cfg === 'partial'"
+                  class="badge badge-warning chip-badge"
+                  title="该课程有部分开课记录还没保存排课设置：自动排课会排已配置的那部分，未配置的由后端跳过并列出原因"
+                >部分未配</span>
+              </div>
+              <div class="chip-bottom">
+                <span class="chip-meta">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
+                <!-- 同名课程区分（2026-11-05）：course 表是开课记录粒度，一师一学期一条，
+                     只显示课程名会让多教学班看起来像重复数据；这里补「学期 · 面向班级」。 -->
+                <span v-if="poolSubLabel(c)" class="chip-meta pool-sub" :title="poolSubLabel(c)">{{ poolSubLabel(c) }}</span>
+                <!-- 重复排课入口的可视化（2026-10-30 P0-A）：这门课还在课表上，这张签是放回留下的软删记录 -->
+                <span
+                  v-if="c.inSchedule"
+                  class="badge badge-warning chip-badge"
+                  title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
+                >已在课表</span>
+              </div>
+            </div>
           </div>
         </div>
         <div v-else class="pool-empty">
@@ -4769,7 +4862,7 @@ watch(
         <span
           v-if="c.cfg === 'none'"
           class="badge badge-warning"
-          title="未配置排课节奏：不能自动排课，只能手动拖拽或点「排课」；到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存后即可自动排"
+          title="未配置排课节奏：只影响自动排课；手动拖拽或点「排课」照常可用。到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存后即可加入自动排课"
         >未配置节奏</span>
         </div>
         <button
@@ -4813,6 +4906,12 @@ watch(
         <el-select v-model="form.courseId" placeholder="请选择课程" filterable style="width: 100%">
           <el-option v-for="o in selectionCourseOptions" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
+        <!-- 未配置排课节奏 ≠ 不能排（2026-11-16）：只提示「自动排课不会收录」，说明手动排照常可用，
+             并给出补配置的路径。绝不因此禁用保存——那会把「没配节奏」变成「排不了课」。 -->
+        <div v-if="createCourseCfg === 'none'" class="small" style="color: var(--warning, #b45309); width: 100%">
+          该课还没保存排课设置（总节次 / 每周节次 / 周范围）：<b>手动排课不受影响</b>，按下面选好时间与周范围即可保存；
+          想以后用「自动排课」省事，到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次。
+        </div>
       </el-form-item>
       <el-form-item label="授课教师" required>
         <!-- 2026-11-11 放开手选（录音 A2：「老是自动带出都是有问题的啊，这里要支持选老师」）：
@@ -5077,12 +5176,13 @@ watch(
         </div>
       </div>
       <!-- 排课规则说明已上移到弹窗开头（紧跟「把待排课程…」那句）：夹在「范围」与「预警」中间会打断信息流 -->
-      <!-- 未配置排课节奏（2026-11-16 业主口径）：不进候选列表，只能手动排；这里如实报数并指路 -->
+      <!-- 未配置排课节奏（2026-11-16 业主口径）：不进自动排课候选；手动排课照常可用 -->
       <div v-if="autoNotConfigured" class="detail-row">
         <span class="detail-k">未配置</span>
         <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">
           还有 <b>{{ autoNotConfigured }}</b> 条课未配置排课节奏（总节次 / 每周节次 / 周范围），
-          <b>不在本次候选里</b>，只能手动排。到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存后再打开本弹窗即可参与。
+          <b>不在本次候选里</b>；这些课<b>仍可手动排课</b>（待排池里点它或直接拖到格子）。
+          想让它们参与自动排课：到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次。
         </div>
       </div>
       <!-- 班级缺口（2026-11-02）：课程不带班级、放回签也没原班级时，不选班级就会排成空班级课次 -->
@@ -5169,17 +5269,43 @@ watch(
     </template>
     <template v-else-if="autoReport">
       <p style="margin-top: 0">
-        <b>排课结果：成功 {{ autoReport.ok.length }} 门，跳过 {{ autoReport.skip.length }} 门</b>
+        <b>
+          排课结果：新排入 {{ autoReport.okCount }} 门 · 有周次已排满 {{ autoReport.doneCount }} 门 · 未排入
+          {{ autoReport.skipCount }} 门
+        </b>
       </p>
-      <ul v-if="autoReport.ok.length" class="small" style="padding-left: 18px; line-height: 2">
-        <li v-for="(t, i) in autoReport.ok" :key="'ok' + i">{{ t }}</li>
-      </ul>
-      <div v-if="autoReport.skip.length">
-        <b class="small">未排入：</b>
-        <ul class="small" style="color: var(--error, #d92d20); padding-left: 18px; line-height: 2">
+      <!-- 四段分色（2026-11-16）：原来只有「成功 / 未排入」两桶，把「配置的总节次已排满」
+           当成失败刷成红色长清单，看着像排课坏了。现在按性质分桶、每门课最多一行。 -->
+      <div v-if="autoReport.okCount" class="rpt-block">
+        <b class="small">已排入</b>
+        <ul class="small rpt-list rpt-ok">
+          <li v-for="(t, i) in autoReport.ok" :key="'ok' + i">{{ t }}</li>
+        </ul>
+      </div>
+      <div v-if="autoReport.doneCount" class="rpt-block">
+        <b class="small">已按配置排满（正常结束，不是失败）</b>
+        <ul class="small rpt-list rpt-done">
+          <li v-for="(t, i) in autoReport.done" :key="'done' + i">{{ t }}</li>
+        </ul>
+      </div>
+      <div v-if="autoReport.skipCount" class="rpt-block">
+        <b class="small">未排入（需要处理）</b>
+        <ul class="small rpt-list rpt-bad">
           <li v-for="(t, i) in autoReport.skip" :key="'skip' + i">{{ t }}</li>
         </ul>
       </div>
+      <div v-if="autoReport.tips.length" class="rpt-block">
+        <b class="small">提示与待补配置</b>
+        <ul class="small rpt-list rpt-tip">
+          <li v-for="(t, i) in autoReport.tips" :key="'tip' + i">{{ t }}</li>
+        </ul>
+      </div>
+      <p
+        v-if="!autoReport.okCount && !autoReport.doneCount && !autoReport.skipCount && !autoReport.tips.length"
+        class="small muted"
+      >
+        本次没有产生任何变更。
+      </p>
     </template>
     <template #footer>
       <span v-if="autoReport">
@@ -6066,14 +6192,18 @@ watch(
   gap: 6px;
 }
 .pool-list {
-  display: flex;
-  /* ★ 竖向滑动：课程多时折行显示，超出约三行的高度后上下滚动浏览。
+  /* 两列（2026-11-16 业主口径：每行显示两门课）：原来 flex 横排一行挤三四张，
+     课程一多就得上下滚；两列定宽后每张卡的宽度一致，扫视更快。
+     max-height 也随两列调大——同样的滚动高度能看两倍的课。
+     ★ 竖向滑动：课程多时上下滚动浏览。
      ⛔ 不能写 scrollbar-width / scrollbar-color 标准属性：Chrome 121+ 一旦设置，
      ::-webkit-scrollbar 自绘整体失效，回落 Win11 悬浮滚动条 —— 不滚动时完全隐形
      （10-18「超过四个就看不到」的根因）。删掉后自绘条强制常显 */
-  flex-wrap: wrap;
-  align-content: flex-start;
-  max-height: 132px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
+  /* 两列后一行两张、每张约 49px：240 ≈ 4 行（8 门课）不滚动，再多才滚 */
+  max-height: 240px;
   overflow-y: auto;
   gap: 8px;
   padding-right: 4px;
@@ -6092,10 +6222,10 @@ watch(
   background: var(--brand-500, var(--brand-400));
 }
 .pool-chip {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 6px;
-  padding: 7px 10px;
+  padding: 6px 9px;
   border: 1px solid var(--brand-300);
   background: var(--brand-100);
   color: var(--brand-800);
@@ -6104,17 +6234,66 @@ watch(
   cursor: grab;
   user-select: none;
   transition: 0.12s;
-  white-space: nowrap;
+  /* 两列后不再强撑单行：课程名与元信息各自省略，卡片高度统一由两行内容决定 */
+  min-width: 0;
+  white-space: normal;
   flex: none;
+}
+/* 卡内两行：上行课程名 + 状态角标，下行教师/人数/原节次。窄卡里这样排才不会互相挤掉 */
+.chip-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.chip-top {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.chip-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 16px;
+}
+.chip-badge {
+  flex: none;
+  font-size: 10px;
+  line-height: 15px;
+  padding: 0 5px;
+}
+.chip-bottom {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+}
+.chip-meta {
+  font-size: 11px;
+  color: color-mix(in srgb, var(--brand-800) 62%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: none;
+  max-width: 60%;
 }
 .pool-chip:hover {
   transform: translateY(-1px);
   box-shadow: var(--sh-1);
 }
 /* 同名课程区分信息（2026-11-05）：学期 · 面向班级，比教师名更淡；
-   限宽省略，避免多教学班并排时把池子横向拉得过长 */
+   两列卡片里它吃掉剩余宽度（教师/人数先占位），超出省略 */
 .pool-sub {
-  max-width: 240px;
+  flex: 1;
+  min-width: 0;
+  max-width: none;
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 11px;
@@ -6133,9 +6312,16 @@ watch(
   .pool-cols {
     grid-template-columns: minmax(0, 1fr);
   }
-  /* 竖排后每栏拿到整行宽度，给列表多留些高度，少一次滚动 */
+  /* 竖排后每栏拿到整行宽度，两列仍成立；高度给到 4 行，8 门课不用滚 */
   .pool-col .pool-list {
-    max-height: 208px;
+    max-height: 240px;
+  }
+}
+/* 再窄（含手机/极小预览）两列会挤成省略号，退回单列 */
+@media (max-width: 720px) {
+  .pool-list {
+    grid-template-columns: minmax(0, 1fr);
+    max-height: 260px;
   }
 }
 .pool-col {
@@ -6303,6 +6489,31 @@ watch(
 }
 .spacer {
   flex: 1;
+}
+/* ---- 自动排课结果四段（2026-11-16）----
+ * 一段一块，各自带色：已排入=品牌绿、已排满=中性灰（明确「不是失败」）、
+ * 未排入=红、提示与待补配置=琥珀。原来红绿两桶会把正常结束刷成一片红。 */
+.rpt-block {
+  margin: 10px 0 0;
+}
+.rpt-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  line-height: 1.9;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.rpt-ok {
+  color: var(--ink-700, inherit);
+}
+.rpt-done {
+  color: var(--ink-500, #6b7280);
+}
+.rpt-bad {
+  color: var(--error, #d92d20);
+}
+.rpt-tip {
+  color: var(--warning, #b45309);
 }
 .detail-row {
   display: flex;
