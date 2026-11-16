@@ -143,6 +143,38 @@ const schedCfgPreview = computed(() => {
   };
 });
 
+/** 「未分班」等历史占位值不算真班级（与排课页 isNoClazzName 同词表口径） */
+const NO_CLAZZ_TOKENS = new Set(['未分班', '无', '-', '—', 'n/a', 'none']);
+
+function isNoClazzName(name?: string | null): boolean {
+  const s = String(name ?? '').trim();
+  return !s || NO_CLAZZ_TOKENS.has(s.toLowerCase());
+}
+
+/** 选修/通识可不配面向班级（业主 2026-11-16 口径，与排课页 needClazz 一致） */
+function isElectiveType(courseType?: string | null): boolean {
+  const t = String(courseType ?? '').trim().toLowerCase();
+  return t === 'elective' || t === 'general';
+}
+
+/**
+ * 一条配置是否「配置完整」（2026-11-16 业主口径：除了班级可不选，教师这些必选，选完才能进已配置）：
+ * 节奏已保存（scheduleConfigured ≠ 0，字段缺失按旧包宽松处理）+ 教师已选 +（非选修）面向班级已填。
+ */
+function offeringComplete(o: AdminOfferingVo, courseType?: string | null): boolean {
+  if (o.scheduleConfigured !== undefined && o.scheduleConfigured !== null && Number(o.scheduleConfigured) === 0) return false;
+  if (!o.teacherId) return false;
+  if (isElectiveType(courseType)) return true;
+  const clazzes = (Array.isArray(o.targetClasses) ? o.targetClasses : []).map(x => String(x ?? '').trim()).filter(x => !isNoClazzName(x));
+  return clazzes.length > 0 || !isNoClazzName(o.classKey);
+}
+
+/** 抽屉「配置」徽章：有配置且全部完整才算已配置（缺一项都还显示未配置，点进去补） */
+const drawerConfigured = computed(() => {
+  const offs = detailData.value?.offerings ?? [];
+  return offs.length > 0 && offs.every(o => offeringComplete(o, detailData.value?.courseType ?? detailCourse.value?.courseType));
+});
+
 function schedCfgLabel(o: AdminOfferingVo) {
   const from = o.weekFrom ?? 1;
   const weeks = o.weekCount ?? 0;
@@ -358,11 +390,13 @@ function scheduledCount(row: AdminCourseVo): number | null {
   return scheduleCount.value.get(String(row.courseId)) ?? 0;
 }
 
-/** 「排课情况」列头悬浮说明：把"数据来源 + 能否排序"一次讲清，避免用户点了表头没反应却不知道为什么 */
+/** 「排课情况」列头悬浮说明：把"数据来源 + 能否排序"一次讲清，避免用户点了表头没反应却不知道为什么。
+ *  ★ 口径（2026-11-16 后端 P2-4 改定）：scheduleCount 按**当前学期**课次统计（与排课页默认口径一致），
+ *    不再是全部课次累加 —— 文案跟着改，否则「列显示 0 节但这课明明排过课」会被当成 bug 报上来。 */
 const scheduleHeaderTitle = computed(() => {
   const base = scheduleStatsPartial.value
     ? '课次总数超出单次拉取上限，此处仅统计已拉取部分'
-    : '按全部课次统计，放回待排的课次不计入';
+    : '按当前学期课次统计，放回待排的课次不计入';
   return canServerSort.value
     ? `${base}；点表头可按课次数排序`
     : `${base}；当前运行包不支持服务端排序，换包后可按课次数排序`;
@@ -1124,7 +1158,16 @@ onMounted(async () => {
       >
         <!-- 勾选列只对"能删"的人显示：没权限却摆勾选框，用户会以为能批量操作 -->
         <el-table-column v-if="canRemove" type="selection" width="44" fixed="left" />
-        <el-table-column v-if="columnVisible.courseNo" label="课程编号" width="110" prop="courseNo" fixed="left">
+        <!-- 2026-11-16 全页测试发现：ORDER_BY_WHITELIST 与后端白名单都含 courseNo，
+             但这列漏配 :sortable ⇒ 表头点不动、白名单里的 courseNo 成了死配置（配置/排课情况两列都有） -->
+        <el-table-column
+          v-if="columnVisible.courseNo"
+          label="课程编号"
+          width="110"
+          prop="courseNo"
+          fixed="left"
+          :sortable="canServerSort ? 'custom' : false"
+        >
           <template #default="{ row }">{{ row.courseNo || '—' }}</template>
         </el-table-column>
         <!-- 名称可能很长（如「小程序教师端测试课程1」）：规范要求超长以 … 省略、悬停看全文 -->
@@ -1152,12 +1195,15 @@ onMounted(async () => {
         >
           <template #default="{ row }">
             <span v-if="row.offeringCount === null || row.offeringCount === undefined" class="muted small">—</span>
-            <span v-else-if="row.offeringCount > 0" class="badge badge-success">已配置</span>
+            <!-- 2026-11-16 业主：「除了班级可不选，教师这些是必选，选完才能进入已配置」。
+                 offeringCount>0 只代表建过配置；缺教师/缺节奏/（必修缺班级）任一项都算未配置完。
+                 旧包不下发 offeringIncomplete（undefined）⇒ 退回只看 offeringCount 的旧口径。 -->
+            <span v-else-if="row.offeringCount > 0 && !row.offeringIncomplete" class="badge badge-success">已配置</span>
             <!-- 2026-11-16 业主：「未配置」本身就要能点进去配。
                  改前只能「查看」→ 抽屉里再点「新增配置」，两步且入口不显眼；
                  现在点徽标直接进配置表单（向导第 2 步），抽屉那条路保持不动。
                  无 admin:offerings:add 权限时退化成静态徽标，不给死入口。 -->
-            <el-tooltip v-else-if="canOffer" content="点此配置学期 / 授课教师 / 上课班级" placement="top">
+            <el-tooltip v-else-if="canOffer" :content="row.offeringIncomplete ? '配置不完整（缺教师/节奏或必修缺班级），点此补全' : '点此配置学期 / 授课教师 / 上课班级'" placement="top">
               <button type="button" class="badge badge-neutral badge-action" @click.stop="openOfferFor(row)">
                 未配置<ZkIcon name="chevron-right" :size="11" />
               </button>
@@ -1313,7 +1359,14 @@ onMounted(async () => {
         <div class="pf-row">
           <span class="k">配置</span>
           <span>
-            <span v-if="(detailData?.offerings ?? []).length" class="badge badge-success">已配置</span>
+            <span v-if="!(detailData?.offerings ?? []).length" class="badge badge-neutral">未配置</span>
+            <span v-else-if="drawerConfigured" class="badge badge-success">已配置</span>
+            <!-- 有配置但不完整（缺教师/节奏/必修缺班级）：仍按未配置引导补全（2026-11-16 业主口径） -->
+            <el-tooltip v-else-if="canOffer" content="配置不完整（缺教师/节奏或必修缺班级），点「修改配置」补全" placement="top">
+              <button type="button" class="badge badge-neutral badge-action" @click.stop="openOfferFor({ courseId: detailCourse.courseId, courseName: detailCourse.courseName, hours: detailData?.hours ?? detailCourse.hours ?? null })">
+                未配置<ZkIcon name="chevron-right" :size="11" />
+              </button>
+            </el-tooltip>
             <span v-else class="badge badge-neutral">未配置</span>
           </span>
         </div>
@@ -1347,7 +1400,10 @@ onMounted(async () => {
           >
             <ZkIcon name="plus" :size="13" style="margin-right: 3px" />新增配置
           </el-button>
-          <span v-else-if="(detailData?.offerings ?? []).length" class="small muted" style="margin-left: 8px">已配置完成</span>
+          <span v-else-if="drawerConfigured" class="small muted" style="margin-left: 8px">已配置完成</span>
+          <!-- 有配置但不完整：不能再说「已配置完成」（2026-11-16 业主：选完才能进已配置）。
+               教师/班级的补全需开课编辑接口（已派单），节奏可在行内「修改配置」里补。 -->
+          <span v-else class="small" style="margin-left: 8px; color: var(--el-color-warning)">配置未完成：缺教师 / 节奏{{ isElectiveType(detailCourse?.courseType) ? '' : ' / 必修缺班级' }}</span>
         </div>
         <div v-loading="detailOfferLoading">
           <div v-if="(detailData?.offerings ?? []).length" class="stack" style="gap: 8px">
