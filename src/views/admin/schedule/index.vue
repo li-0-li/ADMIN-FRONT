@@ -808,6 +808,12 @@ type PoolCourse = CourseBrief & {
   /** 未配置排课节奏的开课数（后端 AdminCourseVo.offeringUnconfigured，2026-11-13）。
    *  ★ 旧包不下发 ⇒ `?? 0` 读，缺省按 0（= 不标记，不阻塞）。 */
   offeringUnconfigured?: number;
+  /**
+   * 课程学时（后端 `AdminCourseVo.hours`，2026-11-16 用于「总节次配置体检」）。
+   * 换算：1 节次 = 110 分钟 = 2 学时 ⇒ 应有节次 = ⌈学时 ÷ 2⌉。
+   * ★ 可选：`CourseBrief` 契约里没有这个字段，这里只在本地加宽，不动作业类型。
+   */
+  hours?: number;
 };
 const poolCourses = ref<PoolCourse[]>([]);
 
@@ -3555,7 +3561,6 @@ async function runAuto() {
           const name = r.courseName || e.courseName;
           const placed = r.arranged ?? r.weeksPlaced?.length ?? 0;
           const weeks = r.weeksPlaced ?? [];
-          const total = r.totalWeeks ?? 0;
           const sk = r.skipped ?? [];
           const idem = sk.filter(s => IDEM.test(s.reason || ''));
           const noslot = sk.filter(s => NOSLOT.test(s.reason || ''));
@@ -3585,12 +3590,23 @@ async function runAuto() {
           if (others.length) {
             tips.push(`「${name}」${others[0].reason || '前置校验未通过'}${others.length > 1 ? `（同类 ${others.length} 周）` : ''}`);
           }
-          // 配置体检（根因提示）：总节次比「学期周数 × 每周节次」小 ⇒ 后面那些周永远排不满
-          if (cap !== null && total > 0 && cap < total * lpw) {
-            tips.push(
-              `「${name}」排课设置里总节次只有 ${cap} 节（按每周 ${lpw} 节只够 ${Math.ceil(cap / lpw)} 周），本学期共 ${total} 周需 ${total * lpw} 节 —— ` +
-                `要铺满整学期，到「课程管理 → 课程详情 → 开课记录 → 排课设置」把总节次改成 ${total * lpw} 再排一次`
-            );
+          // 配置体检（2026-11-16）：总节次该是多少由**学时**决定（1 节次 = 2 学时），
+          // 不是「铺满学期」——64 学时 = 32 节 + 每周 2 节 = 16 周，学期 20 周里剩下的 4 周本来就不排。
+          // 所以这里只比「配置值 vs 学时折算值」，别再建议「改成 学期周数×每周节次」（那会引导错误配置）。
+          if (cap !== null && cap > 0) {
+            const hours = Number(courseById.value.get(String(e.courseId))?.hours ?? 0);
+            const expect = hours > 0 ? Math.ceil(hours / 2) : 0;
+            if (expect > 0 && cap !== expect) {
+              tips.push(
+                `「${name}」排课设置的总节次是 ${cap} 节，与本课学时对不上：${hours} 学时 = ${expect} 节次（1 节次 110 分钟 = 2 学时）。` +
+                  `到「课程管理 → 课程详情 → 开课记录 → 排课设置」改成 ${expect} 再排一次`
+              );
+            } else if (!expect) {
+              tips.push(
+                `「${name}」本次按配置的总节次 ${cap} 节排满（约 ${Math.ceil(cap / lpw)} 周），其余周不再排；` +
+                  `若本课学时比这更多，请到「课程详情 → 开课记录 → 排课设置」核对总节次`
+              );
+            }
           }
         }
       } catch (err) {
