@@ -776,7 +776,7 @@ const grid = computed(() =>
  *   ⇒ 规则据此分成「可选并入/互换」与「只能互换」两种，见 ③④。
  * ★ 互换会把对方也挪走（破坏性大于"并入"），所以两种都可行时必须由用户显式选择，
  *   不做默认自动决定 —— 避免"我只是想把他俩放一起，怎么把另一节挪走了"。
- * ✔ 已接后端端点：`/schedules/auto`（runAuto 逐门调 autoArrange；未配置排课节奏的课由后端跳过并提示）
+ * ✔ 已接后端端点：`/schedules/auto`（runAuto 逐门调 autoArrange；未配置课程的课由后端跳过并提示）
  *   ✔ 已实现并真发请求：`publishSchedules()`（发布课表，`:2215`）、`deleteSchedule()`（删除课次，`:1294` / `:1300` / `:1475`）
  */
 /**
@@ -805,7 +805,7 @@ type PoolCourse = CourseBrief & {
    * ★ 旧包可能不下发 ⇒ 一律 `Number(x ?? 0)` 读，缺省按 0 处理（= 不查 offerings）。
    */
   offeringCount?: number;
-  /** 未配置排课节奏的开课数（后端 AdminCourseVo.offeringUnconfigured，2026-11-13）。
+  /** 还没配齐排课设置的开课数（后端 AdminCourseVo.offeringUnconfigured，2026-11-13）。
    *  ★ 旧包不下发 ⇒ `?? 0` 读，缺省按 0（= 不标记，不阻塞）。 */
   offeringUnconfigured?: number;
   /**
@@ -1014,17 +1014,20 @@ interface PoolEntry extends CourseBrief {
    */
   inSchedule: boolean;
   /**
-   * 排课节奏配置状态（2026-11-16 业主口径：待排池拆「已配置 / 未配置」两栏，自动排课只收已配置的课）。
-   * - `ready`   全部开课记录都配过（总节次 / 每周节次 / 周范围）⇒ 可自动排课；
-   * - `partial` 有开课记录没配完 ⇒ 归「已配置」栏、允许自动排课（后端按 offering 逐条排，
-   *             未配的那条跳过并报因），签上标「含未配置开课」如实提示；
-   * - `none`    全部开课记录都没配、或根本还没有开课记录 ⇒ 只能手动排，自动排课不列它；
+   * 排课节奏配置状态（2026-11-16 业主口径：待排池拆「已配置课程 / 未配置课程」两栏，
+   * 自动排课只收已配置的课）。
+   * - `ready`   全部开课记录都配过（总节次 / 每周节次 / 周范围）⇒ 才算「已配置课程」，可自动排课；
+   * - `partial` 有开课记录没配完 ⇒ **归未配置栏**（业主 11-16：只配了一部分不算配置完成），
+   *             卡片角标写「未配 1/2」把缺口说清，自动排课不收录；
+   * - `none`    全部开课记录都没配、或根本还没有开课记录 ⇒ 归未配置栏，只能手动排；
    * - `unknown` 运行包不下发 `offeringUnconfigured`（旧包）⇒ 按已配置处理，回落旧行为。
    *             ★ 宁可多列也不把课藏起来：旧包下若全判「未配置」，会出现「一门课都排不了」的假故障。
    */
   cfg: 'ready' | 'partial' | 'none' | 'unknown';
   /** 该课名下的开课记录数（`AdminCourseVo.offeringCount`）：0 = 只建了基础课程，排课无从下手 */
   offeringCount?: number;
+  /** 还没配排课设置的开课记录数（`AdminCourseVo.offeringUnconfigured`）：卡片角标「未配 1/2」的分子 */
+  offeringUnconfigured?: number;
 }
 
 /**
@@ -1149,18 +1152,24 @@ const onlyClazzFiltering = computed(() =>
   !!filters.clazzName && !filters.courseId && !filters.teacherId && !filters.major
 );
 
-/* ---------- 待排池两栏（2026-11-16 业主口径）：已配置排课节奏 / 未配置 ----------
+/* ---------- 待排池两栏（2026-11-16 业主口径）：已配置课程 / 未配置课程 ----------
  * 为什么分两栏：以前 20 多条签混在一行里，管理员看不出「哪些课排不进去是因为没配节奏」，
  * 每次自动排课都要先在弹窗里读一遍「N 条未配置」才知道；把配置状态搬到池子外面，
  * 一眼就能看出缺什么、该先去补哪门课的排课设置。
  * 分工（别混）：
- *   · 已配置栏 = 自动排课的**唯一候选来源**（含 partial，后端逐条 offering 排，未配的那条跳过并报因）；
- *   · 未配置栏 = 只能手动拖/手动排课；不参与自动排课。
+ *   · 已配置栏 = **全部开课记录都配完**的课，也是自动排课的唯一候选来源；
+ *   · 未配置栏 = 没配 / 只配了一部分 / 还没有开课记录的课——只能手动排课。
+ *     ★ 业主 11-16 明确：「只有全部配置完成才进已配置」。partial 以前挂在已配置栏里
+ *       靠「部分未配」角标提示，看起来像已配置却排不全，语义更乱，现一律归未配置。
  * 栏内筛选与搜索是**各栏独立**的（管理员常在未配置栏里找某门课去补配置，
  * 已配置栏的筛选不该影响它）；外层工具栏的筛选则两栏同时生效，这一层不重复做。
  */
-const poolConfigured = computed(() => poolEntries.value.filter(e => e.cfg !== 'none'));
-const poolUnconfigured = computed(() => poolEntries.value.filter(e => e.cfg === 'none'));
+/** 是否算「已配置课程」：配齐了（ready），或旧包拿不到字段时的兜底（unknown） */
+function isCfgReady(cfg: PoolEntry['cfg'] | undefined) {
+  return cfg === 'ready' || cfg === 'unknown';
+}
+const poolConfigured = computed(() => poolEntries.value.filter(e => isCfgReady(e.cfg)));
+const poolUnconfigured = computed(() => poolEntries.value.filter(e => !isCfgReady(e.cfg)));
 
 /**
  * 池子里的「一张卡」= 一门课（2026-11-16 业主反馈：待排池里同一门课出现多张同名卡，像重复数据）。
@@ -1213,7 +1222,7 @@ const poolColumns = computed(() => {
   return [
     {
       key: 'configured' as PoolColKey,
-      title: '已配置排课节奏',
+      title: '已配置课程',
       hint: '可进行自动排课',
       icon: 'check',
       blank: !total
@@ -1227,14 +1236,14 @@ const poolColumns = computed(() => {
     },
     {
       key: 'unconfigured' as PoolColKey,
-      title: '未配置排课节奏',
-      hint: '可手动排课，配置后才能自动排课',
+      title: '未配置课程',
+      hint: '可手动排课，配齐后才可自动排课',
       icon: 'alert-triangle',
       blank: !total
         ? '本周课程已全部排入课表'
         : unChips.length
           ? '没有匹配的课程（清掉栏内搜索/筛选）'
-          : '所有待排课程都已配置排课节奏',
+          : '所有待排课程都已配齐排课设置',
       count: unChips.length,
       entries: unChips.filter(e => matchPoolColumn(e, 'unconfigured'))
     }
@@ -1243,6 +1252,12 @@ const poolColumns = computed(() => {
 
 /** 两栏合计的卡片数（= 门数）；节的条数另报，两者不混（2026-11-16 池子按课程聚合后） */
 const poolChipCount = computed(() => poolColumns.value.reduce((n, col) => n + col.count, 0));
+
+/** 两栏各多少门（池子 head 上一句话报清；按门不按节，与「共 N 门课」同一量纲） */
+const poolCfgCounts = computed(() => ({
+  ready: groupChips(poolConfigured.value).length,
+  unready: groupChips(poolUnconfigured.value).length
+}));
 
 /** 两栏里被栏内搜索/筛选挡掉的条数（head 上如实报，避免"课怎么少了"） */
 const poolColumnFiltered = computed(() =>
@@ -1255,14 +1270,13 @@ function poolChipTitle(e: PoolEntry) {
   const base = e.key.startsWith('lesson-') ? '拖动排回这 1 节' : '拖动新建 1 节课次';
   const cnt = (e as PoolChip).count ?? 0;
   const countTip = cnt > 1 ? `；该课共 ${cnt} 节待排，拖一次排回一节` : '';
-  const cfgTip =
-    e.cfg === 'none'
-      ? !Number(e.offeringCount ?? 0)
-        ? '；还没有开课记录：自动排课无从下手（手动排课照常可用）；到「课程管理 → 课程详情」建开课记录并保存排课设置后即可自动排'
-        : '；未配置排课节奏：只影响自动排课，手动拖拽/新建课次照常可用；到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次即可自动排'
+  const cfgTip = !isCfgReady(e.cfg)
+    ? !Number(e.offeringCount ?? 0)
+      ? '；未配置课程：还没有开课记录（谁教、面向哪个班都还没登记），自动排课无从下手；手动排课照常可用'
       : e.cfg === 'partial'
-        ? '；部分开课记录未配置排课节奏（自动排课时这部分会被跳过，手动排不受影响）'
-        : '';
+        ? `；未配置课程：${Number(e.offeringCount ?? 0)} 条开课记录里还有 ${Number(e.offeringUnconfigured ?? 0)} 条没配排课设置，要全部配齐才进「已配置课程」；手动排课照常可用`
+        : '；未配置课程：开课记录还没保存排课设置（总节次 / 每周节次 / 周范围），自动排课不收录；手动排课照常可用'
+    : '';
   return `${base}${countTip}，或点击打开新增表单：${e.courseName}${cfgTip}`;
 }
 
@@ -3325,20 +3339,22 @@ const autoClass = ref('');
 const autoIncludeScheduled = ref(false);
 /**
  * 本次自动排课实际参与的签。
- * ★ 2026-11-16 业主口径：**只收「已配置排课节奏」的课**（`cfg !== 'none'`）。
+ * ★ 2026-11-16 业主口径：**只收「已配置课程」**（开课记录全部配齐，见 `isCfgReady`）。
  *   未配置的课在待排池里单独成栏、只能手动排，压根不进候选列表——
  *   以前是"默认不勾但列在那里"，管理员仍会看到一排灰行、也仍可能手滑勾上去，
  *   而它们排出来必然是 Skip(week=0)，只会把报告刷满「未配置」。
+ *   ★ partial（只配了一部分）同样不收：业主口径是「只有全部配置完成才进已配置」，
+ *     半配的课放进去排，只会排出一半课次再报一堆「跳过」，不如先补配置。
  */
 const autoEntries = computed(() =>
-  poolEntries.value.filter(e => (autoIncludeScheduled.value || !e.inSchedule) && e.cfg !== 'none')
+  poolEntries.value.filter(e => (autoIncludeScheduled.value || !e.inSchedule) && isCfgReady(e.cfg))
 );
 /** 被护栏挡下的签数（设置视图上说明，不静默吞） */
 const autoSkippedInSchedule = computed(() =>
-  autoIncludeScheduled.value ? 0 : poolEntries.value.filter(e => e.inSchedule && e.cfg !== 'none').length
+  autoIncludeScheduled.value ? 0 : poolEntries.value.filter(e => e.inSchedule && isCfgReady(e.cfg)).length
 );
-/** 未配置排课节奏、不在候选里的签数（弹窗里指路到课程详情，不静默吞） */
-const autoNotConfigured = computed(() => poolEntries.value.filter(e => e.cfg === 'none').length);
+/** 未配置课程（含只配了一部分）、不在候选里的签数（弹窗里指路到课程详情，不静默吞） */
+const autoNotConfigured = computed(() => poolEntries.value.filter(e => !isCfgReady(e.cfg)).length);
 /**
  * 本次要排哪些课（2026-11-02 业主需求）：勾选粒度 = 一张签（= 一节课）。
  * 会话级状态，key = PoolEntry.key；未登记的按「参与」处理，显式取消才置 false
@@ -3382,7 +3398,7 @@ function openAuto() {
   if (!autoEntries.value.length) {
     ElMessage.warning(
       autoNotConfigured.value
-        ? `待排池里的 ${autoNotConfigured.value} 条课都还没配置排课节奏：自动排课只收已配置的课，本次没有可自动排的对象。这些课可以直接在待排池里手动排（点卡片打开表单，或拖到课表格子）；想批量自动排，先到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次`
+        ? `待排池里的 ${autoNotConfigured.value} 条课都属于「未配置课程」：自动排课只收已配置的课，本次没有可自动排的对象。这些课可以直接在待排池里手动排（点卡片打开表单，或拖到课表格子）；想批量自动排，先到「课程管理 → 课程详情 → 开课记录 → 排课设置」把该课每条开课记录都配齐`
         : '待排池里的签都对应「课程已在课表上」的放回记录，没有需要排的课；若要整门重排，先把该课全部节次放回'
     );
     return;
@@ -4141,8 +4157,8 @@ watch(
     <div class="pool-head">
       <span class="card-title"><ZkIcon name="list-checks" :size="16" />待排课程</span>
       <span class="small muted">
-        共 {{ poolChipCount }} 门课 / {{ poolEntries.length }} 节待排（已配置 {{ poolConfigured.length }} 节 · 未配置
-        {{ poolUnconfigured.length }} 节）
+        共 {{ poolChipCount }} 门课 / {{ poolEntries.length }} 节待排（已配置 {{ poolCfgCounts.ready }} 门 · 未配置
+        {{ poolCfgCounts.unready }} 门）
         <template v-if="poolFilterExcluded">· 另有 {{ poolFilterExcluded }} 节被筛选排除</template>
         <template v-if="poolColumnFiltered">· 栏内筛选再挡掉 {{ poolColumnFiltered }} 门</template>
         —— 拖到下方课表格子完成排课
@@ -4228,19 +4244,22 @@ watch(
                   class="badge chip-badge chip-count"
                   :title="`该课有 ${c.count} 节待排（来自「放回」的课次记录）：拖一次排回一节，点卡片可只排其中一节`"
                 >×{{ c.count }} 节</span>
-                <!-- 配置状态角标：两列卡片里只留一枚最要紧的，避免角标把课程名挤没 -->
+                <!-- 未配置原因角标（2026-11-16）：未配置栏里的卡分三种情况，用一枚角标说清缺到哪一步——
+                     ① 根本没开课记录；② 开课记录只配了一部分（写「未配 1/2」）；③ 一条都没配。
+                     两列卡片只留这一枚，课程名才不会被角标挤没。 -->
                 <span
-                  v-else-if="c.cfg === 'none'"
+                  v-else-if="!isCfgReady(c.cfg)"
                   class="badge badge-warning chip-badge"
-                  :title="Number(c.offeringCount ?? 0)
-                    ? '未配置排课节奏（总节次 / 每周节次 / 周范围）⇒ 自动排课不收录；手动排课不受影响'
-                    : '还没有开课记录（谁教、面向哪个班都没登记）⇒ 自动排课无从下手；手动排课仍可直接建课次'"
-                >{{ Number(c.offeringCount ?? 0) ? '未配置' : '未建开课' }}</span>
-                <span
-                  v-else-if="c.cfg === 'partial'"
-                  class="badge badge-warning chip-badge"
-                  title="该课程有部分开课记录还没保存排课设置：自动排课会排已配置的那部分，未配置的由后端跳过并列出原因"
-                >部分未配</span>
+                  :title="!Number(c.offeringCount ?? 0)
+                    ? '未配置课程：还没有开课记录（谁教、面向哪个班都没登记）⇒ 自动排课无从下手；手动排课仍可直接建课次'
+                    : c.cfg === 'partial'
+                      ? `未配置课程：${Number(c.offeringCount ?? 0)} 条开课记录里有 ${Number(c.offeringUnconfigured ?? 0)} 条还没保存排课设置，要全部配齐才进「已配置课程」；手动排课不受影响`
+                      : '未配置课程：开课记录还没保存排课设置（总节次 / 每周节次 / 周范围）⇒ 自动排课不收录；手动排课不受影响'"
+                >{{ !Number(c.offeringCount ?? 0)
+                  ? '未建开课'
+                  : c.cfg === 'partial'
+                    ? `未配 ${Number(c.offeringUnconfigured ?? 0)}/${Number(c.offeringCount ?? 0)}`
+                    : '未配置' }}</span>
               </div>
               <div class="chip-bottom">
                 <span class="chip-meta">{{ c.teacherName || '未指定教师' }} · {{ c.studentCount ?? 0 }} 人</span>
@@ -4922,10 +4941,10 @@ watch(
           title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
         >已在课表</span>
         <span
-          v-if="c.cfg === 'none'"
+          v-if="!isCfgReady(c.cfg)"
           class="badge badge-warning"
-          title="未配置排课节奏：只影响自动排课；手动拖拽或点「排课」照常可用。到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存后即可加入自动排课"
-        >未配置节奏</span>
+          title="未配置课程：只影响自动排课；手动拖拽或点「排课」照常可用。到「课程管理 → 课程详情 → 开课记录 → 排课设置」把每条开课记录都配齐后，才会进「已配置课程」"
+        >未配置课程</span>
         </div>
         <button
           v-if="canCreate"
@@ -4968,11 +4987,11 @@ watch(
         <el-select v-model="form.courseId" placeholder="请选择课程" filterable style="width: 100%">
           <el-option v-for="o in selectionCourseOptions" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
-        <!-- 未配置排课节奏 ≠ 不能排（2026-11-16）：只提示「自动排课不会收录」，说明手动排照常可用，
+        <!-- 未配置课程 ≠ 不能排（2026-11-16）：只提示「自动排课不会收录」，说明手动排照常可用，
              并给出补配置的路径。绝不因此禁用保存——那会把「没配节奏」变成「排不了课」。 -->
-        <div v-if="createCourseCfg === 'none'" class="small" style="color: var(--warning, #b45309); width: 100%">
-          该课还没保存排课设置（总节次 / 每周节次 / 周范围）：<b>手动排课不受影响</b>，按下面选好时间与周范围即可保存；
-          想以后用「自动排课」省事，到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次。
+        <div v-if="createCourseCfg && !isCfgReady(createCourseCfg)" class="small" style="color: var(--warning, #b45309); width: 100%">
+          该课还没配齐排课设置（总节次 / 每周节次 / 周范围）：<b>手动排课不受影响</b>，按下面选好时间与周范围即可保存；
+          想以后用「自动排课」省事，到「课程管理 → 课程详情 → 开课记录 → 排课设置」把每条开课记录都配齐。
         </div>
       </el-form-item>
       <el-form-item label="授课教师" required>
@@ -5238,13 +5257,13 @@ watch(
         </div>
       </div>
       <!-- 排课规则说明已上移到弹窗开头（紧跟「把待排课程…」那句）：夹在「范围」与「预警」中间会打断信息流 -->
-      <!-- 未配置排课节奏（2026-11-16 业主口径）：不进自动排课候选；手动排课照常可用 -->
+      <!-- 未配置课程（2026-11-16 业主口径）：不进自动排课候选；手动排课照常可用 -->
       <div v-if="autoNotConfigured" class="detail-row">
         <span class="detail-k">未配置</span>
         <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">
-          还有 <b>{{ autoNotConfigured }}</b> 条课未配置排课节奏（总节次 / 每周节次 / 周范围），
+          还有 <b>{{ autoNotConfigured }}</b> 条课属于「未配置课程」（没配 / 只配了一部分 / 没有开课记录），
           <b>不在本次候选里</b>；这些课<b>仍可手动排课</b>（待排池里点它或直接拖到格子）。
-          想让它们参与自动排课：到「课程管理 → 课程详情 → 开课记录 → 排课设置」保存一次。
+          想让它们参与自动排课：到「课程管理 → 课程详情 → 开课记录 → 排课设置」把该课每条开课记录都配齐。
         </div>
       </div>
       <!-- 班级缺口（2026-11-02）：课程不带班级、放回签也没原班级时，不选班级就会排成空班级课次 -->
@@ -5296,7 +5315,7 @@ watch(
               />
               <span
                 class="small"
-                :title="`${e.courseName}${e.teacherName ? ' · ' + e.teacherName : ''}${e.cfg === 'partial' ? ' · 部分开课记录未配置排课节奏' : ''}${e.inSchedule ? ' · 课程已在课表（勾选会重复排课）' : ''}`"
+                :title="`${e.courseName}${e.teacherName ? ' · ' + e.teacherName : ''}${e.inSchedule ? ' · 课程已在课表（勾选会重复排课）' : ''}`"
                 :style="{
                   flex: '1 1 auto',
                   minWidth: 0,
@@ -5307,7 +5326,6 @@ watch(
                   textDecoration: poolPick[e.key] === false ? 'line-through' : 'none'
                 }"
               >{{ e.courseName }}</span>
-              <span v-if="e.cfg === 'partial'" class="badge badge-warning" style="flex: none" title="部分开课记录还没保存排课设置，自动排课时这部分会被后端跳过并报因">含未配置开课</span>
               <span v-if="e.inSchedule" class="badge badge-warning" style="flex: none">已在课表</span>
               <el-select
                 v-model="poolClazz[e.key]"
@@ -6264,7 +6282,11 @@ watch(
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-content: start;
-  /* 两列后一行两张、每张约 49px：240 ≈ 4 行（8 门课）不滚动，再多才滚 */
+  /* 两列后一行两张、每张约 49px：240 ≈ 4 行（8 门课）不滚动，再多才滚。
+     flex: 1 让列表区在两栏等高时吃掉剩余高度（短栏不空一截白底）；min-height: 0 是
+     flex 子项里套滚动容器的必需项，否则内容高度会顶穿 max-height。 */
+  flex: 1 1 auto;
+  min-height: 0;
   max-height: 240px;
   overflow-y: auto;
   gap: 8px;
@@ -6375,7 +6397,10 @@ watch(
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 10px;
-  align-items: start;
+  /* 两栏等高（2026-11-16 业主反馈「已配置和未配置两个栏大小不一样」）：
+     原来 `align-items: start` 让每栏按自己内容高度收，一栏 8 门、一栏 13 门时高度差半屏；
+     改 stretch（grid 默认）后短的一栏被拉到与高的一栏齐平，栏内的列表区用 flex 撑满。 */
+  align-items: stretch;
 }
 @media (max-width: 1040px) {
   .pool-cols {
@@ -6395,6 +6420,10 @@ watch(
 }
 .pool-col {
   min-width: 0;
+  /* 竖向 flex：表头/筛选固定，列表区吃掉剩余高度 ⇒ 两栏等高时短栏的列表也铺到同一条底边，
+     不会出现「左栏到 240px、右栏只到 90px」的参差（2026-11-16 业主反馈） */
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 8px 10px 10px;
@@ -6535,6 +6564,15 @@ watch(
   gap: 6px;
   color: var(--ink-500);
   font-size: 12px;
+}
+/* 栏内空态：撑满列表本该占的高度并居中，两栏等高时空栏不会在底部留一块突兀的白 */
+.pool-col > .pool-empty {
+  flex: 1 1 auto;
+  justify-content: center;
+  min-height: 72px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 10px;
 }
 .legend-dot {
   width: 12px;
