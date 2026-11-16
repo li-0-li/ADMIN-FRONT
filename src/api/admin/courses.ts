@@ -36,6 +36,12 @@ export interface AdminCourseVo {
   scheduleCount?: number;
   /** 开课记录数；0 = 只建了基础课程还没开课（两步建课第一步完成后的合法状态） */
   offeringCount?: number;
+  /**
+   * 配置不完整的开课数（2026-11-16 业主口径：除班级外教师等必选，选完才能进「已配置」）。
+   * 缺教师 / 缺节奏 /（非选修缺面向班级）任一即计 1。
+   * ★ 旧包不下发此字段（undefined）⇒ 徽章退回只看 offeringCount 的旧口径，不算错。
+   */
+  offeringIncomplete?: number;
   /** 是否三项认证全过（窗口期仍按 certification.course_id 算；不能用 status 判"是否过审"） */
   certPassed?: boolean;
 }

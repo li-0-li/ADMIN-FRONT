@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
-import { ElMessage, ElMessageBox } from 'element-plus';
+import { ElMessage } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import {
   checkCourseNo,
@@ -11,7 +11,6 @@ import {
   updateOfferingScheduleConfig
 } from '@/api/admin/courses';
 import type { CourseCreateBo } from '@/api/admin/courses';
-import { autoArrange } from '@/api/admin/schedules';
 import { listClasses, listTerms } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
 import type { Clazz, Term } from '@/types/admin';
@@ -370,37 +369,14 @@ async function submitOffering() {
     }
     ElMessage.success(
       schedSaved
-        ? `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}；排课节奏 第 ${schedForm.weekFrom}~${weekTo} 周 · 每周 ${perWeek} 节 · 共 ${periods} 节次（= ${hours} 学时）`
+        ? `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}；排课节奏 第 ${schedForm.weekFrom}~${weekTo} 周 · 每周 ${perWeek} 节 · 共 ${periods} 节次（= ${hours} 学时）。排课请到「智能排课」页`
         : `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}；排课节奏未保存，可在课程详情里补`
     );
     // 一门课只允许一条配置（业主 2026-11-16：「配置完就是配置完了」）：
-    // 保存即结束，不再清空表单准备第二条，也不再留着弹窗让人接着配。
-    // 排课节奏没写进去就别问「要不要自动排课」——后端会按「未配置节奏」跳过，问了必失败。
-    if (!schedSaved) {
-      close();
-      return;
-    }
-    // B-7 / 会议 A3（2026-11-10 接线）：开课成功后询问是否立即自动排课。
-    // ★ auto-arrange 失败不影响开课结果（开课已落库，仅提示可去排课页手动处理）。
-    try {
-      await ElMessageBox.confirm(
-        `「${created.value.courseName}」配置已保存（${res.termCode}）。是否立即按教学周自动排课？`,
-        '自动排课',
-        { confirmButtonText: '立即排课', cancelButtonText: '暂不，手动排', type: 'info' }
-      );
-    } catch {
-      close(); // 选「暂不」也直接关窗：配置已是一条，没有第二条要配
-      return;
-    }
-    try {
-      await autoArrange({ offeringId: res.offeringId });
-      ElMessage.success('自动排课完成，可到「智能排课」页查看与微调');
-    } catch {
-      /* request.ts 已弹后端原话；开课不受影响 */
-      ElMessage.warning('配置已保存，但自动排课未完成——可到「智能排课」页手动排课');
-    } finally {
-      close();
-    }
+    // 保存即结束直接关窗，不再追问「是否自动排课」——业主 11-16 下午反馈
+    // 「点击保存怎么就排课进去了」：配置是配置、排课是排课，两件事分开。
+    // 排课只发生在「智能排课」页的显式操作（自动排课 / 手动拖排）。
+    close();
   } catch {
     /* request.ts 已弹后端原话（40902/40903/422 等） */
   } finally {
