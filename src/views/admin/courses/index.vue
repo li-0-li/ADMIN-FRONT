@@ -96,7 +96,30 @@ async function onRearrange(o: { offeringId: string; termCode?: string }) {
 
 /* ---------- 批次7 排课配置（录音口径：排课前先在课程详情选好 一共多少课时 / 一周几节 / 第几周到第几周） ----------
  * 每条「进行中」开课记录就地展开小表单；第X周~第Y周换算为 weekFrom + weekCount（Y-X+1）。
- * 总课时留空 = 按周数×每周节次自然铺满；填了则排满该节次总数即停（auto-arrange 幂等补差额）。 */
+ * 总课时留空 = 按周数×每周节次自然铺满；填了则排满该节次总数即停（auto-arrange 幂等补差额）。
+ *
+ * ★ 量纲（2026-11-16 核验）：class_period 一个节次 = 「1-2 节」08:00–09:50 = 110 分钟 = 2 学时。
+ *   而 offering.total_lessons 存的是【节次】而非学时（OfferingScheduleConfigBo 原文「节次口径，排满即停」）。
+ *   业务确认的对应关系：周数 = 课程学时 ÷ 2 ÷ 每周节次。
+ *     64 学时 ÷ 2 = 32 节次，每周 2 节 ⇒ 16 周；56 学时 ⇒ 28 节次，每周 2 节 ⇒ 14 周。
+ *   界面若把节次直接标成「课时」，按学时填 64 会让后端排出 64 节次（=128 学时）⇒ 需 32 周，
+ *   超出学期周数被截断，后段课时永远排不进去。故界面一律标「节次」并括注等值学时。 */
+const HOURS_PER_PERIOD = 2;
+
+/** 学时 → 节次数（向上取整；学时缺失/非法返回 null） */
+function periodsFromHours(hours?: number | null): number | null {
+  const h = Number(hours);
+  if (hours == null || !Number.isFinite(h) || h <= 0) return null;
+  return Math.ceil(h / HOURS_PER_PERIOD);
+}
+
+/** 节次数 ÷ 每周节次 → 需要几周（向上取整；每周节次非法按 1 计） */
+function weeksFromPeriods(periods: number, perWeek: number): number {
+  const p = Number(perWeek);
+  const safePerWeek = Number.isFinite(p) && p >= 1 ? Math.floor(p) : 1;
+  return Math.ceil(Math.max(0, periods) / safePerWeek);
+}
+
 const schedCfgId = ref('');
 const schedCfgSaving = ref(false);
 const schedCfgForm = reactive({
@@ -106,6 +129,40 @@ const schedCfgForm = reactive({
   totalLessons: null as number | null
 });
 
+/** 表单内实时换算：学时 → 节次 → 需要几周，并与用户填的周跨度比对 */
+const schedCfgPreview = computed(() => {
+  const hours = detailData.value?.hours ?? null;
+  const perWeek = schedCfgForm.lessonsPerWeek;
+  const spanWeeks = Math.max(0, (schedCfgForm.weekTo || 0) - (schedCfgForm.weekFrom || 0) + 1);
+  const periods = schedCfgForm.totalLessons ?? spanWeeks * Math.max(1, perWeek);
+  const needWeeks = weeksFromPeriods(periods, perWeek);
+  return {
+    hours,
+    periods,
+    perWeek: Math.max(1, perWeek),
+    needWeeks,
+    spanWeeks,
+    /** 填的周跨度与「节次数÷每周节次」算出的周数不一致 */
+    mismatch: spanWeeks > 0 && needWeeks !== spanWeeks,
+    /** 学时换算出的节次数（用于「按学时算」按钮与偏差提示） */
+    derivedPeriods: periodsFromHours(hours)
+  };
+});
+
+/** 按课程学时一键换算：节次数 = 学时÷2，周跨度 = 节次数÷每周节次 */
+function applyHoursDerived() {
+  const { derivedPeriods, perWeek } = schedCfgPreview.value;
+  if (derivedPeriods == null) {
+    ElMessage.warning('该课程未填学时（course.hours 为空），无法按学时换算，请手工填节次数');
+    return;
+  }
+  schedCfgForm.totalLessons = derivedPeriods;
+  const from = schedCfgForm.weekFrom || 1;
+  const need = weeksFromPeriods(derivedPeriods, perWeek);
+  schedCfgForm.weekTo = from + need - 1;
+  ElMessage.success(`已按 ${schedCfgPreview.value.hours} 学时换算：${derivedPeriods} 节次 ÷ 每周 ${perWeek} 节 = ${need} 周`);
+}
+
 function schedCfgLabel(o: AdminOfferingVo) {
   const from = o.weekFrom ?? 1;
   const weeks = o.weekCount ?? 0;
@@ -114,7 +171,7 @@ function schedCfgLabel(o: AdminOfferingVo) {
   // 2026-11-13 业主反馈：未配置排课节奏的课不可参与自动排课，需在此显式提示
   if (o.scheduleConfigured === 0) return '未配置（不可自动排课）——请保存一次排课设置';
   if (!weeks) return '未设置（缺省整学期 · 每周 1 节）';
-  return `第 ${from}~${from + weeks - 1} 周 · 每周 ${perWeek} 节 · 共 ${total} 课时`;
+  return `第 ${from}~${from + weeks - 1} 周 · 每周 ${perWeek} 节 · 共 ${total} 节次（= ${total * HOURS_PER_PERIOD} 学时）`;
 }
 
 function openSchedCfg(o: AdminOfferingVo) {
@@ -1378,7 +1435,8 @@ onMounted(async () => {
                     <span class="small">第 <el-input-number v-model="schedCfgForm.weekFrom" :min="1" :max="30" size="small" style="width: 84px" controls-position="right" /> ~
                       第 <el-input-number v-model="schedCfgForm.weekTo" :min="1" :max="30" size="small" style="width: 84px" controls-position="right" /> 周</span>
                     <span class="small">每周 <el-input-number v-model="schedCfgForm.lessonsPerWeek" :min="1" :max="7" size="small" style="width: 84px" controls-position="right" /> 节</span>
-                    <span class="small">共 <el-input-number v-model="schedCfgForm.totalLessons" :min="1" :max="500" size="small" style="width: 100px" controls-position="right" placeholder="留空铺满" /> 课时</span>
+                    <span class="small">共 <el-input-number v-model="schedCfgForm.totalLessons" :min="1" :max="500" size="small" style="width: 100px" controls-position="right" placeholder="留空铺满" /> 节次</span>
+                    <el-button size="small" plain @click="applyHoursDerived">按学时算</el-button>
                     <el-button
                       size="small"
                       type="primary"
@@ -1386,8 +1444,20 @@ onMounted(async () => {
                       @click="saveSchedCfg(o)"
                     >保存</el-button>
                   </div>
-                  <div class="small muted" style="margin-top: 6px">
-                    总课时留空 = 按 周数 × 每周节次 自然铺满；填了则排满该节次总数即停（重复排课幂等补差额，已停课的节次不计入）。
+                  <div
+                    class="small"
+                    style="margin-top: 6px"
+                    :style="schedCfgPreview.mismatch ? 'color: var(--warn-700, #8a6116)' : 'color: var(--text-3, #667085)'"
+                  >
+                    <template v-if="schedCfgPreview.derivedPeriods !== null">
+                      本课 {{ schedCfgPreview.hours }} 学时 = <b>{{ schedCfgPreview.derivedPeriods }}</b> 节次（1 节次 08:00–09:50 = 2 学时）；当前填
+                      <b>{{ schedCfgPreview.periods }}</b> 节次 ÷ 每周 {{ schedCfgPreview.perWeek }} 节 ⇒ 需
+                      <b>{{ schedCfgPreview.needWeeks }}</b> 周，而周跨度填的是 {{ schedCfgPreview.spanWeeks }} 周<template v-if="schedCfgPreview.mismatch">（不一致：点「按学时算」自动对齐）</template>。
+                    </template>
+                    <template v-else>本课未填学时（course.hours 为空），节次数只能手工确定。</template>
+                  </div>
+                  <div class="small muted" style="margin-top: 4px">
+                    节次留空 = 按 周数 × 每周节次 自然铺满；填了则排满该节次总数即停（重复排课幂等补差额，已停课的节次不计入）。
                   </div>
                 </div>
               </div>
