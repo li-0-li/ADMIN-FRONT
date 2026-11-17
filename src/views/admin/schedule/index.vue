@@ -1204,10 +1204,11 @@ function buildPoolEntries(): PoolEntry[] {
           .filter(x => String(x.courseId) === String(c.courseId))
           .map(x => `${x.weekNo ?? ''}-${x.weekday}-${x.periodNo}`)
       );
-      // ② 同一「周+星期+节次」只出一张签（2026-11-16 业主：「同一个老师同一个班级 ×2 节，只能有一节」）：
-      //    多轮「建了又删」会在同槽留多条软删残影，按 scheduleId 新→旧去重保留 1 张，库内行不动。
-      //    2026-11-17 修正：去重键带周维度——不同周的「同星期+节次」是两节不同的课，
-      //    既不互相顶掉、也不再用「每周节数」一刀切截断（那会把第 3 周缺失的那一节藏起来）。
+      // ② 同一「周+星期+节次」只出一张签，且每门课**至多 1 张签**（2026-11-17 业主终口径：
+      //    「已配置栏一门课出现 ×2 节」——业主把 ×N 角标读成「两门重复的课」）。
+      //    库里查实无重复开课记录，×N 全部来自多轮「建了又删」的软删残影（990106 一门课 49 条
+      //    软删课次）。一张卡 = 一门课 = 1 张签（N=1 角标不再显示）：拖一次排一节，
+      //    批量重排走「排到本周 / 自动排课」（幂等补差额）。按 scheduleId 新→旧留最新一条。
       const kept: ScheduleCell[] = [];
       const seenSlots = new Set<string>();
       for (const r of [...rows].sort((a, b) => Number(b.scheduleId) - Number(a.scheduleId))) {
@@ -1216,6 +1217,7 @@ function buildPoolEntries(): PoolEntry[] {
         if (seenSlots.has(k)) continue;
         seenSlots.add(k);
         kept.push(r);
+        break; // 一门课只出 1 张签
       }
       for (const r of kept) {
         const v = verdict(c);
