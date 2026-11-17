@@ -12,7 +12,7 @@ import { listUsers } from '@/api/admin/users';
 import { listPeriods } from '@/api/admin/periods';
 import { getTeachingWeek } from '@/api/admin/config';
 import { getCourseCapabilityTeachers } from '@/api/admin/capabilities';
-import type { Classroom, CourseBrief, ScheduleCell } from '@/types/admin';
+import type { Classroom, CourseBrief, ScheduleCell, ScheduleQuery } from '@/types/admin';
 
 /**
  * 节次表（★ 已不是常量——主数据源是 GET /api/v1/admin/periods，见 loadPeriods）。
@@ -2409,6 +2409,64 @@ async function undoToStep(depth: number) {
 }
 
 /**
+ * 其他周同槽兄弟查询（2026-11-17 业主口径：拖动排课时，若其他周也有该课程，
+ * 可选「全部跟着动」或「单独动」）。全学期拉一次该课课次，筛出与被拖课次
+ * 同「星期+节次」但周次不同的行（自动排课/排到本周会让一门课每周复用同一槽）。
+ */
+async function fetchSameSlotSiblings(cell: ScheduleCell): Promise<ScheduleCell[]> {
+  const info = currentTermInfo.value;
+  if (!info?.startDate || !info?.endDate) return [];
+  const res = await listSchedules({
+    startDate: String(info.startDate).slice(0, 10),
+    endDate: String(info.endDate).slice(0, 10),
+    termId: String(currentTermId.value || info.termId || ''),
+    pageSize: 500
+  } as ScheduleQuery);
+  const rows: ScheduleCell[] = res?.list ?? [];
+  return rows.filter(
+    x =>
+      !x.deleted &&
+      x.lessonStatus !== 'canceled' &&
+      String(x.courseId) === String(cell.courseId) &&
+      x.weekday === cell.weekday &&
+      x.periodNo === cell.periodNo &&
+      Number(x.weekNo) !== Number(cell.weekNo)
+  );
+}
+
+/** 三态确认：confirm=全部跟着动 / cancel 按钮=仅这一节 / 关闭(X·ESC)=取消整次拖动 */
+function confirmFollow(n: number, target: string): Promise<'follow' | 'single' | 'cancel'> {
+  return new Promise(resolve => {
+    ElMessageBox.confirm(
+      `这门课在其他 ${n} 个周也占着同一时段（星期+节次相同）。这次拖动要怎么处理？`,
+      '其他周也有这门课',
+      {
+        distinguishCancelAndClose: true,
+        confirmButtonText: `全部跟着动（${n} 周）`,
+        cancelButtonText: '仅这一节',
+        type: 'info'
+      }
+    )
+      .then(() => resolve('follow'))
+      .catch(act => resolve(act === 'cancel' ? 'single' : 'cancel'));
+  });
+}
+
+/** 学期第 N 周星期 w 的日期（与 repeatDates / 后端 resolveWeekRef 同口径）：学期没配起点返回 null */
+/** 学期第 N 周星期 w 的日期（与 repeatDates / 后端 resolveWeekRef 同口径）：学期没配起点返回 null。
+ *  ★ 「全部跟着动」用它换算兄弟新日期：兄弟周次不变、星期/节次跟主课次走——
+ *  语义是「整门课每周的同槽时间统一改到新时段」，且保证落回各自教学周窗口内。
+ *  （不用日期位移法：存量行 weekday 与 class_time 有老口径错位，位移会把兄弟平移出学期窗口。） */
+function classTimeAtWeek(weekNo: number, weekday: number, periodStart: string): string | null {
+  const start = parseDateOnly(currentTermInfo.value?.startDate);
+  if (!start) return null;
+  const swd = start.getDay() === 0 ? 7 : start.getDay();
+  const d = new Date(start);
+  d.setDate(d.getDate() + (weekNo - 1) * 7 + ((weekday - swd + 7) % 7));
+  return `${fmt(d)} ${periodStart}:00`;
+}
+
+/**
  * 执行移动（C-19，落到空白格）。★ 不做乐观更新：先落库、成功后再刷新视图。
  * 冲突/失败时视图本就未变，避免「看着动了、其实没存」的假象。
  */
@@ -2429,6 +2487,26 @@ async function doMove(cell: ScheduleCell, weekday: number, periodNo: number) {
     periodNo: cell.periodNo ?? 1
   };
   busy.value = true;
+  // 2026-11-17 业主口径：其他周也占同一「星期+节次」时，落库**前**先让用户选——
+  // 「全部跟着动」= 其他周同槽课次一起搬到新槽（各自按学期周历换算日期），保持周期同步；
+  // 「仅这一节」= 其他周不动；关闭弹窗 = 取消整次拖动（什么都还没写）。
+  let followSiblings: ScheduleCell[] = [];
+  let follow = false;
+  try {
+    followSiblings = await fetchSameSlotSiblings(cell);
+  } catch (e) {
+    console.error('[follow] 同槽兄弟查询失败，本次按「单独动」处理', e);
+    followSiblings = [];
+  }
+  if (followSiblings.length) {
+    const choice = await confirmFollow(followSiblings.length, target);
+    if (choice === 'cancel') {
+      busy.value = false;
+      return;
+    }
+    follow = choice === 'follow';
+  }
+  busy.value = true;
   try {
     const res = await moveSchedule(cell.scheduleId, {
       classTime: `${dateOf(weekday)} ${period.start}:00`,
@@ -2448,6 +2526,54 @@ async function doMove(cell: ScheduleCell, weekday: number, periodNo: number) {
       label: `移动「${cell.courseName ?? '该课次'}」到${target}`,
       prev
     });
+    if (follow) {
+      const failed: string[] = [];
+      let moved = 0;
+      for (const sib of followSiblings) {
+        const sibPeriod = PERIODS.find(p => p.seq === sib.periodNo) ?? period;
+        const sibPrev: ScheduleUpdateBody = {
+          classTime: sib.classTime ?? '',
+          durationMin: sibPeriod.duration,
+          weekday: sib.weekday ?? 1,
+          periodNo: sib.periodNo ?? 1
+        };
+        const ct = classTimeAtWeek(Number(sib.weekNo ?? 1), weekday, period.start);
+        if (!ct) {
+          failed.push(`第 ${sib.weekNo ?? '?'} 周（学期未配开始日期）`);
+          continue;
+        }
+        try {
+          const r2 = await moveSchedule(sib.scheduleId, {
+            classTime: ct,
+            durationMin: period.duration,
+            weekday,
+            periodNo
+          });
+          if (r2?.conflict) {
+            failed.push(`第 ${sib.weekNo ?? '?'} 周（${r2.conflictMsg || '冲突'}）`);
+            continue;
+          }
+          pushUndo({
+            kind: 'move',
+            scheduleId: sib.scheduleId,
+            label: `移动「${cell.courseName ?? '该课次'}」第 ${sib.weekNo ?? '?'} 周课次到${target}`,
+            prev: sibPrev
+          });
+          moved++;
+        } catch {
+          failed.push(`第 ${sib.weekNo ?? '?'} 周`);
+        }
+      }
+      if (moved && failed.length) {
+        ElMessage.warning(`已一起移动 ${moved} 周，另有 ${failed.length} 周没动成：${failed.join('、')}`);
+      } else if (moved) {
+        ElMessage.success(`已把「${cell.courseName ?? '该课次'}」移到${target}，其他 ${moved} 个周的同槽课次已一起跟着移`);
+      } else {
+        ElMessage.warning(`本周已移到${target}，但其他周都没动成：${failed.join('、')}`);
+      }
+      await load(true);
+      return;
+    }
     ElMessage.success(
       siblings.length
         ? `已把「${cell.courseName ?? '该课次'}」也排到${target}，与该节原有 ${siblings.length} 节课次同时段`

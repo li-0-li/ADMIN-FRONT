@@ -282,6 +282,8 @@ export interface ScheduleCell {
    * 只按星期+节次判会把「放回了第 5 周那一节」误判成已兑现，签不显示。
    */
   weekNo?: number;
+  /** 上课时间（schedule.class_time）；2026-11-17 拖动「全部跟着动」按位移换算兄弟日期用 */
+  classTime?: string;
   /** 后端取 schedule.remark */
   note?: string;
 }
