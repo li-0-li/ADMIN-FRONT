@@ -2,7 +2,7 @@
 node_modules/
 
 # 本机构建中转（vite build 前把旧 dist 移到这里，规避 Windows 删除护栏）
-.workbuddy-tmp-dist-prev/
+.workbuddy-tmp-dist-prev*/
 
 # TS 增量构建缓存
 tsconfig.tsbuildinfo
