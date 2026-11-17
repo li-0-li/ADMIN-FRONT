@@ -2183,8 +2183,16 @@ async function handleDrop(weekday: number, periodNo: number, targetCardId: strin
   if (movingCell) {
     // 同班级同节次拦在本地：后端会拒绝，提前说明比让它报一次冲突更省
     if (classBusyAt(movingCell, weekday, periodNo)) {
+      // 点名占位的课程，避免被当成"误判占用"（2026-11-17）
+      const blocker = filtered.value.find(
+        c =>
+          c.scheduleId !== movingCell.scheduleId &&
+          c.weekday === weekday &&
+          c.periodNo === periodNo &&
+          (c.clazzName ?? '').trim() === (movingCell.clazzName ?? '').trim()
+      );
       ElMessage.warning(
-        `「${(movingCell.clazzName ?? '').trim()}」周${CN[weekday - 1]}这一节已有课，同班级不能同时上两门课，这次拖动没生效`
+        `「${(movingCell.clazzName ?? '').trim()}」周${CN[weekday - 1]}这一节已有「${blocker?.courseName ?? '其他课'}」——同班级不能同时上两门课，这次拖动没生效`
       );
       return;
     }
