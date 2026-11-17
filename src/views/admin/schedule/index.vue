@@ -6,7 +6,7 @@ import ZkIcon from '@/components/ZkIcon.vue';
 import { useUserStore } from '@/store/user';
 import { autoArrange, createSchedule, deleteSchedule, fetchClazzPool, listCourseOfferings, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules, updateLessonStatus } from '@/api/admin/schedules';
 import type { ClazzPoolItem, OfferingBrief, ScheduleCreateBody, ScheduleSwapBody, ScheduleUpdateBody } from '@/api/admin/schedules';
-import { deleteCourse } from '@/api/admin/courses';
+import { createOffering, deleteCourse, updateOfferingScheduleConfig } from '@/api/admin/courses';
 import { listClasses, listClassrooms, listMajors, listSchools, listTerms, updateClassroom } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
 import { listPeriods } from '@/api/admin/periods';
@@ -2893,8 +2893,100 @@ watch(
     }
     // 选课变了就重圈候选教师（2026-11-12，见 loadCapabilityTeachers）
     void loadCapabilityTeachers(form.courseId);
+    // 「课程配置」模式：查该课是否已有配置（有 ⇒ 只能更新节奏，教师/班级只读展示）
+    void loadConfigOffering();
   }
 );
+
+/* ========== 「课程配置」模式（2026-11-17 业主终口径）==========
+ * 手动打开（非拖拽）的弹窗 = 纯配置入口：只写 course_offering（教师/班级/周范围/每周节数/总课时），
+ * **不创建任何课次**——「选了星期就自动进课表」被业主否掉，课表时间全部由
+ * 「自动排课」（或把待排课程拖进格子）生成。已有配置的课只能更新节奏
+ * （教师/班级后端暂无编辑接口，字段只读展示，见派单 20261116-开课记录编辑接口）。 */
+const configOffering = ref<OfferingBrief | null>(null);
+const configExisting = ref(false);
+async function loadConfigOffering() {
+  configOffering.value = null;
+  configExisting.value = false;
+  if (!form.courseId || createPresetCell.value) return;
+  try {
+    const list = await listCourseOfferings(form.courseId);
+    if (list.length) {
+      configOffering.value = list[0];
+      configExisting.value = true;
+      // 已有配置 ⇒ 教师/班级回填现值（本次保存只更新排课节奏）
+      if (list[0].teacherId) form.teacherId = String(list[0].teacherId);
+      const tc = list[0].targetClasses?.[0];
+      if (tc && !form.clazzName) form.clazzName = tc;
+      // 节奏回填：让用户看到现在存的是什么再改
+      repeatForm.weekFrom = Number(list[0].weekFrom ?? 1);
+      repeatForm.weekly = Math.max(1, Number(list[0].lessonsPerWeek ?? 1));
+      if (list[0].weekCount) repeatForm.weekTo = Math.min(createWeekMax.value, repeatForm.weekFrom + Number(list[0].weekCount) - 1);
+      if (list[0].totalLessons) repeatForm.total = Number(list[0].totalLessons);
+    }
+  } catch {
+    /* 查询失败按无配置处理，保存时后端会把重复配置的 40902 拦出来 */
+  }
+}
+
+/** 「课程配置」保存（2026-11-17 业主终口径）：只存配置不进课表。 */
+async function submitConfigOnly() {
+  if (!form.termId) {
+    ElMessage.warning('请先选择学期');
+    return;
+  }
+  if (createWeekRangeError.value) {
+    ElMessage.warning(createWeekRangeError.value);
+    return;
+  }
+  if (!form.courseId) {
+    ElMessage.warning('请选择课程');
+    return;
+  }
+  if (!configExisting.value && !form.teacherId) {
+    ElMessage.warning('请选择授课教师（教师必选，班级可不选）');
+    return;
+  }
+  const weekCount = repeatForm.weekTo - repeatForm.weekFrom + 1;
+  const lessonsPerWeek = Math.max(1, repeatForm.weekly);
+  saving.value = true;
+  try {
+    let offeringId = configOffering.value?.offeringId;
+    if (!offeringId) {
+      const clazzId = form.clazzName ? clazzIdByName.value[form.clazzName] : undefined;
+      const res = await createOffering(form.courseId, {
+        termId: form.termId,
+        teacherId: form.teacherId,
+        clazzIds: clazzId ? [clazzId] : undefined,
+        weekCount
+      });
+      offeringId = res.offeringId;
+    }
+    await updateOfferingScheduleConfig(offeringId!, {
+      weekFrom: repeatForm.weekFrom,
+      weekCount,
+      lessonsPerWeek,
+      totalLessons: repeatForm.total
+    });
+    // 这门课的配置变了 ⇒ 池子「已配置/缺教师/缺班级」判定要重算，直接写入最新值
+    try {
+      const fresh = await listCourseOfferings(form.courseId);
+      offeringByCourse.value = { ...offeringByCourse.value, [String(form.courseId)]: fresh as OfferingBrief[] };
+    } catch {
+      /* 刷新失败不阻断，下次进池子会重拉 */
+    }
+    createVisible.value = false;
+    ElMessage.success(
+      configExisting.value
+        ? `排课节奏已更新（第 ${repeatForm.weekFrom}~${repeatForm.weekTo} 周 · 每周 ${lessonsPerWeek} 节）。课表请在上方点「自动排课」生成`
+        : '课程配置已保存。课表请在上方点「自动排课」生成，或把待排课程拖进格子手动排'
+    );
+  } catch {
+    /* 请求层已弹后端原话（40902 重复配置 / 422 等） */
+  } finally {
+    saving.value = false;
+  }
+}
 
 /**
  * 新建课次：教师候选按「该课程的授课资格」收口（2026-11-12）。
@@ -3159,6 +3251,13 @@ function autoAssignPeriods(): Array<{ weekday: number; periodNo: number }> | nul
 }
 
 async function submitCreate() {
+  // 2026-11-17 业主终口径：手动打开的弹窗 = 纯「课程配置」——只存配置不建课次
+  // （「选了星期就自动进课表」被否），课表时间全部交给自动排课/拖拽；
+  // 只有拖拽（落点已定）才走建课次的老路径。
+  if (!createPresetCell.value) {
+    await submitConfigOnly();
+    return;
+  }
   if (!form.termId) {
     ElMessage.warning('请先选择学期');
     return;
@@ -4426,7 +4525,7 @@ watch(
         v-if="canCreate"
         class="btn btn-outline"
         type="button"
-        title="课程配置：逐门指定课程、教师、班级、教室、星期与周范围（第几节由系统自动分配；也可把下方待排课程直接拖进课表格子）"
+        title="课程配置：指定课程、教师、班级与排课节奏（周范围/每周节数/总课时）——上课时间由自动排课生成，这里不选；也可把下方待排课程拖进课表格子手动排"
         @click="openCreate(null, null)"
       >
         <ZkIcon name="pencil" :size="16" style="margin-right: 4px" />手动排课
@@ -5399,6 +5498,7 @@ watch(
           filterable
           clearable
           :loading="capTeacherLoading"
+          :disabled="!createPresetCell && configExisting"
           style="width: 100%"
         >
           <el-option v-for="t in createTeacherOptions" :key="t.value" :label="t.label" :value="t.value" />
@@ -5425,12 +5525,13 @@ watch(
           v-model="form.clazzName"
           placeholder="请选择班级"
           filterable
+          :disabled="!createPresetCell && configExisting"
           style="width: 100%"
         >
           <el-option v-for="n in classListOptions" :key="n" :label="n" :value="n" />
         </el-select>
       </el-form-item>
-      <el-form-item label="上课教室">
+      <el-form-item v-if="createPresetCell" label="上课教室">
         <el-select v-model="form.classroomId" placeholder="可不填" clearable style="width: 100%">
           <el-option v-for="o in roomOptions" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
@@ -5439,27 +5540,30 @@ watch(
           {{ createCapacityWarn }}
         </div>
       </el-form-item>
-      <el-form-item label="星期">
+      <!-- 星期/教室：仅拖拽模式（落点已定）可改；「课程配置」模式不选时间——
+           2026-11-17 业主终口径：上课时间是自动排课排出来的，配置页不选 -->
+      <el-form-item v-if="createPresetCell" label="星期">
         <el-select v-model="form.weekday" style="width: 100%">
           <el-option v-for="d in WEEKDAYS" :key="d.v" :label="d.label" :value="d.v" />
         </el-select>
       </el-form-item>
       <!-- 每周节数（2026-10-20）：一周多节的课一次排完
-           2026-11-17 业主口径：节次时间（第几节 + 具体时段）不在配置里选，由系统自动分配空位；
-           每周多节时只为每节选「星期几」，第几节保存时自动找空位 -->
+           2026-11-17 业主终口径：课程配置不选「星期」——上课时间（星期几 + 第几节 + 时段）
+           全部由自动排课生成；拖拽模式下每节可分别指定星期 -->
       <el-form-item label="每周节数">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center">
           <el-input-number v-model="repeatForm.weekly" :min="1" :max="5" @change="syncRepeatTotal" style="width: 110px" />
-          <span class="small muted">大于 1 时可为每节分别选星期</span>
+          <span v-if="createPresetCell" class="small muted">大于 1 时可为每节分别选星期</span>
         </div>
-        <div class="small muted" style="width: 100%">
-          第几节 + 具体时段不用选：保存时由系统自动分配空位，排完后可在课表上拖动微调
+        <div v-if="!createPresetCell" class="small muted" style="width: 100%">
+          这里不选上课时间：保存配置后点「自动排课」，系统按教师/教室/班级空闲生成课表
         </div>
       </el-form-item>
       <el-form-item
         v-for="(s, i) in extraSlotList"
         :key="'extra-slot-' + i"
         :label="`第${i + 2}节`"
+        v-if="createPresetCell"
       >
         <div style="display: flex; gap: 8px; width: 100%; align-items: center">
           <el-select v-model="s.weekday" style="width: 100%">
@@ -5468,9 +5572,11 @@ watch(
           <span class="small muted" style="white-space: nowrap">节次自动分配</span>
         </div>
       </el-form-item>
-      <!-- 周次重复（2026-10-20）：排一次 = 按周展开成整学期的课次，翻周即可见 -->
-      <el-form-item label="重复">
-        <div style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
+      <!-- 周次重复（2026-10-20）：拖拽排课一次 = 按周展开成整学期的课次
+           2026-11-17 课程配置模式：这里显示的周范围 = 排课节奏的铺课窗口（weekFrom~weekTo），
+           不再选重复方式（单双周等是排课时的概念，配置里没有） -->
+      <el-form-item :label="createPresetCell ? '重复' : '周范围'">
+        <div v-if="createPresetCell" style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
           <el-select v-model="repeatForm.mode" style="flex: 1; min-width: 140px">
             <el-option v-for="(t, m) in REPEAT_TEXT" :key="m" :label="t" :value="m" />
           </el-select>
@@ -5479,7 +5585,7 @@ watch(
              取代原来的裸周数 times —— 后者起点被隐式固定，插班/半学期场景无法表达。
              上限 = 所选学期的真实周数（#11）；学期未配日期时上限 25 并在上方给橙色提示。 -->
         <div
-          v-if="repeatForm.mode !== 'once'"
+          v-if="!createPresetCell || repeatForm.mode !== 'once'"
           style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap; margin-top: 8px"
         >
           <span class="small muted">第</span>
@@ -5503,13 +5609,21 @@ watch(
           <span class="small muted">周</span>
           <span class="small muted" style="margin-left: auto">上限 {{ createWeekMax }} 周</span>
         </div>
-        <div v-if="repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
+        <!-- 已有配置提示（2026-11-17 课程配置模式）：一门课只允许一条配置，
+             教师/班级已随配置定死（后端暂无编辑接口），本次保存只更新排课节奏 -->
+        <div v-if="!createPresetCell && configExisting" class="small" style="color: var(--warning, #b45309); width: 100%; margin-top: 6px">
+          该课程已有一条配置：本次保存将更新排课节奏（教师/班级暂不支持在界面修改）
+        </div>
+        <div v-if="createPresetCell && repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
           {{ repeatAnchorLabel }} · {{ repeatHint }}
+        </div>
+        <div v-else-if="!createPresetCell" class="small muted" style="width: 100%">
+          自动排课只会把课铺进这个周窗口；窗口外的周次不会排课
         </div>
         <!-- 单双周锚定说明（2026-10-29）：默认按学期起点算奇偶，从哪周排都不错位；
              学期未配开始日期才回退「锚定当前浏览周」，此时才有对调风险（橙色提示去补日期） -->
         <div
-          v-if="repeatForm.mode === 'odd' || repeatForm.mode === 'even'"
+          v-if="createPresetCell && (repeatForm.mode === 'odd' || repeatForm.mode === 'even')"
           class="small"
           :style="{ color: createTermAnchorMonday ? 'var(--ink-600, #52525b)' : 'var(--warning, #b45309)', width: '100%' }"
         >
@@ -5526,7 +5640,7 @@ watch(
       </el-form-item>
       <!-- 总课时（2026-11-13 业主反馈：「总节数」改叫「总课时」——录音口径「一共多少课时」）
            满额可改小 —— 不够分时从最后一周往前少排（前满后少） -->
-      <el-form-item v-if="repeatForm.mode !== 'once'" label="总课时">
+      <el-form-item v-if="!createPresetCell || repeatForm.mode !== 'once'" label="总课时">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
           <el-input-number
             v-model="repeatForm.total"
@@ -5561,9 +5675,9 @@ watch(
             type="primary"
             :loading="saving"
             :disabled="!!createWeekRangeError"
-            :title="createWeekRangeError || '保存这些课次'"
+            :title="createWeekRangeError || (createPresetCell ? '保存这些课次' : '只保存课程配置，不进课表')"
             @click="submitCreate"
-          >保存课次</el-button>
+          >{{ createPresetCell ? '保存课次' : '保存配置' }}</el-button>
         </span>
       </div>
     </template>

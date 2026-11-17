@@ -214,8 +214,12 @@ export interface OfferingBrief {
   studentCount?: number | null;
   status?: string | null;
   weekCount?: number | null;
+  /** 起始周（`course_offering.week_from`，缺省 1；2026-11-17 课程配置弹窗回填节奏用） */
+  weekFrom?: number | null;
   /** 一周几节（`course_offering.lessons_per_week`，缺省 1；待排池按它封顶每周签数） */
   lessonsPerWeek?: number | null;
+  /** 一共多少课时（节次口径；null = 按周数×每周节次自然铺满；2026-11-17 配置弹窗回填用） */
+  totalLessons?: number | null;
   /**
    * 这条开课记录是否已保存排课设置（`course_offering.schedule_configured`，1=已配）。
    * ★ 2026-11-16 新增：待排池要判「已配置课程」，光看课程行的 `offeringUnconfigured`
