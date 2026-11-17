@@ -276,6 +276,12 @@ export interface ScheduleCell {
   substituteTeacherName?: string;
   /** 调整原因（停课/补课/代课说明） */
   adjustReason?: string;
+  /**
+   * 教学周次（schedule.week_ref，1 起；2026-11-17 起下发）。
+   * 待排池判「已兑现签」的差集必须带周维度——同一门课每周复用同一「星期+节次」，
+   * 只按星期+节次判会把「放回了第 5 周那一节」误判成已兑现，签不显示。
+   */
+  weekNo?: number;
   /** 后端取 schedule.remark */
   note?: string;
 }

@@ -1121,6 +1121,8 @@ interface PoolEntry extends CourseBrief {
    */
   fromWeekday?: number;
   fromPeriodNo?: number;
+  /** 放回签的原教学周次（2026-11-17 起后端下发 weekNo；差集/展示都要带周维度） */
+  fromWeekNo?: number;
   /**
    * 该课程在本学期已有活跃课次 ⇒ 这张签是**重复排课入口**（2026-10-30 P0-A）。
    * 成因：放回=软删课次行，而软删行会一直留在池里成签（后端列表仍返回 deleted 行）；
@@ -1193,23 +1195,28 @@ function buildPoolEntries(): PoolEntry[] {
     const rows = returned.get(String(c.courseId));
     if (rows?.length) {
       // ① 已兑现的签不再显示（2026-11-16 业主「×2 节只能有一节」的一半成因）：
-      //    放回后又在同一「星期+节次」排回了新课次 ⇒ 这张签已经被兑现，再挂着只会让人
-      //    以为主课有重复。按课程+星期+节次对本周在课表上的课次做差集。
+      //    放回后又在同一「周+星期+节次」排回了新课次 ⇒ 这张签已经被兑现，再挂着只会让人
+      //    以为主课有重复。差集键带周维度（2026-11-17）：同一门课每周复用同一「星期+节次」，
+      //    只按星期+节次判会把「放回了第 5 周那一节」误判成已兑现（别的周还占着同槽），
+      //    签不显示、那一节就永远拖不回课表。旧后端无 weekNo 时退化为按星期+节次（原口径）。
       const liveSlots = new Set(
         inScope
           .filter(x => String(x.courseId) === String(c.courseId))
-          .map(x => `${x.weekday}-${x.periodNo}`)
+          .map(x => `${x.weekNo ?? ''}-${x.weekday}-${x.periodNo}`)
       );
-      // ② 每周待排签数封顶 = 每周节数（2026-11-16 业主：「同一个老师同一个班级 ×2 节，只能有一节」）：
-      //    每周 1 节的课不该出现 2 张签——多出的是「建了又删」多轮留下的软删残影
-      //    （不同锚点/批次各留一条），按 scheduleId 新→旧保留前 N 张，其余不出签。库内行不动。
-      const offs = offeringByCourse.value[String(c.courseId)] ?? [];
-      const lpws = offs.map(o => Number(o.lessonsPerWeek ?? 1)).filter(n => Number.isFinite(n) && n >= 1);
-      const cap = lpws.length ? Math.max(...lpws) : 1;
-      const kept = rows
-        .filter(r => !liveSlots.has(`${r.weekday}-${r.periodNo}`))
-        .sort((a, b) => Number(b.scheduleId) - Number(a.scheduleId))
-        .slice(0, cap);
+      // ② 同一「周+星期+节次」只出一张签（2026-11-16 业主：「同一个老师同一个班级 ×2 节，只能有一节」）：
+      //    多轮「建了又删」会在同槽留多条软删残影，按 scheduleId 新→旧去重保留 1 张，库内行不动。
+      //    2026-11-17 修正：去重键带周维度——不同周的「同星期+节次」是两节不同的课，
+      //    既不互相顶掉、也不再用「每周节数」一刀切截断（那会把第 3 周缺失的那一节藏起来）。
+      const kept: ScheduleCell[] = [];
+      const seenSlots = new Set<string>();
+      for (const r of [...rows].sort((a, b) => Number(b.scheduleId) - Number(a.scheduleId))) {
+        if (liveSlots.has(`${r.weekNo ?? ''}-${r.weekday}-${r.periodNo}`)) continue;
+        const k = `${r.weekNo ?? ''}-${r.weekday}-${r.periodNo}`;
+        if (seenSlots.has(k)) continue;
+        seenSlots.add(k);
+        kept.push(r);
+      }
       for (const r of kept) {
         const v = verdict(c);
         out.push({
@@ -1221,7 +1228,8 @@ function buildPoolEntries(): PoolEntry[] {
           missingRhythm: v.missingRhythm,
           // 2026-11-05：带上原课次时间坐标，供池子卡片区分「同一门课的哪一节」
           fromWeekday: r.weekday,
-          fromPeriodNo: r.periodNo
+          fromPeriodNo: r.periodNo,
+          fromWeekNo: r.weekNo
         });
       }
     } else if (!used.has(String(c.courseId))) {
@@ -3784,7 +3792,9 @@ function poolSubLabel(entry: PoolEntry): string {
   if (entry.fromWeekday && entry.fromPeriodNo) {
     const wd = CN[entry.fromWeekday - 1] ?? '';
     const label = PERIODS.find(x => x.seq === entry.fromPeriodNo)?.label ?? `${entry.fromPeriodNo} 节`;
-    parts.push(`原 周${wd} ${label}`);
+    // 2026-11-17：带上原教学周——同一门课每周复用同槽，不带周根本分不清是哪一周的那一节
+    const wk = entry.fromWeekNo ? `第 ${entry.fromWeekNo} 周 ` : '';
+    parts.push(`原 ${wk}周${wd} ${label}`);
   }
   const sem = (entry.semester ?? '').trim();
   if (sem) parts.push(sem);
