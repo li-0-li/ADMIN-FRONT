@@ -826,11 +826,6 @@ type PoolCourse = CourseBrief & {
    */
   courseType?: string;
   /**
-   * 三项认证是否全过（后端 AdminCourseVo.certPassed，2026-11-05 新增）。
-   * ★ 可选：旧包不下发该字段，certPassed() 里有回退分支，不能按必填用。
-   */
-  certPassed?: boolean;
-  /**
    * 该课程名下开课记录数（后端 `AdminCourseVo.offeringCount`）。
    * ★ 2026-11-12 新增：T-01 后课程行不再带教师，教师挂在开课记录上 ⇒
    *   「有没有教师可查」全靠这个数判断（0 = 只建了基础课程、还没开课）。
@@ -849,12 +844,14 @@ type PoolCourse = CourseBrief & {
 };
 const poolCourses = ref<PoolCourse[]>([]);
 
-/* ---------- 三重认证门槛（2026-10-29 需求）：只有通过三重认证的课才能排课 ----------
- * 口径（2026-11-05 修正）：后端 AdminCourseVo.certPassed —— certification 表 video/plan/schedule
- * 三项均 approved。原先用 course.status === 'active'，但该字段不是审核状态：教师端建课可直接写入
- * active，且审核驳回后不回退，导致未过审的课混进待排池。详见 certPassed() 注释。
- * 作用面：待排池（含自动排课，二者同源）、新增课次的课程下拉、网格内存量课次（标灰 + 角标 + 禁拖）。
- */
+/* ---------- 三重认证门槛（2026-10-29 需求）→ 已退役（2026-11-16 取消审核裁决）----------
+ * 原口径（2026-11-05）：后端 AdminCourseVo.certPassed —— certification 表 video/plan/schedule
+ * 三项均 approved；作用面：待排池、新增课次的课程下拉、网格内存量课次（标灰 + 角标）。
+ * ★ 2026-11-16 业主定案取消认证审核：管理端不再有任何通过/驳回入口 ⇒ 没有课能再变成
+ *   approved，certPassed 语义悬空（17/24 门课 approved=0，课表永远挂「未认证」，见
+ *   20261117 现场反馈）。且 2026-11-11（录音 A3）起认证已不拦截任何排课操作，仅剩提示。
+ * ⇒ 2026-11-17 摘除全部认证角标/标灰/下拉后缀，`certPassed` 函数与类型字段一并删除。
+ *   排课资格口径统一为「已配置/未配置」（节奏+教师+班级三项齐备），认证不再参与。 */
 /** courseId -> 课程池记录：认证判定与教师回显共用一张表 */
 const courseById = computed(() => {
   const m = new Map<string, PoolCourse>();
@@ -969,25 +966,6 @@ function syncTeacherOptionsFromOfferings() {
   }
   if (added.length) teacherList.value = [...teacherList.value, ...added];
 }
-/**
- * 该课程是否已通过三重认证。课程池里查不到的课次（历史/脏数据）按未认证处理——宁可多拦，不放未认证的进来。
- *
- * ★ 2026-11-05 修正：**不再以 `status === 'active'` 作为过审判据**。
- *   `course.status` 是开课状态，有两条写入路径：
- *   ① 三项材料全 approved 时由后端置 active；② 教师端建课直接传 status=active 即写入，不经审核。
- *   且该状态只升不降——材料事后被驳回也不回退。
- *   故 active ≠ 已过审，池子曾因此放进一批未过审课程。
- *   现优先读后端 `certPassed`（certification 表三项 approved，见 AdminCourseVo）。
- *   旧包（字段不下发）回退到 status 判定：回退值是「旧口径的上限」，不会比现在更宽。
- */
-function certPassed(courseId: string | number | undefined | null): boolean {
-  if (courseId === undefined || courseId === null) return false;
-  const c = courseById.value.get(String(courseId));
-  if (!c) return false;
-  if (typeof c.certPassed === 'boolean') return c.certPassed;
-  return c.status === 'active';
-}
-
 /**
  * 排课节奏配置状态（2026-11-16）：把后端按 offering 汇总的两个计数翻成签上可判定的状态。
  * 口径来自课程列表 `AdminCourseVo`：
@@ -2846,6 +2824,8 @@ const saving = ref(false);
  *  是因为「排到哪个学期」与「现在看哪个学期」是两件事，用户必须能分别控制。 */
 const form = reactive({ termId: '', courseId: '', teacherId: '', classroomId: '', clazzName: '', weekday: 1, periodNo: 1 });
 const createTitle = ref('新增课次');
+/** 打开弹窗时落点是否已定（从课表格子拖进来/点进来）：已定则节次沿用格子，不做自动分配（2026-11-17） */
+const createPresetCell = ref(false);
 /** 新增课次弹窗里的「上课班级」下拉，@opened 时把焦点直接放到这个必填项 */
 const clazzSelRef = ref<{ focus?: () => void } | null>(null);
 let focusClazzOnOpen = false;
@@ -2864,13 +2844,12 @@ const presetCourseId = ref('');
  * 原口径（2026-10-29）：只列**已通过三重认证**的课，未认证的课连下拉都进不来。
  * 会议录音 A3 明确否掉：
  *   「排课是排课，你上传视频只是老师的一个人的内容……那这里就是有冲突的」
- * ⇒ 排课不再被认证状态拦住。未认证课程照常可选，只在文案上带「未认证」后缀，
- *   让管理员知情而不是被硬拦。`certPassed` 仍用于给课表格子/待排签打标签（提示用途）。
- */
+ * ⇒ 排课不再被认证状态拦住，课程照常可选。
+ * ★ 2026-11-17：认证角标整体退役（2026-11-16 取消审核），下拉不再带「（未认证）」后缀。 */
 const selectionCourseOptions = computed(() =>
   courseList.value.map(o => ({
     value: o.value,
-    label: certPassed(o.value) ? o.label : `${o.label}（未认证）`
+    label: o.label
   }))
 );
 
@@ -3122,8 +3101,12 @@ async function openCreate(
   form.teacherId = '';
 
   const period = PERIODS.find(x => x.seq === periodNo);
-  createTitle.value =
-    weekday && period ? `拖动排课 · 周${CN[weekday - 1]} ${period.label}` : '新增课次 · 手动选择时间';
+  // 2026-11-17 业主口径：这个弹窗就是「课程配置」——上课时间（第几节 + 具体时段）不在这里选，
+  // 由系统自动分配空位；只有从格子拖进来/点进来时落点已定，才沿用格子坐标。
+  createPresetCell.value = weekday != null && periodNo != null;
+  createTitle.value = createPresetCell.value
+    ? `拖动排课 · 周${CN[(weekday as number) - 1]} ${period?.label ?? ''}`
+    : '课程配置';
   createVisible.value = true;
   // 班级是唯一推不出来的必填项（课程接口不带班级）⇒ 弹窗开完把焦点放上去，省一次"找框"的点击。
   // 焦点要等 @opened（EP 的开场动画结束）再设，nextTick 时输入框还没法接收焦点。
@@ -3134,6 +3117,45 @@ function onCreateOpened() {
   if (!focusClazzOnOpen) return;
   focusClazzOnOpen = false;
   clazzSelRef.value?.focus?.();
+}
+
+/**
+ * 「课程配置」模式的节次自动分配（2026-11-17 业主口径：配置页不选第几节，时间是排出来的）。
+ *
+ * 输入 = 第一节（表单「星期」）+ 第 2~weekly 节（extraSlots 的星期）；输出 = 每节的 (weekday, periodNo)。
+ * 占用判定用**当前浏览周课表**：同教师 / 同班级 / 同教室已占的节位让开（换周铺课后真冲突由后端拦截）。
+ * 某个星期全天节次都被占 ⇒ 返回 null 并就地提示换星期，而不是硬塞一个必然冲突的节次。
+ */
+function autoAssignPeriods(): Array<{ weekday: number; periodNo: number }> | null {
+  const wanted = buildRepeatSlots().map(s => s.weekday);
+  const occupied = new Set<string>();
+  for (const c of allCells.value) {
+    if (c.deleted) continue;
+    const sameTeacher = form.teacherId && String(c.teacherId ?? '') === String(form.teacherId);
+    const sameClazz = form.clazzName.trim() && c.clazzName === form.clazzName.trim();
+    const sameRoom = form.classroomId && String(c.classroomId ?? '') === String(form.classroomId);
+    if (sameTeacher || sameClazz || sameRoom) {
+      occupied.add(`${c.weekday}-${c.periodNo}`);
+    }
+  }
+  const out: Array<{ weekday: number; periodNo: number }> = [];
+  for (const weekday of wanted) {
+    let picked: number | null = null;
+    for (const p of PERIODS) {
+      const k = `${weekday}-${p.seq}`;
+      if (!occupied.has(k)) {
+        picked = p.seq;
+        occupied.add(k); // 本批内多节也互不让位
+        break;
+      }
+    }
+    if (picked == null) {
+      ElMessage.warning(`周${CN[weekday - 1]}当天的节次都已被教师/班级占用，请换一个星期`);
+      return null;
+    }
+    out.push({ weekday, periodNo: picked });
+  }
+  return out;
 }
 
 async function submitCreate() {
@@ -3157,13 +3179,35 @@ async function submitCreate() {
     ElMessage.warning('请选择上课班级');
     return;
   }
-  const period = PERIODS.find(x => x.seq === form.periodNo);
-  if (!period) {
-    ElMessage.warning('节次不合法');
-    return;
+  // 节次落点（2026-11-17 业主口径）：弹窗内不再选「第几节」——
+  // ① 从格子拖进来/点进来：落点已定（createPresetCell），节次 = 格子坐标，extra 节沿用落点节次；
+  // ② 「课程配置」手动进入：按每节所选星期，从当前课表里同教师/同班级/同教室已占的节位让开，
+  //    按节次顺序取第一个空闲；真冲突仍由后端把关（保存后 failed 列表会列出）。
+  if (createPresetCell.value) {
+    const period = PERIODS.find(x => x.seq === form.periodNo);
+    if (!period) {
+      ElMessage.warning('节次不合法');
+      return;
+    }
+  } else {
+    const assigned = autoAssignPeriods();
+    if (!assigned) return; // 提示已在函数内给出
+    form.periodNo = assigned[0].periodNo;
+    assigned.slice(1).forEach((a, i) => {
+      if (extraSlots[i]) extraSlots[i].periodNo = a.periodNo;
+    });
   }
   // 每周多节：同周内两节选了相同「星期+节次」= 自己撞自己，直接拦
   const slots = buildRepeatSlots();
+  // 同一门课一天内不能有两节（2026-11-17 业主口径）：每周多节时各节必须选不同的星期
+  const seenDays = new Set<number>();
+  for (const s of slots) {
+    if (seenDays.has(s.weekday)) {
+      ElMessage.warning('同一门课一天内不能有两节：每周多节时请为每节选不同的星期');
+      return;
+    }
+    seenDays.add(s.weekday);
+  }
   const seenSlots = new Set<string>();
   for (const s of slots) {
     const k = `${s.weekday}-${s.periodNo}`;
@@ -3196,7 +3240,8 @@ async function submitCreate() {
         anchorToTerm: true,
         ctx: {
           anchor: createTermAnchorMonday.value,
-          semEnd: parseDateOnly(createTermInfo.value?.endDate)
+          semEnd: parseDateOnly(createTermInfo.value?.endDate),
+          start: parseDateOnly(createTermInfo.value?.startDate)
         }
       }
     );
@@ -3223,7 +3268,7 @@ async function submitCreate() {
         label: `新增「${courseLabel}」× ${ids.length} 节（${REPEAT_TEXT[repeatForm.mode]}${repeatForm.weekly > 1 ? ` · 每周 ${repeatForm.weekly} 节` : ''}${trimmed ? ' · 前满后少' : ''}）`
       });
       ElMessage.success(
-        `已排入 ${ids.length} 节（${REPEAT_TEXT[repeatForm.mode]}${repeatForm.weekly > 1 ? ` · 每周 ${repeatForm.weekly} 节` : ''}，翻周即可查看）`
+        `已排入 ${ids.length} 节（${REPEAT_TEXT[repeatForm.mode]}${repeatForm.weekly > 1 ? ` · 每周 ${repeatForm.weekly} 节` : ''}${createPresetCell.value ? '' : ' · 节次为系统自动分配，可在课表拖动调整'}，翻周即可查看）`
       );
       if (failed.length) {
         ElMessageBox.alert(`以下时段因冲突未排入：${failed.join('；')}`, '部分课次未排入', { type: 'warning' }).catch(() => {});
@@ -3320,11 +3365,21 @@ const createTermInfo = computed(() => termInfoOf(form.termId));
 const createTermAnchorMonday = computed<Date | null>(() => termAnchorOf(createTermInfo.value));
 /** 弹窗所选学期的真实周数；0 = 该学期未配起止日期（结束周上限退化为 25 并给橙色提示） */
 const createTermWeeks = computed(() => termWeeksOf(createTermInfo.value));
-/** 结束周上限：学期周数已知取真实周数，未知退 25（与历史 times 上限一致） */
-const createWeekMax = computed(() => (createTermWeeks.value > 0 ? createTermWeeks.value : 25));
+/** 结束周上限：学期周数已知取真实周数，未知退 25（与历史 times 上限一致）。
+ *  ★ 2026-11-17：再与「教学周设置」取小——后端按教学周设置判周次越界（本地 18 周），
+ *    学期天数折算出的 20 周若不收口，起始周锚在周一会铺出第 0 周/第 19 周被后端整批拒掉。 */
+const createWeekMax = computed(() => {
+  const termWeeks = createTermWeeks.value > 0 ? createTermWeeks.value : 25;
+  const tw = teachingWeekCount.value;
+  return tw ? Math.min(termWeeks, tw) : termWeeks;
+});
 /** 结束周的默认值：学期周数已知 ⇒ 铺满整学期（「排一次 = 整学期都有课」的既有语义）；
- *  学期未配日期 ⇒ 退回 18（历史默认值），不要拿 25 当默认——那等于默认多排 7 周。 */
-const defaultWeekTo = computed(() => (createTermWeeks.value > 0 ? createTermWeeks.value : 18));
+ *  学期未配日期 ⇒ 退回 18（历史默认值），不要拿 25 当默认——那等于默认多排 7 周。同样与教学周设置取小。 */
+const defaultWeekTo = computed(() => {
+  const termWeeks = createTermWeeks.value > 0 ? createTermWeeks.value : 18;
+  const tw = teachingWeekCount.value;
+  return tw ? Math.min(termWeeks, tw) : termWeeks;
+});
 
 /** 当前浏览的学期（顶部筛选优先，其次是页面认定的当前学期）。
  *  模板里不能写 currentTermId.value —— ref 在模板中已自动解包，会报 TS2551。 */
@@ -3447,7 +3502,7 @@ function repeatDates(
    * 手动排课必须传弹窗所选学期的 anchor/semEnd —— 否则「弹窗选 2026-2027-2、页面在看 2026-2027-1」
    * 时会把日期铺到错误的学期里。
    */
-  ctx?: { anchor?: Date | null; semEnd?: Date | null }
+  ctx?: { anchor?: Date | null; semEnd?: Date | null; start?: Date | null }
 ): string[] {
   const anchor = ctx ? (ctx.anchor ?? null) : termAnchorMonday.value;
   const semEnd = ctx ? (ctx.semEnd ?? null) : parseDateOnly(currentTermInfo.value?.endDate);
@@ -3458,9 +3513,20 @@ function repeatDates(
   const wt = Math.max(wf, Math.round(rp.weekTo ?? wf));
   // 单双周按「学期第 N 周」的奇偶对齐：起始周为偶数但选单周时顺延一周，避免整体错位一周
   const startWeek = rp.mode === 'odd' || rp.mode === 'even' ? alignParityWeek(rp.mode, wf) : wf;
-  const base = new Date(anchored ? anchor! : weekStart.value);
-  if (anchored) base.setDate(base.getDate() + (startWeek - 1) * 7);
-  base.setDate(base.getDate() + (weekday - 1));
+  // 2026-11-17：学期锚定时与后端 resolveWeekRef **同口径**——第 N 周 = termStart+(N-1)*7 起的 7 天窗口，
+  // weekday 落点 = 窗口起点 + ((w - 起点的星期序 + 7) % 7)。原实现从「学期第 1 周周一」起算，
+  // 学期从周二开学时会把周一的课铺到 termStart 前一天（08-31），后端判「第 0 周」整批拒掉。
+  const start = ctx?.start ?? parseDateOnly(currentTermInfo.value?.startDate);
+  const swd = start ? (start.getDay() === 0 ? 7 : start.getDay()) : 0;
+  let base: Date;
+  if (anchored && start) {
+    base = new Date(start);
+    base.setDate(base.getDate() + (startWeek - 1) * 7 + ((weekday - swd + 7) % 7));
+  } else {
+    base = new Date(anchored ? anchor! : weekStart.value);
+    if (anchored) base.setDate(base.getDate() + (startWeek - 1) * 7);
+    base.setDate(base.getDate() + (weekday - 1));
+  }
   const step = rp.mode === 'odd' || rp.mode === 'even' ? 14 : 7;
   const count =
     rp.mode === 'once'
@@ -3505,7 +3571,7 @@ async function createBatch(
     /** 铺日期时锚定学期起点（自动排课必传）：见 repeatDates 第三参说明（2026-10-30） */
     anchorToTerm?: boolean;
     /** 锚定上下文（2026-11-09）：手动排课传弹窗所选学期的 anchor/semEnd，自动排课不传 */
-    ctx?: { anchor?: Date | null; semEnd?: Date | null };
+    ctx?: { anchor?: Date | null; semEnd?: Date | null; start?: Date | null };
   },
   onProgress?: (done: number, total: number) => void
 ) {
@@ -4360,7 +4426,7 @@ watch(
         v-if="canCreate"
         class="btn btn-outline"
         type="button"
-        title="手动排课：逐门指定课程、教师、班级、教室与节次星期（也可把下方待排课程直接拖进课表格子）"
+        title="课程配置：逐门指定课程、教师、班级、教室、星期与周范围（第几节由系统自动分配；也可把下方待排课程直接拖进课表格子）"
         @click="openCreate(null, null)"
       >
         <ZkIcon name="pencil" :size="16" style="margin-right: 4px" />手动排课
@@ -4719,7 +4785,7 @@ watch(
                     : undefined
                 "
               >
-                <!-- 三重认证门槛（2026-10-29）：c-uncertified = 存量未认证课次不藏，标灰保留可见（隐藏会让课次"静默消失"） -->
+                <!-- 三重认证门槛已退役（2026-11-16 取消审核 + 2026-11-17 摘除）：不再按认证标灰 -->
                 <div
                   v-for="(s, idx) in c.list"
                   :key="s.scheduleId"
@@ -4733,7 +4799,6 @@ watch(
                       'c-join-target': isChoiceHover(c.weekday, row.period.seq, s),
                       'c-swap-target': isSwapOnlyHover(c.weekday, row.period.seq, s),
                       'c-jump': String(s.scheduleId) === String(jumpTargetId),
-                      'c-uncertified': !certPassed(s.courseId),
                       'c-canceled': s.lessonStatus === 'canceled'
                     }
                   ]"
@@ -4775,8 +4840,6 @@ watch(
                     class="lesson-tag lesson-tag--sub"
                     :title="lessonStatusText(s)"
                   >代课·{{ s.substituteTeacherName }}</span>
-                  <!-- 未认证角标（2026-11-11 起为**提示性**，不再阻断）：放开后仍保留标识，让管理员看得见状态 -->
-                  <span v-if="!certPassed(s.courseId)" class="uncert-tag" title="该课程未通过三重认证；排课不受此限制，仅作状态提示">未认证</span>
                   <!-- 悬停反馈：不同教师 ⇒ 放下后可选「并入 / 互换」；同一教师 ⇒ 只能互换 -->
                   <span v-if="isChoiceHover(c.weekday, row.period.seq, s)" class="card-tag">
                     <ZkIcon name="plus" :size="11" />{{ draggingCell ? '可并入 / 可互换' : '也排到这一节' }}
@@ -5321,7 +5384,7 @@ watch(
           style="color: var(--warning, #b45309); width: 100%"
         >
           该课属于「未配置课程」（{{ cfgGapSentence(createCourseCfg.gaps) }}）：
-          <b>手动排课不受影响</b>，按下面选好时间与周范围即可保存；
+          <b>手动排课不受影响</b>，按下面选好星期与周范围即可保存（节次自动分配）；
           想以后用「自动排课」省事，到「课程管理 → 课程详情 → 开课记录」补齐授课教师与面向班级（<b>选修课可不填班级</b>），并保存「排课设置」。
         </div>
       </el-form-item>
@@ -5381,42 +5444,28 @@ watch(
           <el-option v-for="d in WEEKDAYS" :key="d.v" :label="d.label" :value="d.v" />
         </el-select>
       </el-form-item>
-      <!-- 每周节数（2026-10-20）：一周多节的课一次排完，每节可分别定时间
-           2026-11-13 业主反馈：原独立「节次」项改叫「第一节」并挪到每周节数之下，
-           与「第2节…」形成同一序列（第一节的时间共用上面的星期） -->
+      <!-- 每周节数（2026-10-20）：一周多节的课一次排完
+           2026-11-17 业主口径：节次时间（第几节 + 具体时段）不在配置里选，由系统自动分配空位；
+           每周多节时只为每节选「星期几」，第几节保存时自动找空位 -->
       <el-form-item label="每周节数">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center">
           <el-input-number v-model="repeatForm.weekly" :min="1" :max="5" @change="syncRepeatTotal" style="width: 110px" />
-          <span class="small muted">大于 1 时可为每节分别选时间</span>
+          <span class="small muted">大于 1 时可为每节分别选星期</span>
         </div>
-      </el-form-item>
-      <el-form-item label="第一节">
-        <el-select v-model="form.periodNo" style="width: 100%">
-          <el-option
-            v-for="p in PERIODS"
-            :key="p.seq"
-            :label="`${p.label}（${timeRange(p)}）`"
-            :value="p.seq"
-          />
-        </el-select>
+        <div class="small muted" style="width: 100%">
+          第几节 + 具体时段不用选：保存时由系统自动分配空位，排完后可在课表上拖动微调
+        </div>
       </el-form-item>
       <el-form-item
         v-for="(s, i) in extraSlotList"
         :key="'extra-slot-' + i"
         :label="`第${i + 2}节`"
       >
-        <div style="display: flex; gap: 8px; width: 100%">
+        <div style="display: flex; gap: 8px; width: 100%; align-items: center">
           <el-select v-model="s.weekday" style="width: 100%">
             <el-option v-for="d in WEEKDAYS" :key="d.v" :label="d.label" :value="d.v" />
           </el-select>
-          <el-select v-model="s.periodNo" style="width: 100%">
-            <el-option
-              v-for="p in PERIODS"
-              :key="p.seq"
-              :label="`${p.label}（${timeRange(p)}）`"
-              :value="p.seq"
-            />
-          </el-select>
+          <span class="small muted" style="white-space: nowrap">节次自动分配</span>
         </div>
       </el-form-item>
       <!-- 周次重复（2026-10-20）：排一次 = 按周展开成整学期的课次，翻周即可见 -->
@@ -6458,31 +6507,10 @@ watch(
 .lesson-tag--sub {
   background: var(--warning, #b45309);
 }
-/* 三重认证门槛（2026-10-29）：未认证存量课次标灰 + 左下角标；不隐藏（隐藏=课次静默消失） */
-.cblock.c-uncertified {
-  opacity: 0.45;
-  filter: grayscale(0.9);
-  cursor: not-allowed;
-}
-/* 批次6 停课课次：半透明仍可见（时间位置还在，点开可恢复正常） */
+/* 批次6 停课课次：半透明仍可见（时间位置还在，点开可恢复正常）
+   （认证标灰/角标样式已随 2026-11-16 取消审核裁决摘除） */
 .cblock.c-canceled {
   opacity: 0.55;
-}
-.cblock.c-uncertified.c-jump {
-  opacity: 0.85;
-}
-.uncert-tag {
-  position: absolute;
-  bottom: -1px;
-  left: -1px;
-  padding: 1px 6px;
-  border-radius: 0 8px 0 8px;
-  background: var(--ink-500);
-  color: #fff;
-  font-size: 10px;
-  font-weight: 600;
-  white-space: nowrap;
-  z-index: 1;
 }
 /* 新增弹窗：授课教师只读展示（2026-10-29） */
 .teacher-ro {
