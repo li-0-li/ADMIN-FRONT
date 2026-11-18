@@ -61,6 +61,8 @@ interface CourseRow {
   weekCount?: number | null;
   /** 学生选课的报名状态（enrolled 等）；教师记录没有这个字段 */
   enrollStatus?: string;
+  /** 学生选课时间（后端 `enrollTime` 是完整时间戳，表格里只取日期） */
+  enrollTime?: string;
 }
 const COURSE_STATUS: Record<string, string> = { enrolled: '已选课', dropped: '已退课', completed: '已完成' };
 const courseRows = computed<CourseRow[]>(() => {
@@ -85,10 +87,24 @@ const courseRows = computed<CourseRow[]>(() => {
       termCode: year ? `${year} 年` : '',
       studentCount: (c.studentCount as number) ?? null,
       weekCount: (c.weekCount as number) ?? null,
-      enrollStatus: String(c.status ?? '')
+      enrollStatus: String(c.status ?? ''),
+      enrollTime: enrollTime ? enrollTime.slice(0, 10) : ''
     };
   });
 });
+
+/* ---------------- 记录表的展示口径 ---------------- */
+/** 周数列只在真有数据时出现：库里 weekCount 基本都是 null，硬留一列「—」比不长更难看 */
+const hasWeek = computed(() => courseRows.value.some((r) => r.weekCount !== null && r.weekCount !== undefined));
+/** 教师记录里的学生数合计（真实数据求和，不是编的） */
+const totalStudents = computed(() =>
+  isTeacher.value ? courseRows.value.reduce((s, r) => s + (r.studentCount ?? 0), 0) : 0
+);
+/** 表格列模板：教师(有周数)=课程/周数/学生；教师(无周数)=课程/学生；学生=课程/选课时间/状态 */
+const recBoxClass = computed(() => ({
+  'rec-3col': isTeacher.value && hasWeek.value,
+  'rec-stu': !isTeacher.value
+}));
 
 const termOptions = computed(() => {
   const set = new Set<string>();
@@ -273,39 +289,68 @@ async function submitEdit() {
       </section>
 
       <!-- ③ 授课 / 选课记录（按学期分组） -->
-      <section class="sec">
+      <section class="sec sec-rec">
         <div class="sec-head">
           <span class="sec-title">{{ isTeacher ? '授课记录' : '选课记录' }}</span>
-          <el-select
-            v-if="termOptions.length"
-            v-model="termFilter"
-            :placeholder="isTeacher ? '全部学期' : '全部年份'"
-            clearable
-            size="small"
-            style="width: 150px"
-          >
-            <el-option v-for="t in termOptions" :key="t" :label="t" :value="t" />
-          </el-select>
-        </div>
-
-        <div v-if="!groupedCourses.length" class="small muted">
-          {{ isTeacher ? '本学期还没有授课记录。' : '还没有选课记录。' }}
-        </div>
-
-        <div v-for="g in groupedCourses" :key="g.term" class="term-group">
-          <div class="term-head">
-            <ZkIcon name="calendar-days" :size="13" />
-            <span class="term-name">{{ g.term }}</span>
-            <span class="small muted">{{ g.list.length }} 门</span>
+          <div class="sec-tools">
+            <span v-if="courseRows.length" class="small muted">
+              {{ courseRows.length }} 门<template v-if="totalStudents"> · {{ totalStudents }} 名学生</template>
+            </span>
+            <el-select
+              v-if="termOptions.length"
+              v-model="termFilter"
+              :placeholder="isTeacher ? '全部学期' : '全部年份'"
+              clearable
+              size="small"
+              style="width: 150px"
+            >
+              <el-option v-for="t in termOptions" :key="t" :label="t" :value="t" />
+            </el-select>
           </div>
-          <div class="course-list">
-            <div v-for="c in g.list" :key="c.key" class="course-item">
-              <span class="course-name">{{ c.courseName }}</span>
-              <span class="course-meta">
-                <template v-if="c.enrollStatus">　<em class="st-tag">{{ COURSE_STATUS[c.enrollStatus] ?? c.enrollStatus }}</em></template>
-                <template v-if="c.studentCount !== null">　{{ c.studentCount }} 人</template>
-                <template v-if="c.weekCount">　·　{{ c.weekCount }} 周</template>
-              </span>
+        </div>
+
+        <!-- 记录区做成占满剩余高度的表格：字段横向铺开（原来一列小字贴在左边，
+             右边 700 多像素全空），不足一屏时由「已显示全部」收尾，不再是一片裸白 -->
+        <div class="rec-box" :class="recBoxClass">
+          <div class="rec-head">
+            <span>{{ isTeacher ? '课程' : '课程' }}</span>
+            <span v-if="isTeacher && hasWeek" class="num">周数</span>
+            <span v-if="isTeacher" class="num">学生</span>
+            <template v-else>
+              <span class="num">选课时间</span>
+              <span class="num">状态</span>
+            </template>
+          </div>
+
+          <div class="rec-body">
+            <template v-if="groupedCourses.length">
+              <div v-for="g in groupedCourses" :key="g.term" class="rec-group">
+                <div class="rec-group-head">
+                  <ZkIcon name="calendar-days" :size="13" />
+                  <span class="term-name">{{ g.term }}</span>
+                  <span class="small muted">{{ g.list.length }} 门</span>
+                </div>
+                <div v-for="c in g.list" :key="c.key" class="rec-row">
+                  <span class="rec-course" :title="c.courseName">{{ c.courseName }}</span>
+                  <template v-if="isTeacher">
+                    <span v-if="hasWeek" class="num muted">{{ c.weekCount ? `${c.weekCount} 周` : '—' }}</span>
+                    <span class="num">{{ c.studentCount === null || c.studentCount === undefined ? '—' : `${c.studentCount} 人` }}</span>
+                  </template>
+                  <template v-else>
+                    <span class="num muted">{{ c.enrollTime || '—' }}</span>
+                    <span class="num">
+                      <em v-if="c.enrollStatus" class="st-tag">{{ COURSE_STATUS[c.enrollStatus] ?? c.enrollStatus }}</em>
+                      <span v-else class="muted">—</span>
+                    </span>
+                  </template>
+                </div>
+              </div>
+              <div class="rec-end">已显示全部 {{ courseRows.length }} 条记录</div>
+            </template>
+
+            <div v-else class="rec-empty">
+              <ZkIcon name="calendar-days" :size="22" />
+              <span>{{ termFilter ? '该学期没有记录，清掉上方筛选看全部' : (isTeacher ? '还没有授课记录' : '还没有选课记录') }}</span>
             </div>
           </div>
         </div>
@@ -358,7 +403,9 @@ async function submitEdit() {
 }
 .kv-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* 原来固定 2 列 ⇒ 卡片有 1000+ 像素宽时，「姓名」和「账号」之间被拉开 500 像素空白。
+     改成按可用宽度自动铺列：字段「标签+值」始终贴在一起，整行铺满，不再有大段横向留白。 */
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
   gap: 8px 20px;
 }
 .kv {
@@ -420,39 +467,112 @@ async function submitEdit() {
   color: var(--brand-700, #4338ca);
   font-size: 12px;
 }
-.term-group + .term-group {
-  margin-top: 12px;
+/* ---------------- 记录表 ---------------- */
+/* 撑满卡片剩余高度：表格框一直画到卡片底，视觉上「这块是记录列表」，
+   而不是内容结束后剩一大片裸白 */
+.sec-rec {
+  flex: 1;
+  min-height: 190px;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
 }
-.term-head {
+.sec-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.rec-box {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border, #e8ecf2);
+  border-radius: var(--r-md, 10px);
+  overflow: hidden;
+  background: #fff;
+  /* 列模板：教师(有周数)=课程/周数/学生；教师(无周数)=课程/学生；学生=课程/选课时间/状态 */
+  --rec-cols: 1fr 96px;
+}
+.rec-box.rec-3col {
+  --rec-cols: 1fr 92px 96px;
+}
+.rec-box.rec-stu {
+  --rec-cols: 1fr 130px 90px;
+}
+.rec-head {
+  display: grid;
+  grid-template-columns: var(--rec-cols);
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--bg-soft, #f7f9fc);
+  border-bottom: 1px solid var(--border, #e8ecf2);
+  font-size: 12px;
+  color: var(--ink-400, #9aa3b2);
+}
+.rec-head .num {
+  text-align: right;
+}
+.rec-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.rec-group-head {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-bottom: 6px;
+  padding: 7px 12px;
+  background: #fbfcfe;
+  border-bottom: 1px dashed var(--border, #eef0f4);
   color: var(--ink-500, #6b7280);
+}
+.rec-row {
+  display: grid;
+  grid-template-columns: var(--rec-cols);
+  gap: 12px;
+  align-items: center;
+  padding: 9px 12px;
+  border-bottom: 1px solid #f1f4f9;
+  font-size: 13px;
+}
+.rec-row:hover {
+  background: var(--ink-50, #f8fafc);
+}
+.rec-course {
+  color: var(--ink-800, #1f2937);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rec-row .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+/* 记录不足一屏时收尾：把「已显示全部」居中放在剩余空白里，让空白成为空态的一部分 */
+.rec-end {
+  margin: auto 0;
+  padding: 14px 12px 18px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--ink-400, #9aa3b2);
+}
+.rec-empty {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 24px;
+  font-size: 12.5px;
+  color: var(--ink-400, #9aa3b2);
 }
 .term-name {
   font-weight: 700;
   font-size: 12.5px;
   color: var(--ink-700, #374151);
-}
-.course-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding-left: 19px;
-}
-.course-item {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  font-size: 13px;
-}
-.course-name {
-  color: var(--ink-800, #1f2937);
-}
-.course-meta {
-  font-size: 12px;
-  color: var(--ink-400, #9aa3b2);
 }
 .st-tag {
   font-style: normal;
