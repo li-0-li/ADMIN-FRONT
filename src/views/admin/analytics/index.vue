@@ -385,12 +385,18 @@ interface PrepAgg {
   expDone: number;
   expTotal: number;
 }
+/** 聚合维度键：院系/课程名缺失时归入「未归类」。
+ *  2026-11-18：库里存在未挂院系的课程（dept=null，如「临时验证课」），null 参与
+ *  localeCompare / Set 比较会抛错或永远不相等，故统一在此归一化。 */
+const normKey = (v?: string | null): string => (v ?? '').trim() || '未归类';
+const prepKeyOf = (d: AnalyticsPrepDetail): string =>
+  prepDim.value === 'dept' ? normKey(d.dept) : normKey(d.course);
 const prepAggs = computed<PrepAgg[]>(() => {
   const map = new Map<string, PrepAgg>();
   for (const d of data.value?.prepDetails ?? []) {
-    const k = prepDim.value === 'dept' ? d.dept : d.course;
+    const k = prepKeyOf(d);
     if (!map.has(k)) {
-      map.set(k, { key: k, dept: prepDim.value === 'dept' ? k : d.dept, courses: {}, teachers: {}, prepDone: 0, prepTotal: 0, expDone: 0, expTotal: 0 });
+      map.set(k, { key: k, dept: prepDim.value === 'dept' ? k : (d.dept ?? '未归类'), courses: {}, teachers: {}, prepDone: 0, prepTotal: 0, expDone: 0, expTotal: 0 });
     }
     const g = map.get(k)!;
     if (d.course) g.courses[d.course] = true;
@@ -401,6 +407,8 @@ const prepAggs = computed<PrepAgg[]>(() => {
     g.expTotal += d.expTotal ?? 0;
   }
   // 滞后在前：教务开这块是为了找异常行，不是先看正常的
+  // ★ 2026-11-18：排序键必须兜底成字符串——库里存在未挂院系的课程（dept=null，
+  //   如「临时验证课」），直接 localeCompare 会抛 TypeError 并让整页渲染中断（只剩 loading）。
   return [...map.values()].sort(
     (a, b) => pct(a.prepDone, a.prepTotal) - pct(b.prepDone, b.prepTotal) || a.key.localeCompare(b.key, 'zh-CN')
   );
@@ -417,18 +425,18 @@ function lagCoursesOf(g: PrepAgg): number {
   if (prepDim.value !== 'dept') return 0;
   const byCourse = new Map<string, { done: number; total: number }>();
   for (const d of data.value?.prepDetails ?? []) {
-    if (d.dept !== g.key) continue;
-    const c = byCourse.get(d.course) || { done: 0, total: 0 };
+    if (normKey(d.dept) !== g.key) continue;
+    const c = byCourse.get(normKey(d.course)) || { done: 0, total: 0 };
     c.done += d.prepDone ?? 0;
     c.total += d.prepTotal ?? 0;
-    byCourse.set(d.course, c);
+    byCourse.set(normKey(d.course), c);
   }
   let lag = 0;
   for (const c of byCourse.values()) if (pct(c.done, c.total) < 50) lag++;
   return lag;
 }
 function drillRows(g: PrepAgg): AnalyticsPrepDetail[] {
-  return (data.value?.prepDetails ?? []).filter(d => (prepDim.value === 'dept' ? d.dept : d.course) === g.key);
+  return (data.value?.prepDetails ?? []).filter(d => prepKeyOf(d) === g.key);
 }
 function switchPrep(dim: 'dept' | 'course') {
   prepDim.value = dim;
