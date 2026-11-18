@@ -83,12 +83,17 @@ const sysCells = computed(() => [
 /* ---------------- 统计卡 ---------------- */
 
 /**
- * 快捷入口：取菜单里的 7 项。
+ * 快捷入口：取菜单里的 8 项。
  * ★ 2026-11-09 会议 #22 摘掉 AI 工作台后由 9 → 8 项
  * ★ 2026-11-10 P-3 摘掉「课程审核」页（并入课程总览抽屉）后 8 → 7 项
+ * ★ 2026-11-18 业主选了方案 B：页头右上角那个「智能排课」跳转按钮摘掉，
+ *   改为并进本卡 → 7 → 8 项（2 列正好 4 行满格，不留空格）。
+ *   顺序不按本数组，而是 `ADMIN_MENUS.filter(...)` 跟着菜单顺序走，
+ *   所以「智能排课」落在「账号管理」之后（菜单里它在教学资源组末位）。
  */
 const SHORTCUT_PATHS = [
   '/admin/accounts',
+  '/admin/schedule',
   '/admin/analytics',
   '/admin/patrol',
   '/admin/basicdata',
@@ -178,11 +183,10 @@ onMounted(async () => {
 <template>
   <div class="page-head">
     <h1>后台管理</h1>
-    <div class="actions">
-      <a class="btn btn-outline" href="javascript:void(0)" @click="router.push('/admin/schedule')">
-        <ZkIcon name="calendar-days" :size="16" />智能排课
-      </a>
-    </div>
+    <!-- ★ 2026-11-18：摘掉右上角「智能排课」跳转按钮（业主疑问「为什么在右上角」）。
+         页头 .actions 的位置语义是全站统一的**本页操作**（新增/导出/保存），
+         而这个按钮是「去另一个页面」，和左侧栏「教学资源 → 智能排课」重复，
+         又与右侧「快捷入口」卡里的 7 个导航入口割裂。⇒ 导航入口统一收进快捷入口。 -->
   </div>
 
   <!-- 系统状态迷你条：权限不足 / 取数失败都不渲染，不留半截空壳 -->
