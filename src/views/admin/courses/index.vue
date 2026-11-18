@@ -169,6 +169,13 @@ function offeringComplete(o: AdminOfferingVo, courseType?: string | null): boole
   return clazzes.length > 0 || !isNoClazzName(o.classKey);
 }
 
+/** 课程行是否「已配置」——与「配置」列同一判据（后端 AdminCourseMapper 已算好 offeringIncomplete）：
+ *  有开课记录（offeringCount>0）且没有一条配置不完整。旧运行包不下发 offeringIncomplete，
+ *  退化成只看 offeringCount，跟列上的旧口径一致。 */
+function isConfigured(row: AdminCourseVo): boolean {
+  return Number(row.offeringCount ?? 0) > 0 && !row.offeringIncomplete;
+}
+
 /** 抽屉「配置」徽章：有配置且全部完整才算已配置（缺一项都还显示未配置，点进去补） */
 const drawerConfigured = computed(() => {
   const offs = detailData.value?.offerings ?? [];
@@ -268,7 +275,10 @@ async function toggleStatus(row: AdminCourseVo) {
  */
 const canExport = computed(() => userStore.hasPermi('admin:courses:export'));
 /** scheduleState：排课状态筛选（'' 全部 / 'scheduled' 已排课 / 'unscheduled' 未排课）
- *  见下方 fetchList 的说明：这个条件没法交给后端分页，只能本地筛。 */
+ *  见下方 fetchList 的说明：这个条件没法交给后端分页，只能本地筛。
+ *  cfgState：配置情况筛选（'' 全部 / 'configured' 已配置 / 'unconfigured' 未配置）
+ *  ★ 2026-11-18 业主：认证取消后「认证中」这个状态筛选没意义了，换成「是否配置」。
+ *    判据与「配置」列同源（offeringCount>0 且 offeringIncomplete=0），同样只能本地筛。 */
 const query = reactive<{
   page: number;
   pageSize: number;
@@ -278,14 +288,15 @@ const query = reactive<{
   /** 状态筛选（T-01：active/disabled；'' = 全部，不再固定 active） */
   status: string;
   scheduleState: string;
+  cfgState: string;
   orderBy: AdminCourseOrderBy | '';
   orderDir: 'asc' | 'desc' | '';
-}>({ page: 1, pageSize: 10, keyword: '', termId: '', status: '', scheduleState: '', orderBy: '', orderDir: '' });
+}>({ page: 1, pageSize: 10, keyword: '', termId: '', status: '', scheduleState: '', cfgState: '', orderBy: '', orderDir: '' });
 /** 排课筛选下的补充说明（例如全量没拉完），空串=无话可说 */
 const filterNote = ref('');
 /** 是否存在任一筛选条件：决定空态给「清空筛选」还是「去课程审核」 */
 const hasFilter = computed(
-  () => !!query.keyword.trim() || !!query.termId || !!query.status || !!query.scheduleState
+  () => !!query.keyword.trim() || !!query.termId || !!query.status || !!query.scheduleState || !!query.cfgState
 );
 
 const terms = ref<{ termId: string; name: string; code: string }[]>([]);
@@ -447,12 +458,12 @@ async function fetchList() {
       orderBy: query.orderBy || undefined,
       orderDir: query.orderDir || undefined
     };
-    if (query.scheduleState) {
+    if (query.scheduleState || query.cfgState) {
       // 排课筛选的前提是"知道每门课的节次数"：新包行里直接带 scheduleCount，旧包才需要先聚合
-      if (!serverHasScheduleCount.value && !scheduleStatsReady.value) {
+      if (query.scheduleState && !serverHasScheduleCount.value && !scheduleStatsReady.value) {
         await loadScheduleCounts();
       }
-      if (!serverHasScheduleCount.value && !scheduleStatsReady.value) {
+      if (query.scheduleState && !serverHasScheduleCount.value && !scheduleStatsReady.value) {
         rows.value = [];
         total.value = 0;
         filterNote.value = '';
@@ -466,15 +477,26 @@ async function fetchList() {
       // 逐行判断：有新字段用字段（0 是合法的"未排课"），没有才查聚合 Map
       const countOf = (c: AdminCourseVo) =>
         typeof c.scheduleCount === 'number' ? c.scheduleCount : scheduleCount.value.get(String(c.courseId)) ?? 0;
-      const filtered = all.filter((c) => (onlyScheduled ? countOf(c) > 0 : countOf(c) === 0));
+      // 两个本地筛选可以叠加：先按排课情况，再按配置情况，顺序不影响结果（都是行级布尔判断）
+      const notes: string[] = [];
+      let filtered = all;
+      if (query.scheduleState) {
+        filtered = filtered.filter((c) => (onlyScheduled ? countOf(c) > 0 : countOf(c) === 0));
+        notes.push(`排课情况=${onlyScheduled ? '已排课' : '未排课'}`);
+      }
+      if (query.cfgState) {
+        const wantConfigured = query.cfgState === 'configured';
+        filtered = filtered.filter((c) => isConfigured(c) === wantConfigured);
+        notes.push(`配置情况=${wantConfigured ? '已配置' : '未配置'}`);
+      }
       total.value = filtered.length;
       const start = (query.page - 1) * query.pageSize;
       rows.value = filtered.slice(start, start + query.pageSize);
       const serverTotal = res?.total ?? 0;
       filterNote.value =
         serverTotal > all.length
-          ? `排课筛选仅在已拉取的 ${all.length} 门课内进行（共 ${serverTotal} 门，超出单次拉取上限 ${SCHEDULE_FILTER_FETCH_LIMIT}）`
-          : `按排课情况筛选：${onlyScheduled ? '已排课' : '未排课'} ${filtered.length} 门`;
+          ? `筛选仅在已拉取的 ${all.length} 门课内进行（共 ${serverTotal} 门，超出单次拉取上限 ${SCHEDULE_FILTER_FETCH_LIMIT}）`
+          : `按 ${notes.join('、')} 筛选：${filtered.length} 门`;
       loadError.value = '';
       return;
     }
@@ -529,6 +551,7 @@ function resetQuery() {
   query.termId = '';
   query.status = '';
   query.scheduleState = '';
+  query.cfgState = '';
   query.orderBy = '';
   query.orderDir = '';
   query.page = 1;
@@ -604,13 +627,14 @@ loadColumnPrefs();
  * 筛完只剩几条时，用户最容易怀疑"数据是不是丢了"。把已生效条件摆成可逐个删除的 chip，
  * 一眼就知道"为什么少"。这是通用数据表规范里最常被提的一条。
  */
-type FilterKey = 'keyword' | 'termId' | 'status' | 'scheduleState';
+type FilterKey = 'keyword' | 'termId' | 'status' | 'scheduleState' | 'cfgState';
 interface FilterChip {
   key: FilterKey;
   label: string;
   text: string;
 }
 const SCHEDULE_STATE_TEXT: Record<string, string> = { scheduled: '已排课', unscheduled: '未排课' };
+const CFG_STATE_TEXT: Record<string, string> = { configured: '已配置', unconfigured: '未配置' };
 const activeFilterChips = computed<FilterChip[]>(() => {
   const chips: FilterChip[] = [];
   if (query.keyword.trim()) chips.push({ key: 'keyword', label: '关键词', text: query.keyword.trim() });
@@ -621,6 +645,9 @@ const activeFilterChips = computed<FilterChip[]>(() => {
   if (query.status) chips.push({ key: 'status', label: '状态', text: statusLabel(query.status) });
   if (query.scheduleState) {
     chips.push({ key: 'scheduleState', label: '排课情况', text: SCHEDULE_STATE_TEXT[query.scheduleState] ?? query.scheduleState });
+  }
+  if (query.cfgState) {
+    chips.push({ key: 'cfgState', label: '配置情况', text: CFG_STATE_TEXT[query.cfgState] ?? query.cfgState });
   }
   return chips;
 });
@@ -651,6 +678,7 @@ interface FilterView {
   termId: string;
   status: string;
   scheduleState: string;
+  cfgState?: string;
   orderBy: string;
   orderDir: string;
 }
@@ -703,6 +731,7 @@ async function saveCurrentView() {
     termId: query.termId,
     status: query.status,
     scheduleState: query.scheduleState,
+    cfgState: query.cfgState,
     orderBy: query.orderBy,
     orderDir: query.orderDir
   };
@@ -717,6 +746,8 @@ function applyView(v: FilterView) {
   query.termId = v.termId ?? '';
   query.status = v.status ?? '';
   query.scheduleState = v.scheduleState ?? '';
+  // 旧版本存的视图没有 cfgState 字段，缺省按"全部"处理，不能让它变成 undefined 传给后端
+  query.cfgState = v.cfgState ?? '';
   // 白名单校验：视图是本地存的，可能来自旧版本或被手改，非法排序字段不能直接发给后端
   query.orderBy = ORDER_BY_WHITELIST.includes(v.orderBy as AdminCourseOrderBy) ? (v.orderBy as AdminCourseOrderBy) : '';
   query.orderDir = v.orderDir === 'asc' || v.orderDir === 'desc' ? v.orderDir : '';
@@ -832,9 +863,11 @@ async function onExport() {
     });
     const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     saveBlob(blob, `课程清单-${stamp}.xlsx`);
+    // 排课情况/配置情况都是前端本地筛，后端导出不认 ⇒ 说清楚导的是哪一层
+    const localOnly = [query.scheduleState ? '排课情况' : '', query.cfgState ? '配置情况' : ''].filter(Boolean);
     ElMessage.success(
-      query.scheduleState
-        ? '已导出：含当前关键词/学期/状态条件下的全部课程（排课情况筛选不参与导出）'
+      localOnly.length
+        ? `已导出：含当前关键词/学期/状态条件下的全部课程（${localOnly.join('、')}筛选不参与导出）`
         : '已导出当前筛选结果'
     );
   } catch {
@@ -1090,12 +1123,19 @@ onMounted(async () => {
           :value="t.termId"
         />
       </el-select>
-      <!-- 状态筛选（T-01）：不再固定 active，默认全部。取值与 STATUS_LABEL 对齐（含实测存在的 certifying/archived） -->
+      <!-- 状态筛选（T-01）：不再固定 active，默认全部。
+           ★ 2026-11-18：认证审核已取消，「认证中」这个选项没有意义（业主口径），去掉；
+             库里的历史 certifying 行仍会在状态列如实显示「认证中」，但不再作为筛选项。 -->
       <el-select v-model="query.status" placeholder="全部状态" clearable style="width: 120px" @change="onSearch">
         <el-option label="启用" value="active" />
-        <el-option label="认证中" value="certifying" />
         <el-option label="已停用" value="disabled" />
         <el-option label="已归档" value="archived" />
+      </el-select>
+      <!-- 配置情况筛选（2026-11-18 业主：取代原来的「是否认证」）：判据与「配置」列同源，
+           有开课记录且不缺教师/节奏/必修班级才算已配置；同样只能本地筛 -->
+      <el-select v-model="query.cfgState" placeholder="全部配置情况" clearable style="width: 132px" @change="onSearch">
+        <el-option label="已配置" value="configured" />
+        <el-option label="未配置" value="unconfigured" />
       </el-select>
       <!-- 排课情况筛选（10-29 新增）：与「排课情况」列同源，都基于课次聚合 -->
       <el-select
