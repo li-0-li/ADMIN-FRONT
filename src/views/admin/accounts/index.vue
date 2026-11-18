@@ -1197,8 +1197,10 @@ async function openFootprint(row: AdminUserVo) {
         <!-- 失败时不能照常印「共 0 条记录」：那个数字会被读成"库里真没有"，是本次最误导的一处 -->
         <template v-if="loadError">记录数未取到（加载失败）</template>
         <template v-else>
+          <!-- 2026-11-18 业主：删掉「（点表头排序走服务端，整表重排、跨页连续）」。
+               那是实现细节不是用户信息——排序怎么算的、翻页连不连续，用户点一下就知道，
+               写在记录数旁边只是噪点。行为本身不变（仍是服务端排序、跨页连续）。 -->
           共 {{ total }} 条记录
-          <span class="muted small">（点表头排序走服务端，整表重排、跨页连续）</span>
         </template>
       </span>
       <div class="mini-pager">
