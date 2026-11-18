@@ -196,22 +196,33 @@ onMounted(() => { void fetchList(false); });
 </template>
 
 <style scoped>
+/* 左右两卡等高：stretch 让矮的那张（详情）拉到与列表同高，底边对齐。
+   原来是 flex-start ⇒ 两卡各按自己内容定高，详情内容短时右下方吊出一个大缺口，
+   页面看着「没对齐、留白很多」。 */
 .g6-wrap {
   display: flex;
   gap: 16px;
-  align-items: flex-start;
+  align-items: stretch;
 }
+/* 两卡共用同一个高度上限（100vh - 顶栏 56 - main 上内边距 24 - 页头约 50 - main 下内边距 24 = 154），
+   上限不一致时内容超长又会重新错开。 */
 .g6-list {
   width: 320px;
   flex: none;
   display: flex;
   flex-direction: column;
   padding: 12px;
-  max-height: calc(100vh - 190px);
+  max-height: calc(100vh - 154px);
+  min-height: 0;
 }
 .g6-detail {
   flex: 1;
   min-width: 0;
+  max-height: calc(100vh - 154px);
+  /* 详情比列表长时在卡内滚动，不把整页撑长、也不让两卡再次错高 */
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
 }
 .list-toolbar {
   display: flex;

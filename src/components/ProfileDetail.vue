@@ -317,6 +317,11 @@ async function submitEdit() {
 <style scoped>
 .profile-panel {
   min-height: 240px;
+  /* 外层详情卡已与左列表等高 ⇒ 这里撑满剩余高度：内容不足时的留白落在卡内（有边框收口），
+     flex-shrink:0 保证内容超长时不被压扁，而是交给卡自身的滚动条。 */
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
 }
 .banner-warn {
   display: flex;
@@ -466,6 +471,8 @@ async function submitEdit() {
   align-items: center;
   gap: 6px;
   padding: 40px 16px;
+  /* 没选中人时垂直居中，而不是贴在卡片顶部留一大片空 */
+  margin: auto 0;
   color: var(--ink-400, #9aa3b2);
 }
 .empty-title {
