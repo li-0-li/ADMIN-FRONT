@@ -32,7 +32,7 @@ const listLoading = ref(false);
 const rows = ref<AdminUserVo[]>([]);
 const total = ref(0);
 const listError = ref('');
-const query = reactive({ page: 1, pageSize: 10, keyword: '' });
+const query = reactive({ page: 1, pageSize: 8, keyword: '' });
 
 async function fetchList(keepSelection = true) {
   listLoading.value = true;
@@ -157,10 +157,9 @@ onMounted(() => { void fetchList(false); });
           :class="{ active: String(r.userId) === selectedUserId }"
           @click="selectRow(r)"
         >
-          <div class="row-main">
-            <span class="row-name">{{ r.nickName || r.username }}</span>
-            <span class="row-acc mono">{{ r.username }}</span>
-          </div>
+          <span class="row-name">{{ r.nickName || r.username }}</span>
+          <!-- 昵称为空时上面显示的就是账号，这里不再重复一遍 -->
+          <span v-if="r.nickName && r.nickName !== r.username" class="row-acc mono">{{ r.username }}</span>
           <span class="row-status" :class="{ off: String(r.status) === '1' }">{{ statusText(r.status) }}</span>
         </div>
       </div>
@@ -234,12 +233,15 @@ onMounted(() => { void fetchList(false); });
   min-height: 160px;
   overflow-y: auto;
 }
+/* 单行紧凑行：姓名 + 账号 + 状态 挤在一行，行高 38（原先是姓名/账号两行、约 53）。
+   左列表是「选人」的入口，不需要卡片式的宽松排版；行一矮，整块卡片跟着变矮，
+   右详情栏底部那片用不上的空白也就一起收掉了。 */
 .list-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
-  padding: 8px 10px;
+  height: 38px;
+  padding: 0 10px;
   border-radius: var(--r-md, 8px);
   cursor: pointer;
   transition: background 0.12s;
@@ -250,12 +252,9 @@ onMounted(() => { void fetchList(false); });
 .list-row.active {
   background: var(--brand-50, #eef2ff);
 }
-.row-main {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
 .row-name {
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 13px;
   font-weight: 600;
   color: var(--ink-800, #1f2937);
@@ -264,8 +263,13 @@ onMounted(() => { void fetchList(false); });
   white-space: nowrap;
 }
 .row-acc {
+  flex: none;
+  max-width: 104px;
   font-size: 11.5px;
   color: var(--ink-400, #9aa3b2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .row-status {
   flex: none;
