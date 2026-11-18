@@ -940,7 +940,25 @@ async function openFootprint(row: AdminUserVo) {
 <template>
   <div class="page-head">
     <h1>账号管理</h1>
+    <!-- ★ 2026-11-18 业主口径：「导入 / 导出」挪到标题右侧。
+         它们本来就是**本页操作**（读当前筛选导出 / 批量导入），放在页头 .actions 比
+         之前塞在列表底部更符合全站位置语义（页头右侧=本页操作，例：课程总览「新增课程」）；
+         顺带也让它们不必再挤工具栏那行（窄视口下工具栏曾因此溢出）。
+         排列顺序：本页操作 → 页面间跳转（角色管理/操作日志仍在最右），跳转链接位置不变。 -->
     <div class="actions">
+      <a class="btn btn-outline" href="javascript:void(0)" @click="openImport">
+        <ZkIcon name="upload" :size="16" />导入
+      </a>
+      <a
+        class="btn btn-outline"
+        href="javascript:void(0)"
+        :title="`导出按当前筛选（关键词 / 角色 / 状态 / 学校 / 院系 / 专业 / 班级）取，单次最多 ${EXPORT_MAX_ROWS} 条；命中更多时只导前 ${EXPORT_MAX_ROWS} 条，导出后会写明少导了多少。`"
+        :aria-busy="exporting"
+        style="min-width: 96px; justify-content: center"
+        @click="exporting ? undefined : onExport()"
+      >
+        <ZkIcon name="download" :size="16" />{{ exporting ? '导出中…' : '导出' }}
+      </a>
       <a class="btn btn-outline" href="javascript:void(0)" @click="$router.push('/admin/roles')">
         <ZkIcon name="shield-check" :size="16" />角色管理
       </a>
@@ -955,8 +973,9 @@ async function openFootprint(row: AdminUserVo) {
       <el-button type="primary" @click="openCreate">
         <ZkIcon name="plus" :size="15" style="margin-right: 4px" />新增账号
       </el-button>
-      <!-- 导入 / 导出已移到列表最下方：这一行原本是「3 个操作 + 分隔线 + 3 个批量 + 搜索单元 + 3 个下拉 + 重置」，
-           单行固有宽超过窄视口可用宽（实测见 style 里 .toolbar 那条），低频的导入导出先挪到底部（见 .table-foot-bar） -->
+      <!-- 导入 / 导出**已在页头**（2026-11-18 业主：挪到「账号管理」标题右边），此处不再放。
+           历史上它们被从这行挪到过列表底部（.table-foot-bar），起因是这行「3 个操作 + 分隔线
+           + 3 个批量 + 搜索单元 + 3 个下拉 + 重置」单行固有宽超窄视口；挪到页头后这个问题一并消失。 -->
       <el-divider direction="vertical" />
       <el-tooltip content="勾选后可用（翻页保留，改筛选即清空）" :disabled="!!selectedRows.length" placement="top">
         <el-button :disabled="!selectedRows.length" :loading="batchLoading" @click="runBatch('enable')">
@@ -988,21 +1007,14 @@ async function openFootprint(row: AdminUserVo) {
           @click="toggleFilterPanel"
         >筛选{{ filterCount ? `（${filterCount}）` : '' }}</el-button>
         <div class="filter-panel">
-          <!-- 院系候选 = 若依原生 /system/dept/list 里「学校根子树」的全量节点（编号 23，10-26 换掉原来的账号去重快照）。
-               范围与基础数据页同一口径；筛出 0 条是「该院系下确实没有账号」，不是候选缺项。 -->
-          <el-select v-model="query.deptId" filterable clearable style="width: 160px" placeholder="全部院系" @change="onDeptFilterChange">
-            <el-option v-for="o in deptOptions" :key="o.id" :label="o.name" :value="o.id" />
-            <!-- 只在取不到候选时出现：静默空下拉会被读成「库里没院系」，这是 1022-P2-1 同类的隐形缺陷，必须说清 -->
-            <template v-if="deptLoadFailed" #footer>
-              <div class="small muted dept-foot-tip">
-                院系候选取不到（可能未授权 system:dept:list，或该学校根下没有院系节点）；可改用关键词搜索定位账号。
-              </div>
-            </template>
-          </el-select>
-          <!-- 学校/专业/班级：be-admin 新增的三个筛选维度（SQL 在 AdminUserMapper.xml 68-76）。
-               旧包没有这三个入参字段 ⇒ 参数被静默忽略 ⇒ 先金丝雀探测（clazzId=-1）再渲染，
-               绝不给一个「选了却不筛」的下拉。专业按已选院系、班级按已选专业客户端级联。 -->
+          <!-- ★ 2026-11-18 业主口径：学校筛选排在院系之前（层级从大到小：学校 → 院系 → 专业 → 班级）。
+               学校和专业/班级同属 be-admin 新增维度（旧包没有这三个入参，会被静默忽略），
+               所以拆成「学校」与「专业/班级」两段受 advFilterSupported 保护的块，院系夹在中间
+               —— 院系走若依原生 /system/dept/list，两端包都有，不需要这道闸。 -->
           <template v-if="advFilterSupported">
+            <!-- 学校/专业/班级：be-admin 新增的三个筛选维度（SQL 在 AdminUserMapper.xml 68-76）。
+                 旧包没有这三个入参字段 ⇒ 参数被静默忽略 ⇒ 先金丝雀探测（clazzId=-1）再渲染，
+                 绝不给一个「选了却不筛」的下拉。专业按已选院系、班级按已选专业客户端级联。 -->
             <el-select
               v-model="query.schoolId"
               filterable
@@ -1014,6 +1026,19 @@ async function openFootprint(row: AdminUserVo) {
             >
               <el-option v-for="o in schoolOptions" :key="o.schoolId" :label="o.name" :value="String(o.schoolId)" />
             </el-select>
+          </template>
+          <!-- 院系候选 = 若依原生 /system/dept/list 里「学校根子树」的全量节点（编号 23，10-26 换掉原来的账号去重快照）。
+               范围与基础数据页同一口径；筛出 0 条是「该院系下确实没有账号」，不是候选缺项。 -->
+          <el-select v-model="query.deptId" filterable clearable style="width: 160px" placeholder="全部院系" @change="onDeptFilterChange">
+            <el-option v-for="o in deptOptions" :key="o.id" :label="o.name" :value="o.id" />
+            <!-- 只在取不到候选时出现：静默空下拉会被读成「库里没院系」，这是 1022-P2-1 同类的隐形缺陷，必须说清 -->
+            <template v-if="deptLoadFailed" #footer>
+              <div class="small muted dept-foot-tip">
+                院系候选取不到（可能未授权 system:dept:list，或该学校根下没有院系节点）；可改用关键词搜索定位账号。
+              </div>
+            </template>
+          </el-select>
+          <template v-if="advFilterSupported">
             <el-select
               v-model="query.majorId"
               filterable
@@ -1205,17 +1230,6 @@ async function openFootprint(row: AdminUserVo) {
           <ZkIcon name="chevron-right" :size="14" />
         </button>
       </div>
-    </div>
-
-    <!-- 导入 / 导出（从工具栏移下来，见上方注释）：紧贴「共 N 条记录」，导出范围就在按钮旁边说清 -->
-    <div class="row table-foot-bar">
-      <el-button @click="openImport">
-        <ZkIcon name="upload" :size="15" style="margin-right: 4px" />导入
-      </el-button>
-      <el-button :loading="exporting" @click="onExport">
-        <ZkIcon name="download" :size="15" style="margin-right: 4px" />导出
-      </el-button>
-      <span class="small muted">导出按上方筛选（关键词 / 角色 / 状态 / 院系）取，单次最多 1000 条；命中更多时只导前 1000 条，导出后会写明少导了多少。</span>
     </div>
   </div>
 
@@ -1443,6 +1457,16 @@ async function openFootprint(row: AdminUserVo) {
 </template>
 
 <style scoped>
+/* 页头右侧按钮组允许换行：2026-11-18 导入/导出搬进来后变成 4 个（导入 · 导出 · 角色管理 · 操作日志），
+   合计固有宽约 460 + 标题 ~110 + 间距 ⇒ 视口 <700 时会顶出去。theme.css 的 .page-head 是 flex+nowrap，
+   这里只在本页作用域补 wrap（选择器带 data-v，不影响其它页面）。 */
+.page-head {
+  flex-wrap: wrap;
+}
+.page-head .actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
 /* 工具栏允许换行：共享样式 .toolbar 是 flex + nowrap（theme.css:216-217），窄视口下不会折行、只会溢出。
    真页面实测（同源 iframe 造视口，10-23）：左组固有宽 425 + 右组 878 + 间距 12 + 内边距 32 = 单行需 1347px，
    加侧栏 224 与主区内边距 56 ⇒ 视口要到 ~1627px 才容得下单行；1366 可用 1069、1440 可用 1143 ⇒ 都会折成两行（实测高 102px）。
@@ -1510,12 +1534,6 @@ async function openFootprint(row: AdminUserVo) {
   width: 100% !important;
 }
 
-/* 列表底部：导入 / 导出（从工具栏移下来） */
-.table-foot-bar {
-  gap: 10px;
-  padding: 12px 16px;
-  border-top: 1px solid var(--border);
-}
 /* 院系下拉「候选可能不全」提示：只在账号总数超过快照大小时出现 */
 .dept-foot-tip {
   line-height: 1.6;
