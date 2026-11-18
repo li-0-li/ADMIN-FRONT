@@ -8,7 +8,7 @@
  *  - 详情 = `GET /api/v1/admin/teachers|students/{userId}/profile`（聚合详情）
  * ★ 学生列表接口实测**不返回 roleKeys**（教师返回了）⇒ 列表渲染一律不依赖该字段。
  */
-import { computed, onMounted, reactive, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import ProfileDetail from '@/components/ProfileDetail.vue';
@@ -32,7 +32,23 @@ const listLoading = ref(false);
 const rows = ref<AdminUserVo[]>([]);
 const total = ref(0);
 const listError = ref('');
-const query = reactive({ page: 1, pageSize: 8, keyword: '' });
+
+/** 单个列表行的高度（与 `.list-row` 的 height 一致，改样式要同步这里） */
+const ROW_H = 38;
+/**
+ * 每页行数按可视高度**自适应**，让列表正好填满左侧卡片。
+ * 固定 8 行时卡片只有 400 出头，卡片下方会空掉大半屏；固定 20 行则在 768 高的笔记本上
+ * 把卡片顶出视口。所以按「可用高度 / 行高」算，两端各夹一个合理区间。
+ *   可用高度 = 视口 - 56 顶栏 - 24 上内边距 - 50 页头 - 24 下内边距
+ *   扣掉工具条 42 + 卡片内边距 24 + 分页器 34
+ */
+function calcPageSize() {
+  const avail = window.innerHeight - 154;
+  const chrome = 42 + 24 + 34;
+  return Math.min(24, Math.max(6, Math.floor((avail - chrome) / ROW_H)));
+}
+
+const query = reactive({ page: 1, pageSize: calcPageSize(), keyword: '' });
 
 async function fetchList(keepSelection = true) {
   listLoading.value = true;
@@ -111,7 +127,28 @@ function onSaved() {
   void loadProfile();
 }
 
-onMounted(() => { void fetchList(false); });
+/* 窗口尺寸变化（拉窗口 / 分屏）后重算每页行数，否则列表要么留白要么顶出视口。
+   防抖 200ms：拖拽过程中不反复请求；只在行数真的变了才回到第 1 页重取。 */
+let rzTimer: number | undefined;
+function onResize() {
+  window.clearTimeout(rzTimer);
+  rzTimer = window.setTimeout(() => {
+    const next = calcPageSize();
+    if (next === query.pageSize) return;
+    query.pageSize = next;
+    query.page = 1;
+    void fetchList(false);
+  }, 200);
+}
+
+onMounted(() => {
+  void fetchList(false);
+  window.addEventListener('resize', onResize);
+});
+onBeforeUnmount(() => {
+  window.clearTimeout(rzTimer);
+  window.removeEventListener('resize', onResize);
+});
 </script>
 
 <template>
@@ -202,6 +239,10 @@ onMounted(() => { void fetchList(false); });
   display: flex;
   gap: 16px;
   align-items: stretch;
+  /* 撑满视口剩余高度（100vh - 顶栏 56 - main 上内边距 24 - 页头约 50 - main 下内边距 24 = 154）：
+     卡片只按内容定高时，两卡 400 出头、下面空掉大半屏，看着像页面没做完。
+     内容超过这个高度时由 .g6-list / .g6-detail 的 max-height 兜住，各自卡内滚动。 */
+  min-height: calc(100vh - 154px);
 }
 /* 两卡共用同一个高度上限（100vh - 顶栏 56 - main 上内边距 24 - 页头约 50 - main 下内边距 24 = 154），
    上限不一致时内容超长又会重新错开。 */
