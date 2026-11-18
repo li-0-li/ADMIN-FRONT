@@ -18,11 +18,11 @@ import {
   updateUserStatus
 } from '@/api/admin/users';
 import type { DeptNodeVo } from '@/api/admin/users';
-import { listClasses, listMajors, listSchools } from '@/api/admin/basicdata';
+import { listClasses, listMajors } from '@/api/admin/basicdata';
 import { getTeacherCapabilities, saveTeacherCapabilities } from '@/api/admin/capabilities';
 import { listCourses } from '@/api/admin/courses';
 import type { AdminCourseVo } from '@/api/admin/courses';
-import type { AdminUserVo, Clazz, FootprintVo, ImportResultVo, Major, School, UserSaveBo } from '@/types/admin';
+import type { AdminUserVo, Clazz, FootprintVo, ImportResultVo, Major, UserSaveBo } from '@/types/admin';
 import { useUserStore } from '@/store/user';
 
 /* ---------------- 词典 ---------------- */
@@ -71,7 +71,7 @@ const total = ref(0);
  * 存文案而不是布尔：无数据(空态) / 取数失败(错误态) / 加载中 是三件事，要各自画出来。
  */
 const loadError = ref('');
-const query = reactive({ page: 1, pageSize: 20, keyword: '', roleKey: '', status: '', deptId: undefined as string | undefined, schoolId: undefined as string | undefined, majorId: undefined as string | undefined, clazzId: undefined as string | undefined, sortField: 'createTime', sortOrder: 'desc' as 'asc' | 'desc' });
+const query = reactive({ page: 1, pageSize: 20, keyword: '', roleKey: '', status: '', deptId: undefined as string | undefined, majorId: undefined as string | undefined, clazzId: undefined as string | undefined, sortField: 'createTime', sortOrder: 'desc' as 'asc' | 'desc' });
 
 /* ---------------- 院系候选（A6 / 编号 23）----------------
  * 10-26 起换成全量：后端选路线②（给 role 100 授 `system:dept:list`），前端接若依原生 GET /system/dept/list。
@@ -111,19 +111,21 @@ async function loadDeptOptions() {
   }
 }
 
-/* ---------------- 学校 / 专业 / 班级筛选（be-admin 新增的三个维度）----------------
- * 后端列表 SQL（AdminUserMapper.xml 68-76）已支持 e.school_id / e.major_id / e.clazz_id，
- * 但 10-26 运行包的 UserQueryBo 连这三个字段都没有 ⇒ 参数被静默忽略：用户选了
+/* ---------------- 专业 / 班级筛选（be-admin 新增的两个维度）----------------
+ * 后端列表 SQL（AdminUserMapper.xml 68-76）已支持 e.major_id / e.clazz_id（school_id 仍在 SQL 里，
+ * 但 2026-11-18 业主已把「学校」这个下拉去掉，前端不再传），
+ * 但 10-26 运行包的 UserQueryBo 连这些字段都没有 ⇒ 参数被静默忽略：用户选了
  * 「软件 2401」列表却纹丝不动，还以为看到的就是那个班的人——静默失效比 403 更危险。
  * 进页做一次金丝雀探测：clazzId='-1'（不可能存在的班级主键）查 1 条——
- * 新包 ⇒ total=0（筛选真实生效）；旧包 ⇒ total=账号总数（>0）⇒ 三个下拉不渲染。
+ * 新包 ⇒ total=0（筛选真实生效）；旧包 ⇒ total=账号总数（>0）⇒ 两个下拉不渲染。
  */
 const advFilterSupported = ref<boolean | null>(null);
-const schoolOptions = ref<School[]>([]);
 const majorOptions = ref<Major[]>([]);
 const clazzOptions = ref<Clazz[]>([]);
 const advLoadFailed = ref(false);
-const advLoaded = { school: false, major: false, clazz: false };
+/** ★ 2026-11-18 业主：「学校筛选不要了」 ⇒ 下拉与候选（listSchools）一并下线，
+ *  只留专业/班级两个维度（院系走 sys_dept 树，见上）。 */
+const advLoaded = { major: false, clazz: false };
 
 async function probeAdvFilters() {
   try {
@@ -135,15 +137,12 @@ async function probeAdvFilters() {
   }
 }
 
-/** 候选懒加载（首次展开下拉才拉）。一个域拉失败就全体置失败：三域同权限族（admin:schools:majors:classes:list），
- *  一个不通多半都不通，逐个报错只会刷三条一样的提示 */
-async function loadAdvOptions(kind: 'school' | 'major' | 'clazz') {
+/** 候选懒加载（首次展开下拉才拉）。一个域拉失败就全体置失败：两域同权限族（admin:schools:majors:classes:list），
+ *  一个不通多半都不通，逐个报错只会刷两条一样的提示 */
+async function loadAdvOptions(kind: 'major' | 'clazz') {
   if (advLoaded[kind] || advLoadFailed.value) return;
   try {
-    if (kind === 'school') {
-      const res = await listSchools({ page: 1, pageSize: 500 });
-      schoolOptions.value = res.list ?? [];
-    } else if (kind === 'major') {
+    if (kind === 'major') {
       const res = await listMajors({ page: 1, pageSize: 500 });
       majorOptions.value = res.list ?? [];
     } else {
@@ -235,7 +234,6 @@ function resetQuery() {
   query.roleKey = '';
   query.status = '';
   query.deptId = undefined;
-  query.schoolId = undefined;
   query.majorId = undefined;
   query.clazzId = undefined;
   query.page = 1;
@@ -294,7 +292,7 @@ let filterMql: MediaQueryList | null = null;
 const filterCount = computed(
   () =>
     [query.roleKey, query.status].filter(Boolean).length +
-    [query.deptId, query.schoolId, query.majorId, query.clazzId].filter(v => v != null).length
+    [query.deptId, query.majorId, query.clazzId].filter(v => v != null).length
 );
 
 function toggleFilterPanel() {
@@ -598,7 +596,6 @@ async function onExport() {
       roleKey: query.roleKey || undefined,
       status: query.status || undefined,
       deptId: query.deptId,
-      schoolId: query.schoolId,
       majorId: query.majorId,
       clazzId: query.clazzId
     });
@@ -994,10 +991,10 @@ async function openFootprint(row: AdminUserVo) {
       </el-tooltip>
     </div>
     <div class="right">
-      <!-- placeholder 必须显式写：三个下拉的「全部」项值都是空串，EP 对空值显示 placeholder
+      <!-- placeholder 必须显式写：各下拉的「全部」项值都是空串，EP 对空值显示 placeholder
            而不是 option 的 label ⇒ 不写就会一起显示默认的「请选择」，看不出这是筛选器。
            （原此处有「角色筛选」小字标签，2026-10-22 用户要求删除；placeholder 已自带语义，不补别的标签。）
-           三个下拉一律 clearable：点 ✕ 即回到「全部」并触发查询，与搜索单元的 ✕ 同一口径。 -->
+           每个下拉一律 clearable：点 ✕ 即回到「全部」并触发查询，与搜索单元的 ✕ 同一口径。 -->
       <div ref="filterHostRef" class="filter-host" :class="{ compact: compactFilter, open: filterPanelOpen }">
         <el-button
           v-if="compactFilter"
@@ -1007,26 +1004,8 @@ async function openFootprint(row: AdminUserVo) {
           @click="toggleFilterPanel"
         >筛选{{ filterCount ? `（${filterCount}）` : '' }}</el-button>
         <div class="filter-panel">
-          <!-- ★ 2026-11-18 业主口径：学校筛选排在院系之前（层级从大到小：学校 → 院系 → 专业 → 班级）。
-               学校和专业/班级同属 be-admin 新增维度（旧包没有这三个入参，会被静默忽略），
-               所以拆成「学校」与「专业/班级」两段受 advFilterSupported 保护的块，院系夹在中间
-               —— 院系走若依原生 /system/dept/list，两端包都有，不需要这道闸。 -->
-          <template v-if="advFilterSupported">
-            <!-- 学校/专业/班级：be-admin 新增的三个筛选维度（SQL 在 AdminUserMapper.xml 68-76）。
-                 旧包没有这三个入参字段 ⇒ 参数被静默忽略 ⇒ 先金丝雀探测（clazzId=-1）再渲染，
-                 绝不给一个「选了却不筛」的下拉。专业按已选院系、班级按已选专业客户端级联。 -->
-            <el-select
-              v-model="query.schoolId"
-              filterable
-              clearable
-              style="width: 140px"
-              placeholder="全部学校"
-              @visible-change="(v: boolean) => v && loadAdvOptions('school')"
-              @change="onSearch"
-            >
-              <el-option v-for="o in schoolOptions" :key="o.schoolId" :label="o.name" :value="String(o.schoolId)" />
-            </el-select>
-          </template>
+          <!-- ★ 2026-11-18 业主：「学校筛选不要了」⇒ 下拉已删。层级筛选取「院系 → 专业 → 班级」，
+               学校这一层本来也不会联动（后端没有 school↔dept 关系，院系候选恒为学校根子树）。 -->
           <!-- 院系候选 = 若依原生 /system/dept/list 里「学校根子树」的全量节点（编号 23，10-26 换掉原来的账号去重快照）。
                范围与基础数据页同一口径；筛出 0 条是「该院系下确实没有账号」，不是候选缺项。 -->
           <el-select v-model="query.deptId" filterable clearable style="width: 160px" placeholder="全部院系" @change="onDeptFilterChange">
@@ -1039,6 +1018,9 @@ async function openFootprint(row: AdminUserVo) {
             </template>
           </el-select>
           <template v-if="advFilterSupported">
+            <!-- 专业/班级：be-admin 新增的筛选维度（SQL 在 AdminUserMapper.xml 68-76）。
+                 旧包没有这两个入参字段 ⇒ 参数被静默忽略 ⇒ 先金丝雀探测（clazzId=-1）再渲染，
+                 绝不给一个「选了却不筛」的下拉。专业按已选院系、班级按已选专业客户端级联。 -->
             <el-select
               v-model="query.majorId"
               filterable
