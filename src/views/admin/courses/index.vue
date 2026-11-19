@@ -12,6 +12,7 @@ import { listTerms } from '@/api/admin/basicdata';
 import { useUserStore } from '@/store/user';
 import type { AdminCourseDetailVo, AdminOfferingVo, CertDetail, CertMaterial } from '@/types/admin';
 import CreateCourseDialog from './CreateCourseDialog.vue';
+import EditCourseDialog from './EditCourseDialog.vue';
 
 /**
  * 课程总览（2026-10-29 新增；T-01 基础课程口径改造，2026-11-06）
@@ -42,6 +43,8 @@ const router = useRouter();
 const userStore = useUserStore();
 /** 新建课程（两步向导）：按钮显隐跟着权限走，与导出同思路 */
 const canAdd = computed(() => userStore.hasPermi('admin:courses:add'));
+/** T01-3 编辑基础信息（后端 PUT /courses/{id} 早就有，2026-11-18 补前端入口） */
+const canEdit = computed(() => userStore.hasPermi('admin:courses:edit'));
 /** G5 的另一半：下线用停用不用删（权限 admin:courses:disable） */
 const canDisable = computed(() => userStore.hasPermi('admin:courses:disable'));
 /** 详情抽屉「为这门课开课」：建课第二步权限 */
@@ -957,6 +960,26 @@ async function onOfferingSaved() {
   }
 }
 
+/* ---------------- 编辑基础信息（T01-3 · 2026-11-18）----------------
+ * 后端 PUT /api/v1/admin/courses/{courseId}（admin:courses:edit，菜单 3372）一直都在，
+ * 前端漏了入口 —— 用户只能改不能编辑。入口两处：操作列「编辑」+ 详情抽屉「编辑基础信息」。
+ * 保存成功后与 onOfferingSaved 同款：刷新列表 + 抽屉还开着就重拉详情。
+ */
+const editVisible = ref(false);
+const editTarget = ref<AdminCourseDetailVo | null>(null);
+
+function openEdit(row: AdminCourseVo) {
+  // 优先用抽屉里已拉的详情 VO（带 description/credit/hours 完整字段），没有就用列表行回填
+  editTarget.value = detailData.value && String(detailData.value.courseId) === String(row.courseId)
+    ? detailData.value
+    : { ...row, description: null } as AdminCourseDetailVo;
+  editVisible.value = true;
+}
+
+async function onEditSaved() {
+  await onOfferingSaved();
+}
+
 /* ---------------- 删除课程（C-23 · G5 定案语义，2026-11-06）----------------
  * 后端语义（AdminCourseServiceImpl.deleteCourse 重写后）：查开课记录数与课次数，
  * 任一 > 0 ⇒ 业务码 40904 拒绝（"该课程已有开课记录/课次，不可删除；如需下线请使用停用"）；
@@ -1285,10 +1308,13 @@ onMounted(async () => {
         </el-table-column>
         <!-- 操作列冻结：规范要求"数据列无法一屏展示时操作列默认冻结"，
              否则窗口一窄就只剩半截「查看」（10-29 实测过 1280 下被裁） -->
-        <el-table-column label="操作" width="210" align="right" fixed="right" class-name="courses-op">
+        <el-table-column label="操作" width="264" align="right" fixed="right" class-name="courses-op">
           <template #default="{ row }">
             <el-button text size="small" @click="openDetail(row)">
               <ZkIcon name="eye" :size="14" style="margin-right: 3px" />查看
+            </el-button>
+            <el-button v-if="canEdit" text size="small" @click="openEdit(row)">
+              <ZkIcon name="pencil" :size="14" style="margin-right: 3px" />编辑
             </el-button>
             <el-button
               v-if="canDisable"
@@ -1386,6 +1412,11 @@ onMounted(async () => {
        + 开课记录区块（offerings[]，第二步回显入口）+ 认证材料（材料缺失只降级说明，不当错误） -->
   <el-drawer v-model="detailVisible" :title="detailCourse?.courseName ?? '课程详情'" size="460px">
     <div v-if="detailCourse" class="stack" style="gap: 14px">
+      <div style="display: flex; justify-content: flex-end">
+        <el-button v-if="canEdit" size="small" plain @click="openEdit(detailCourse)">
+          <ZkIcon name="pencil" :size="13" style="margin-right: 4px" />编辑基础信息
+        </el-button>
+      </div>
       <div class="pf-grid">
         <div class="pf-row"><span class="k">课程编号</span><span>{{ detailCourse.courseNo || '—' }}</span></div>
         <div class="pf-row"><span class="k">面向专业</span><span>{{ detailCourse.major || '—' }}</span></div>
@@ -1611,6 +1642,7 @@ onMounted(async () => {
   <!-- 两步建课向导（T-01）：page-head「新建课程」从第 1 步进；
        抽屉「新增课程配置」带 startCourse 直接进第 2 步 -->
   <CreateCourseDialog v-model:visible="dialogVisible" :start-course="dialogCourse" @created="onOfferingSaved" />
+  <EditCourseDialog v-model:visible="editVisible" :course="editTarget" @saved="onEditSaved" />
 </template>
 
 <style scoped>
