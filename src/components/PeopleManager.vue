@@ -12,7 +12,8 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import ProfileDetail from '@/components/ProfileDetail.vue';
-import { listUsers } from '@/api/admin/users';
+import { listDeptTree, listUsers, type DeptNodeVo } from '@/api/admin/users';
+import { listClasses } from '@/api/admin/basicdata';
 import { getStudentProfile, getTeacherProfile, type StudentProfile, type TeacherProfile } from '@/api/admin/profiles';
 import type { AdminUserVo } from '@/types/admin';
 
@@ -21,11 +22,6 @@ const props = defineProps<{ mode: 'teacher' | 'student' }>();
 const isTeacher = computed(() => props.mode === 'teacher');
 const roleKey = computed(() => (isTeacher.value ? 'teacher' : 'student'));
 const pageTitle = computed(() => (isTeacher.value ? '教师管理' : '学生管理'));
-const pageHint = computed(() =>
-  isTeacher.value
-    ? '左侧选人，右侧看基本资料、可授课程与授课记录（按学期分组）。'
-    : '左侧选人，右侧看基本资料与选课记录（本期只读）。'
-);
 
 /* ---------------- 列表 ---------------- */
 const listLoading = ref(false);
@@ -34,17 +30,74 @@ const total = ref(0);
 const listError = ref('');
 
 /* 卡片高度已固定（见样式 .g6-wrap），每页行数必须跟着算，否则固定行数只占一半、左卡下面吊一大截空白。
-   可用高度 = 卡片高度 - 内边距 24 - 工具条 44（34 高输入框 + 10 下间距） - 分页器预留 40；行高 38。
+   可用高度 = 卡片高度 - 内边距 24 - 工具条 44（34 高输入框 + 10 下间距）
+              - 筛选行 44（34 高下拉 + 10 下间距） - 分页器预留 40；行高 38。
    上下界 6~24：太小翻页太碎，太大一屏塞不下。 */
 const WRAP_MAX_H = 620;
 const ROW_H = 38;
 function calcPageSize() {
   const avail = Math.min(Math.max(window.innerHeight - 154, 420), WRAP_MAX_H);
-  const body = avail - 24 - 44 - 40;
+  const body = avail - 24 - 44 - 44 - 40;
   return Math.max(6, Math.min(24, Math.floor(body / ROW_H)));
 }
 
-const query = reactive({ page: 1, pageSize: calcPageSize(), keyword: '' });
+const query = reactive({
+  page: 1,
+  pageSize: calcPageSize(),
+  keyword: '',
+  /** 筛选维度：教师 = 院系（deptId），学生 = 班级（clazzId）。两页取值不同，
+   *  但控件只有一个下拉、一种布局，观感一致、逻辑各管各的。 */
+  dim: '',
+  status: ''
+});
+
+/* ---------------- 筛选候选（教师=院系 / 学生=班级） ----------------
+ * 后端 UserQueryBo 认 deptId / clazzId / status（金丝雀实测：clazzId=-1 返回 0 条）。
+ * 但 10-26 那批老包的 UserQueryBo 连 clazzId 都没有 ⇒ 参数被静默忽略：人选了「计科2026-1班」，
+ * 列表纹丝不动，还以为看到的就是那个班的人。所以进页先用 clazzId=-1 探一次，
+ * 不认就整块不渲染，不留「选了却不筛」的下拉。 */
+const dimSupported = ref<boolean | null>(null);
+const dimOptions = ref<{ id: string; name: string }[]>([]);
+const dimLoadFailed = ref(false);
+
+async function probeDimSupport() {
+  try {
+    const res = await listUsers({ page: 1, pageSize: 1, roleKey: roleKey.value, clazzId: '-1' });
+    dimSupported.value = (res?.total ?? 0) === 0;
+  } catch {
+    dimSupported.value = false;
+  }
+}
+
+/** 院系候选 = 若依原生院系树里「本校根子树」的节点（与账号管理页同一口径） */
+const ROOT_DEPT_ID = '200';
+function deptOptionsOf(list: DeptNodeVo[]) {
+  const self = list.find((d) => String(d.deptId) === ROOT_DEPT_ID);
+  const chain = (self?.ancestors ?? '').split(',').map((s) => s.trim()).filter((s) => s && s !== '0');
+  const rootId = chain.length ? chain[0] : ROOT_DEPT_ID;
+  return list
+    .filter((d) => String(d.deptId) === rootId || (d.ancestors ?? '').split(',').map((s) => s.trim()).includes(rootId))
+    .map((d) => ({ id: String(d.deptId), name: d.deptName }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+}
+
+async function loadDimOptions() {
+  try {
+    if (isTeacher.value) {
+      const res = await listDeptTree();
+      dimOptions.value = res.ok ? deptOptionsOf(res.list) : [];
+    } else {
+      const res = await listClasses({ page: 1, pageSize: 500 });
+      dimOptions.value = (res.list ?? []).map((c) => ({
+        id: String(c.clazzId ?? ''),
+        name: c.clazzName || c.clazzCode || String(c.clazzId ?? '')
+      }));
+    }
+    dimLoadFailed.value = dimOptions.value.length === 0;
+  } catch {
+    dimLoadFailed.value = true;
+  }
+}
 
 async function fetchList(keepSelection = true) {
   listLoading.value = true;
@@ -54,7 +107,10 @@ async function fetchList(keepSelection = true) {
       page: query.page,
       pageSize: query.pageSize,
       keyword: query.keyword.trim() || undefined,
-      roleKey: roleKey.value
+      roleKey: roleKey.value,
+      status: query.status || undefined,
+      // 维度筛选两页各走各的字段：教师按院系、学生按班级
+      ...(isTeacher.value ? { deptId: query.dim || undefined } : { clazzId: query.dim || undefined })
     });
     rows.value = res?.list ?? [];
     total.value = res?.total ?? 0;
@@ -77,6 +133,9 @@ function onSearch() {
   query.page = 1;
   void fetchList(false);
 }
+
+/** 有没有任一筛选条件：决定空态说「没有符合条件」还是「还没有账号」 */
+const hasFilter = computed(() => !!query.keyword.trim() || !!query.dim || !!query.status);
 
 /* ---------------- 详情 ---------------- */
 const selectedUserId = ref('');
@@ -123,7 +182,12 @@ function onSaved() {
   void loadProfile();
 }
 
-onMounted(() => { void fetchList(false); });
+onMounted(() => {
+  void fetchList(false);
+  // 筛选候选与能力探测并行，别挡列表首屏
+  void probeDimSupport();
+  void loadDimOptions();
+});
 
 /* 视口变化 ⇒ 每页行数重算；只有行数真的变了才回第 1 页重取（否则白白丢当前页） */
 let resizeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -147,9 +211,6 @@ onBeforeUnmount(() => {
 <template>
   <div class="page-head">
     <h1>{{ pageTitle }}</h1>
-    <div class="actions">
-      <span class="small muted">{{ pageHint }}</span>
-    </div>
   </div>
 
   <div class="g6-wrap">
@@ -174,14 +235,45 @@ onBeforeUnmount(() => {
         </el-button>
       </div>
 
+      <!-- 筛选：两页的**维度不同**（教师按院系归属、学生按班级归属），但控件与布局完全一致。
+           状态两页都有。维度下拉带能力闸门：后端不认 clazzId 时（老包）整块不渲染，
+           不给「选了却不筛」的假下拉。 -->
+      <div class="list-filters" :class="{ 'one-col': dimSupported === false }">
+        <el-select
+          v-if="dimSupported !== false"
+          v-model="query.dim"
+          class="ft-dim"
+          :placeholder="isTeacher ? '全部院系' : '全部班级'"
+          :disabled="dimLoadFailed"
+          filterable
+          clearable
+          @change="onSearch"
+        >
+          <el-option v-for="o in dimOptions" :key="o.id" :label="o.name" :value="o.id" />
+          <template v-if="dimLoadFailed" #footer>
+            <div class="ft-tip">{{ isTeacher ? '院系' : '班级' }}候选取不到，可先用搜索定位</div>
+          </template>
+        </el-select>
+        <el-select
+          v-model="query.status"
+          class="ft-status"
+          placeholder="全部状态"
+          clearable
+          @change="onSearch"
+        >
+          <el-option label="正常" value="0" />
+          <el-option label="停用" value="1" />
+        </el-select>
+      </div>
+
       <div v-loading="listLoading" class="list-body">
         <div v-if="listError" class="list-tip">
           <span>{{ listError }}</span>
         </div>
         <div v-else-if="!rows.length && !listLoading" class="empty-block">
           <ZkIcon :name="isTeacher ? 'graduation-cap' : 'user'" :size="24" />
-          <div class="empty-title">{{ query.keyword ? '没有匹配的账号' : (isTeacher ? '还没有教师账号' : '还没有学生账号') }}</div>
-          <div v-if="query.keyword" class="small muted">换个关键词，或清空搜索框。</div>
+          <div class="empty-title">{{ hasFilter ? '没有符合筛选条件的账号' : (isTeacher ? '还没有教师账号' : '还没有学生账号') }}</div>
+          <div v-if="hasFilter" class="small muted">换个关键词，或清掉筛选条件再看。</div>
         </div>
         <div
           v-for="r in rows"
@@ -286,6 +378,28 @@ onBeforeUnmount(() => {
   height: 34px;
   padding: 0;
   flex: none;
+}
+/* 筛选行：与搜索框同规格（34 高、13px 字），一个维度下拉 + 一个状态下拉；
+   后端不认维度筛选时退化成一列（状态占满）。 */
+.list-filters {
+  display: grid;
+  /* 108px 是「全部状态」+ 箭头不被截断的最小宽度（92 会截成「全部…」），其余给维度下拉 */
+  grid-template-columns: 1fr 108px;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.list-filters.one-col {
+  grid-template-columns: 1fr;
+}
+.list-filters :deep(.el-select__wrapper) {
+  min-height: 34px;
+  font-size: 13px;
+}
+.ft-tip {
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-400, #9aa3b2);
 }
 .list-body {
   flex: 1;
