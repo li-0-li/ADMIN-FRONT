@@ -1064,6 +1064,19 @@ onMounted(async () => {
   <div class="page-head">
     <h1>课程总览</h1>
     <!-- P-3（2026-11-10）：「课程审核」页退役，待审课程的通过/驳回在详情抽屉「认证材料」区就地操作 -->
+    <!-- ★ 2026-11-19：原先「新建课程」只挂在表格空态里（列表 0 行才出现），有课时页头和工具栏
+         都没有入口，而空态文案却写"点右上角「新建课程」"——指向一个不存在的按钮。
+         现补到页头右侧，与账号管理「导入/导出」同一位置语义：页头右侧 = 本页操作。
+         权限仍是 admin:courses:add；空态里那个按钮保留（首次建课时更近手）。 -->
+    <div v-if="canAdd" class="actions">
+      <button
+        class="btn btn-primary"
+        title="新建基础课程：第 1 步填基础信息，第 2 步配置开课"
+        @click="openCreate"
+      >
+        <ZkIcon name="plus" :size="16" />新建课程
+      </button>
+    </div>
   </div>
 
   <div class="toolbar">
