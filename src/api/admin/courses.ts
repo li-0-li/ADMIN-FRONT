@@ -172,7 +172,16 @@ export function listCourseOfferings(courseId: string | number) {
  */
 export function updateOfferingScheduleConfig(
   offeringId: string | number,
-  body: { weekFrom: number; weekCount: number; lessonsPerWeek: number; totalLessons?: number | null }
+  body: {
+    weekFrom: number;
+    weekCount: number;
+    lessonsPerWeek: number;
+    totalLessons?: number | null;
+    /** 2026-11-19：改授课教师（不传 = 不改，传了会同步已排课次） */
+    teacherId?: string;
+    /** 2026-11-19：改面向班级（不传 = 不改，[] = 改成不绑班级，传了会同步已排课次） */
+    clazzIds?: string[];
+  }
 ) {
   return request<number>({
     url: `/api/v1/admin/courses/offerings/${offeringId}/schedule-config`,

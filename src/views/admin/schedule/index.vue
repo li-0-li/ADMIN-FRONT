@@ -2999,7 +2999,7 @@ const createCourseCfg = computed<CfgVerdict | null>(() => {
   return c ? cfgVerdictOf(c) : null;
 });
 
-/** 课程自带的认证教师——只作**默认值**，不再是唯一可选值（2026-11-11） */
+/** 课程自带的授课教师——只作**默认值**，不再是唯一可选值（2026-11-11） */
 const autoTeacherId = computed(() => {
   const hit = form.courseId ? courseById.value.get(String(form.courseId)) : undefined;
   return hit?.teacherId ? String(hit.teacherId) : '';
@@ -3039,19 +3039,29 @@ watch(
  * （教师/班级后端暂无编辑接口，字段只读展示，见派单 20261116-开课记录编辑接口）。 */
 const configOffering = ref<OfferingBrief | null>(null);
 const configExisting = ref(false);
+/**
+ * 已有配置的「教师/班级」初始快照（2026-11-19）。
+ *
+ * 有了它才能只提交**真正改过的**字段：后端把「不传 clazzIds」解读为不改、
+ * 「传 []」解读为改成不绑班级，若每次保存都无脑带上现值，一旦回填没命中
+ * （班级重名/未加载完）就会把班级误清空。
+ */
+const configSnapshot = ref<{ teacherId: string; clazzName: string }>({ teacherId: '', clazzName: '' });
 async function loadConfigOffering() {
   configOffering.value = null;
   configExisting.value = false;
+  configSnapshot.value = { teacherId: '', clazzName: '' };
   if (!form.courseId || createPresetCell.value) return;
   try {
     const list = await listCourseOfferings(form.courseId);
     if (list.length) {
       configOffering.value = list[0];
       configExisting.value = true;
-      // 已有配置 ⇒ 教师/班级回填现值（本次保存只更新排课节奏）
+      // 已有配置 ⇒ 教师/班级回填现值（2026-11-19 起这两项可改，保存时一并提交）
       if (list[0].teacherId) form.teacherId = String(list[0].teacherId);
       const tc = list[0].targetClasses?.[0];
       if (tc && !form.clazzName) form.clazzName = tc;
+      configSnapshot.value = { teacherId: String(form.teacherId || ''), clazzName: String(form.clazzName || '') };
       // 节奏回填：让用户看到现在存的是什么再改
       repeatForm.weekFrom = Number(list[0].weekFrom ?? 1);
       repeatForm.weekly = Math.max(1, Number(list[0].lessonsPerWeek ?? 1));
@@ -3077,7 +3087,7 @@ async function submitConfigOnly() {
     ElMessage.warning('请选择课程');
     return;
   }
-  if (!configExisting.value && !form.teacherId) {
+  if (!form.teacherId) {
     ElMessage.warning('请选择授课教师（教师必选，班级可不选）');
     return;
   }
@@ -3096,12 +3106,42 @@ async function submitConfigOnly() {
       });
       offeringId = res.offeringId;
     }
-    await updateOfferingScheduleConfig(offeringId!, {
+    // 2026-11-19：已有配置时教师/班级也能改，但**只提交真正改过的字段**——
+    // 不传=不改，clazzIds:[]=改成不绑班级，无脑带现值会把班级误清空。
+    const payload: {
+      weekFrom: number;
+      weekCount: number;
+      lessonsPerWeek: number;
+      totalLessons?: number | null;
+      teacherId?: string;
+      clazzIds?: string[];
+    } = {
       weekFrom: repeatForm.weekFrom,
       weekCount,
       lessonsPerWeek,
       totalLessons: repeatForm.total
-    });
+    };
+    if (configExisting.value) {
+      const teacherNow = String(form.teacherId || '');
+      if (teacherNow && teacherNow !== configSnapshot.value.teacherId) {
+        payload.teacherId = teacherNow;
+      }
+      const classNow = String(form.clazzName || '');
+      if (classNow !== configSnapshot.value.clazzName) {
+        if (classNow) {
+          const cid = clazzIdByName.value[classNow];
+          if (!cid) {
+            ElMessage.warning('班级数据未加载完成，请刷新页面后重试');
+            saving.value = false;
+            return;
+          }
+          payload.clazzIds = [cid];
+        } else {
+          payload.clazzIds = []; // 明确的「改成不绑班级」
+        }
+      }
+    }
+    await updateOfferingScheduleConfig(offeringId!, payload);
     // 这门课的配置变了 ⇒ 池子「已配置/缺教师/缺班级」判定要重算，直接写入最新值
     try {
       const fresh = await listCourseOfferings(form.courseId);
@@ -3110,9 +3150,12 @@ async function submitConfigOnly() {
       /* 刷新失败不阻断，下次进池子会重拉 */
     }
     createVisible.value = false;
+    const teachingTouched = !!(payload.teacherId || payload.clazzIds);
     ElMessage.success(
       configExisting.value
-        ? `排课节奏已更新（第 ${repeatForm.weekFrom}~${repeatForm.weekTo} 周 · 每周 ${lessonsPerWeek} 节）。课表请在上方点「自动排课」生成`
+        ? `配置已更新（第 ${repeatForm.weekFrom}~${repeatForm.weekTo} 周 · 每周 ${lessonsPerWeek} 节）${
+            teachingTouched ? '；教师/班级变更已同步到已排课次' : ''
+          }`
         : '课程配置已保存。课表请在上方点「自动排课」生成，或把待排课程拖进格子手动排'
     );
   } catch {
@@ -5623,23 +5666,24 @@ watch(
       </el-form-item>
       <el-form-item label="授课教师" required>
         <!-- 2026-11-11 放开手选（录音 A2：「老是自动带出都是有问题的啊，这里要支持选老师」）：
-             默认仍按课程带出认证教师，但允许改成任一教师。
+             默认按课程带出授课教师，但允许改成任一教师。
              2026-11-12 收口：候选默认只列**该课程有授课资格**的教师（录音「不能把上英语的排去上数学」），
-             想用其他教师勾一下「显示全部教师」即可 —— 自由度不丢，默认不乱排。 -->
+             想用其他教师勾一下「显示全部教师」即可 —— 自由度不丢，默认不乱排。
+             ★ 2026-11-19：已有配置也能改（业主定案「改配置并同步课表」），改完会同步到已排课次；
+               文案去掉「认证」——11-16 取消认证审核后系统里已无「认证教师」这一说。 -->
         <el-select
           v-model="form.teacherId"
           placeholder="请选择授课教师"
           filterable
           clearable
           :loading="capTeacherLoading"
-          :disabled="!createPresetCell && configExisting"
           style="width: 100%"
         >
           <el-option v-for="t in createTeacherOptions" :key="t.value" :label="t.label" :value="t.value" />
         </el-select>
         <div class="small muted" style="width: 100%">
           <template v-if="form.courseId && autoTeacherId && form.teacherId === autoTeacherId">
-            已按课程带出认证教师，可改选其他教师
+            已按课程带出授课教师，可改选其他教师
           </template>
           <template v-else-if="!teacherList.length">
             教师列表未取到——可点工具栏刷新后重试，或先到「基础数据 → 教师」确认有教师账号
@@ -5653,13 +5697,15 @@ watch(
           显示全部教师（含无该课程资格）
         </el-checkbox>
       </el-form-item>
-      <el-form-item label="上课班级" required>
+      <el-form-item label="上课班级">
+        <!-- 业主口径：班级可不选（选修课常不绑班），所以不挂 required。
+             ★ 2026-11-19：已有配置也能改，改完同步到已排课次。 -->
         <el-select
           ref="clazzSelRef"
           v-model="form.clazzName"
-          placeholder="请选择班级"
+          placeholder="可不选（选修课常不绑班级）"
           filterable
-          :disabled="!createPresetCell && configExisting"
+          clearable
           style="width: 100%"
         >
           <el-option v-for="n in classListOptions" :key="n" :label="n" :value="n" />
@@ -5743,10 +5789,10 @@ watch(
           <span class="small muted">周</span>
           <span class="small muted" style="margin-left: auto">上限 {{ createWeekMax }} 周</span>
         </div>
-        <!-- 已有配置提示（2026-11-17 课程配置模式）：一门课只允许一条配置，
-             教师/班级已随配置定死（后端暂无编辑接口），本次保存只更新排课节奏 -->
-        <div v-if="!createPresetCell && configExisting" class="small" style="color: var(--warning, #b45309); width: 100%; margin-top: 6px">
-          该课程已有一条配置：本次保存将更新排课节奏（教师/班级暂不支持在界面修改）
+        <!-- 已有配置提示（2026-11-19 更新口径）：一门课只允许一条配置，教师/班级现在也能改，
+             改动会同步到该课已排课次（业主定案「改配置并同步课表」） -->
+        <div v-if="!createPresetCell && configExisting" class="small muted" style="width: 100%; margin-top: 6px">
+          该课程已有一条配置：本次保存会更新节奏；若改了教师或班级，会一并同步到已排课次
         </div>
         <div v-if="createPresetCell && repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
           {{ repeatAnchorLabel }} · {{ repeatHint }}
