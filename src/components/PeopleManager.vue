@@ -8,7 +8,7 @@
  *  - 详情 = `GET /api/v1/admin/teachers|students/{userId}/profile`（聚合详情）
  * ★ 学生列表接口实测**不返回 roleKeys**（教师返回了）⇒ 列表渲染一律不依赖该字段。
  */
-import { computed, onMounted, reactive, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import ProfileDetail from '@/components/ProfileDetail.vue';
@@ -32,7 +32,19 @@ const listLoading = ref(false);
 const rows = ref<AdminUserVo[]>([]);
 const total = ref(0);
 const listError = ref('');
-const query = reactive({ page: 1, pageSize: 8, keyword: '' });
+
+/* 卡片高度已固定（见样式 .g6-wrap），每页行数必须跟着算，否则固定行数只占一半、左卡下面吊一大截空白。
+   可用高度 = 卡片高度 - 内边距 24 - 工具条 44（34 高输入框 + 10 下间距） - 分页器预留 40；行高 38。
+   上下界 6~24：太小翻页太碎，太大一屏塞不下。 */
+const WRAP_MAX_H = 620;
+const ROW_H = 38;
+function calcPageSize() {
+  const avail = Math.min(Math.max(window.innerHeight - 154, 420), WRAP_MAX_H);
+  const body = avail - 24 - 44 - 40;
+  return Math.max(6, Math.min(24, Math.floor(body / ROW_H)));
+}
+
+const query = reactive({ page: 1, pageSize: calcPageSize(), keyword: '' });
 
 async function fetchList(keepSelection = true) {
   listLoading.value = true;
@@ -112,6 +124,24 @@ function onSaved() {
 }
 
 onMounted(() => { void fetchList(false); });
+
+/* 视口变化 ⇒ 每页行数重算；只有行数真的变了才回第 1 页重取（否则白白丢当前页） */
+let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+function onViewportResize() {
+  if (resizeTimer) clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    const next = calcPageSize();
+    if (next === query.pageSize) return;
+    query.pageSize = next;
+    query.page = 1;
+    void fetchList(false);
+  }, 200);
+}
+onMounted(() => { window.addEventListener('resize', onViewportResize); });
+onBeforeUnmount(() => {
+  if (resizeTimer) clearTimeout(resizeTimer);
+  window.removeEventListener('resize', onViewportResize);
+});
 </script>
 
 <template>
@@ -125,19 +155,22 @@ onMounted(() => { void fetchList(false); });
   <div class="g6-wrap">
     <!-- 左：账号列表 -->
     <div class="card g6-list">
+      <!-- 搜索框尺寸：原先 size="small" 只有 24px 高、字号 12px，在 320px 宽的卡片里
+           又矮又细，输入时不好点。改成默认尺寸再把高度抬到 34px、字号 13px，
+           与右侧详情区的正文同一档，刷新按钮同步对齐。 -->
       <div class="list-toolbar">
         <el-input
           v-model="query.keyword"
+          class="tb-search"
           :placeholder="isTeacher ? '姓名 / 工号' : '姓名 / 学号'"
           clearable
-          size="small"
           @keyup.enter="onSearch"
           @clear="onSearch"
         >
-          <template #prefix><ZkIcon name="search" :size="13" /></template>
+          <template #prefix><ZkIcon name="search" :size="14" /></template>
         </el-input>
-        <el-button class="tb-icon" size="small" :loading="listLoading" title="刷新" @click="fetchList(true)">
-          <ZkIcon v-if="!listLoading" name="refresh-cw" :size="14" />
+        <el-button class="tb-icon" :loading="listLoading" title="刷新" @click="fetchList(true)">
+          <ZkIcon v-if="!listLoading" name="refresh-cw" :size="15" />
         </el-button>
       </div>
 
@@ -195,38 +228,64 @@ onMounted(() => { void fetchList(false); });
 </template>
 
 <style scoped>
-/* 左右两卡等高：stretch 让矮的那张（详情）拉到与列表同高，底边对齐。
-   原来是 flex-start ⇒ 两卡各按自己内容定高，详情内容短时右下方吊出一个大缺口，
-   页面看着「没对齐、留白很多」。 */
+/* ★ 2026-11-19 业主口径：教师管理 / 学生管理两页格式必须一致。
+   之前卡片高度是「按内容自然撑开」，教师页右侧有基本信息+可授课程+授课记录（3 条）⇒ 483，
+   学生页右侧只有 1 条选课 ⇒ 412，两页一对比就是「栏位大小不一」。
+   现在给两卡一个**与内容无关的固定高度**：min(视口剩余高度, 620px)。
+   - 两端用同一个值，切到哪一页、选中哪个人，卡片尺寸都不变；
+   - 620 是上限，大屏不会把卡片拉成一片空表；小屏自动降到视口剩余高度，不顶出滚动条。 */
 .g6-wrap {
   display: flex;
   gap: 16px;
   align-items: stretch;
+  height: min(calc(100vh - 154px), 620px);
+  min-height: 420px;
 }
-/* 两卡共用同一个高度上限（100vh - 顶栏 56 - main 上内边距 24 - 页头约 50 - main 下内边距 24 = 154），
-   上限不一致时内容超长又会重新错开。 */
 .g6-list {
   width: 320px;
   flex: none;
   display: flex;
   flex-direction: column;
   padding: 12px;
-  max-height: calc(100vh - 154px);
+  height: 100%;
   min-height: 0;
 }
 .g6-detail {
   flex: 1;
   min-width: 0;
-  max-height: calc(100vh - 154px);
-  /* 详情比列表长时在卡内滚动，不把整页撑长、也不让两卡再次错高 */
+  height: 100%;
+  /* 详情比固定高度长时在卡内滚动，不把整页撑长、也不会把卡片顶高 */
   overflow-y: auto;
   display: flex;
   flex-direction: column;
 }
+/* 工具条用网格定死两列（输入框吃掉剩余宽度 + 34px 按钮），
+   不再靠 flex 自适应 —— el-input 默认宽度有限，flex 下会在右边留一条空隙。 */
 .list-toolbar {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr 34px;
   gap: 8px;
   margin-bottom: 10px;
+}
+.list-toolbar :deep(.tb-search) {
+  width: 100%;
+  min-width: 0;
+}
+/* 搜索框 34px 高、13px 字（原 small 档 24px/12px 偏小）；图标与文案同一基线 */
+.list-toolbar :deep(.tb-search .el-input__wrapper) {
+  height: 34px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+.list-toolbar :deep(.tb-search .el-input__inner) {
+  font-size: 13px;
+}
+/* 刷新按钮跟搜索框等高，方形 34×34，不再是一个小窄条 */
+.list-toolbar :deep(.tb-icon) {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  flex: none;
 }
 .list-body {
   flex: 1;
