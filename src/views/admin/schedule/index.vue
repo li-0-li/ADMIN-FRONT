@@ -5943,10 +5943,18 @@ watch(
             @change="onCfgWeekFromChange"
           />
           <span class="small muted">周 至 第</span>
-          <!-- 2026-11-20：学时固定来自课程总览 ⇒ 结束周只读派生，不再提供输入框 -->
-          <span style="min-width: 40px; text-align: center; font-weight: 600">{{ cfgWeekTo }}</span>
-          <span class="small muted">周（按学时自动算出）</span>
-          <span class="small muted" style="margin-left: auto">上限 {{ createWeekMax }} 周</span>
+          <!-- 2026-11-20：学时固定来自课程总览 ⇒ 结束周只读派生，不再提供输入框。
+               用禁用输入框而不是裸数字：和左侧起始周同宽同款，视觉对称，也不再显得空 -->
+          <el-input-number
+            :model-value="cfgWeekTo"
+            :min="repeatForm.weekFrom"
+            :max="createWeekMax"
+            disabled
+            step-strictly
+            style="width: 110px"
+          />
+          <span class="small muted">周（自动算出）</span>
+          <span class="small muted" style="margin-left: 8px">上限 {{ createWeekMax }} 周</span>
         </div>
         <!-- 已有配置提示（2026-11-19 更新口径）：一门课只允许一条配置，教师/班级现在也能改，
              改动会同步到该课已排课次（业主定案「改配置并同步课表」） -->
