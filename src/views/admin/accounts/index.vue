@@ -19,7 +19,12 @@ import {
 } from '@/api/admin/users';
 import type { DeptNodeVo } from '@/api/admin/users';
 import { listClasses, listMajors } from '@/api/admin/basicdata';
-import { getTeacherCapabilities, saveTeacherCapabilities } from '@/api/admin/capabilities';
+import {
+  getTeacherCapabilities,
+  revokeTeacherCapability,
+  saveTeacherCapabilities,
+  type TeacherCapabilityVo
+} from '@/api/admin/capabilities';
 import { listCourses } from '@/api/admin/courses';
 import type { AdminCourseVo } from '@/api/admin/courses';
 import type { AdminUserVo, Clazz, FootprintVo, ImportResultVo, Major, UserSaveBo } from '@/types/admin';
@@ -782,14 +787,21 @@ function onMoreCommand(cmd: string, row: AdminUserVo) {
 
 /* ---------------- 可授课程（会议 #10 · T-04 capability，2026-11-10） ----------------
  * 教师能上哪些课 = 智能排课/开课的教师候选约束来源。三口径：教研室默认/教师自设/管理员代设，
- * 本弹窗是管理员代设入口：读当前集合（GET）→ 勾选 → 整组覆盖保存（POST）。
- * ★ 只对教师角色行显示入口；权限点后端未定档，暂不做 hasPermi 门禁（见 capabilities.ts 注释）。 */
+ * 本弹窗是管理员代设入口：读当前集合（GET）→ 勾选 → 保存。
+ * ★ 2026-11-20 更正两处：
+ *  1. GET 返回对象数组（capabilityId/courseId/…），旧代码 map(String) 会得到 "[object Object]"，
+ *     打开弹窗原有勾选全丢 —— 按 courseId 取值。
+ *  2. POST 是 INSERT IGNORE **追加**，不是整组覆盖 ⇒ 取消勾选必须按 capabilityId 逐条 DELETE。
+ *     只发 POST 的话「取消勾选保存后仍在」是必然结果。
+ *  权限点：admin:capabilities:add(3347)/:remove(3348)/:list(3387)。 */
 const capVisible = ref(false);
 const capSaving = ref(false);
 const capLoading = ref(false);
 const capTeacher = ref<AdminUserVo | null>(null);
 const capCourses = ref<AdminCourseVo[]>([]);
 const capSelected = ref<string[]>([]);
+/** 打开时的原资格快照：POST 只增不删，撤销要靠 capabilityId */
+const capOrig = ref<TeacherCapabilityVo[]>([]);
 
 const isTeacherRow = (row: AdminUserVo) => (row.roleKeys ?? []).includes('teacher');
 
@@ -797,6 +809,7 @@ async function openCapability(row: AdminUserVo) {
   capTeacher.value = row;
   capSelected.value = [];
   capCourses.value = [];
+  capOrig.value = [];
   capVisible.value = true;
   capLoading.value = true;
   const jobs: Promise<void>[] = [
@@ -808,10 +821,13 @@ async function openCapability(row: AdminUserVo) {
         capCourses.value = [];
       }),
     getTeacherCapabilities(row.userId)
-      .then((ids) => {
-        capSelected.value = Array.isArray(ids) ? ids.map(String) : [];
+      .then((list) => {
+        const arr = Array.isArray(list) ? list.filter((c) => c && c.courseId != null) : [];
+        capOrig.value = arr;
+        capSelected.value = arr.map((c) => String(c.courseId));
       })
       .catch(() => {
+        capOrig.value = [];
         capSelected.value = [];
       })
   ];
@@ -823,11 +839,33 @@ async function saveCapability() {
   if (!capTeacher.value) return;
   capSaving.value = true;
   try {
-    await saveTeacherCapabilities(capTeacher.value.userId, capSelected.value);
+    const teacherId = capTeacher.value.userId;
+    const before = new Set(capOrig.value.map((c) => String(c.courseId)));
+    const after = new Set(capSelected.value.map(String));
+    const toAdd = [...after].filter((id) => !before.has(id));
+    const toRemove = capOrig.value.filter((c) => !after.has(String(c.courseId)));
+    // 先加后删：中途失败时宁可多一门，也不要出现「旧的删了新的没加上」的空档
+    if (toAdd.length) await saveTeacherCapabilities(teacherId, toAdd);
+    if (toRemove.length) {
+      // ★ 后端缺陷：唯一键 uk_teacher_course 不含 deleted，DELETE 是软删 ⇒ 撤销后加不回来。
+      //   撤销属于破坏性动作，先确认。
+      const names = toRemove.map((c) => c.courseName || String(c.courseId)).join('、');
+      const go = await ElMessageBox.confirm(
+        `将撤销 ${toRemove.length} 门可授课程：${names}。\n\n` +
+          '注意：当前后端撤销后无法再次授予（已知缺陷），除非先修后端或改库。',
+        '确认撤销可授课程',
+        { type: 'warning', confirmButtonText: '仍然撤销', cancelButtonText: '取消' }
+      ).catch(() => false);
+      if (!go) {
+        capSaving.value = false;
+        return;
+      }
+      for (const c of toRemove) await revokeTeacherCapability(String(c.capabilityId));
+    }
     ElMessage.success(
-      capSelected.value.length
-        ? `已保存「${capTeacher.value.nickName}」的可授课程（${capSelected.value.length} 门）`
-        : '已清空个人可授课程设置'
+      toAdd.length || toRemove.length
+        ? `已保存「${capTeacher.value.nickName}」的可授课程（新增 ${toAdd.length} 门、撤销 ${toRemove.length} 门）`
+        : `「${capTeacher.value.nickName}」的可授课程没有变化`
     );
     capVisible.value = false;
   } catch {
