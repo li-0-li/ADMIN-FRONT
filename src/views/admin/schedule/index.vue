@@ -3710,11 +3710,13 @@ const effectiveRepeatTimes = computed(() => {
   return wt - wf + 1;
 });
 
-/* ---------- 课程配置模式：周范围 ⇄ 总课时 双向联动（2026-11-20 业主定案） ----------
+/* ---------- 课程配置模式：周范围 ⇄ 每周节数 ⇄ 总课时 联动（2026-11-20 业主定案） ----------
  * 口径：**谁被改，谁做主**。
  *   · 改总课时 ⇒ 结束周 = 起始周 + ⌈总课时 ÷ 每周节数⌉ − 1（课时装不下就把周往后让）
  *   · 改结束周 ⇒ 总课时 = 每周节数 × 周数（窗口拉大课时补满，窗口缩小课时跟着缩）
- *   · 改每周节数 / 起始周 ⇒ 总课时不变，结束周重算
+ *   · 改每周节数 ⇒ 窗口不动，总课时 = 每周节数 × 周数（业主：每周节数也要跟最大周一样
+ *     同步改动总课时，而不是课时不动、把结束周压来压去）
+ *   · 改起始周 ⇒ 总课时不变，结束周整体后移
  * 2026-11-19 只做了「课时 → 周」单向，业主实测两个毛病：窗口比课时富余时把最大周拉大，
  * 课时不动（窗口白留）；把最大周改小则被弹回去提示「无法更改」。所以补上反方向。
  * 结束周被学期/教学周上限截断、课时铺不完时给红字并拦住保存。
@@ -3774,13 +3776,14 @@ const extraSlotList = computed(() => extraSlots.slice(0, Math.max(0, repeatForm.
  * ★ 刻意不用 watch 做联动：watch 回调是异步派发的，A 改 B、B 又改回 A 这种相互触发
  *   用「加锁变量」挡不住（赋值函数返回时回调还没跑，锁已经解了）。改成输入框 @change
  *   直接调用 —— 一次用户操作只走一个方向，不会来回抖。 */
-/** 课时 → 窗口：改总课时 / 每周节数 / 起始周时，结束周跟着重算（课时是主控） */
+/** 课时 → 窗口：改总课时 / 起始周时，结束周跟着重算（课时是主控） */
 function syncCfgWeekToFromTotal() {
   if (createPresetCell.value || cfgBackfilling.value) return;
   const to = cfgWeekTo.value;
   if (repeatForm.weekTo !== to) repeatForm.weekTo = to;
 }
-/** 窗口 → 课时：改结束周（最大周）时，总课时按窗口满额重算 —— 拉大补满、缩小跟着减 */
+/** 窗口 → 课时：改结束周（最大周）/ 每周节数时，总课时按「每周节数 × 周数」重算
+ *  —— 结束周拉大补满、缩小跟着减；每周节数加大/减小也直接体现在总课时上，窗口不动 */
 function syncCfgTotalFromWeekTo() {
   if (createPresetCell.value || cfgBackfilling.value) return;
   const { wf, wt } = weekRange();
@@ -3789,10 +3792,11 @@ function syncCfgTotalFromWeekTo() {
   const full = Math.max(1, cfgPerWeek.value * (wt - wf + 1));
   if (repeatForm.total !== full) repeatForm.total = full;
 }
-/** 每周节数 / 起始周变化：拖拽模式把总课时补到满额；配置模式保持课时、只重算结束周 */
+/** 每周节数变化：拖拽模式把总课时补到满额；配置模式窗口不动、总课时按窗口重算
+ *  （2026-11-20 业主：每周节数要跟最大周一样同步改动总课时） */
 function syncRepeatTotal() {
   if (!createPresetCell.value) {
-    syncCfgWeekToFromTotal();
+    syncCfgTotalFromWeekTo();
     return;
   }
   repeatForm.total = Math.max(1, repeatForm.weekly * effectiveRepeatTimes.value);
@@ -5889,6 +5893,7 @@ watch(
         </div>
         <div v-if="!createPresetCell" class="small muted" style="width: 100%">
           上限 {{ weekLessonsMax }} 节（每天 {{ PERIODS.length }} 节次 × 5 个工作日，即整个课表格子数）；
+          改这里窗口不动、总课时按「每周节数 × 周数」同步重算。
           这里不选上课时间：保存配置后点「自动排课」，系统按教师/教室/班级空闲生成课表
         </div>
       </el-form-item>
@@ -5954,7 +5959,8 @@ watch(
           {{ repeatAnchorLabel }} · {{ repeatHint }}
         </div>
         <div v-else-if="!createPresetCell" class="small muted" style="width: 100%">
-          总课时与周范围双向联动：改总课时 ⇒ 结束周自动让位；改结束周 ⇒ 总课时按窗口补满或缩减。
+          总课时、周范围、每周节数三方联动，谁被改谁做主：改总课时 ⇒ 结束周自动让位；
+          改结束周或每周节数 ⇒ 总课时按「每周节数 × 周数」重算。
           自动排课只会把课铺进这个周窗口，窗口外的周次不会排课
         </div>
         <!-- 单双周锚定说明（2026-10-29）：默认按学期起点算奇偶，从哪周排都不错位；
@@ -5976,9 +5982,9 @@ watch(
         </div>
       </el-form-item>
       <!-- 总课时（2026-11-13 业主反馈：「总节数」改叫「总课时」——录音口径「一共多少课时」）
-           ★ 2026-11-20 课程配置模式：与周范围**双向联动** —— 改课时则结束周跟着让位，
-             改结束周则课时按窗口满额补满/缩减（2026-11-19 的单向版本会让窗口富余时
-             拉大最大周课时不动，缩小最大周又被弹回去，业主已反馈）。 -->
+           ★ 2026-11-20 课程配置模式：与周范围/每周节数**三方联动** —— 改课时则结束周跟着让位，
+             改结束周或每周节数则课时按「每周节数 × 周数」重算（2026-11-19 的单向版本会让
+             窗口富余时拉大最大周课时不动，缩小最大周又被弹回去，业主已反馈）。 -->
       <el-form-item v-if="!createPresetCell || repeatForm.mode !== 'once'" label="总课时">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
           <el-input-number
