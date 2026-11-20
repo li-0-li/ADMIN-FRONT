@@ -3,40 +3,33 @@
  * 师生资料聚合详情（G6 共享组件）
  * -----------------------------------------------------------------------------
  * `/admin/teachers` 与 `/admin/students` 两页共用这一个面板，差异靠 `mode` 区分：
- *   mode='teacher' → 基本资料可编辑（PUT /teachers/{id}/profile）
- *   mode='student' → **纯只读**（后端没有 PUT 端点，不许给编辑入口，否则用户点了必然 404）
+ *   mode='teacher' → 基本信息 + 可授课程 + 授课记录（按学期分组）
+ *   mode='student' → 基本信息 + 选课记录（按入学年份分组）
+ *
+ * ★ 2026-11-20 改口径：**编辑不再走本组件的内联表单**。
+ *   原来教师的「编辑」只调 `PUT /teachers/{id}/profile`，而后端该端点只取 `jobTitle`，
+ *   姓名/院系/状态填了也被丢弃 —— 看着能编辑，实际只改得动职称；学生干脆没有入口。
+ *   现在统一由父组件挂 `PeopleEditDialog`（走 `PUT /admin/users` + 可授课程差异同步），
+ *   本组件只负责「展示」并在标题右侧发一个 `edit` 事件。
  *
  * ★ 授课/选课记录必须按 `termCode` **分组**展示，不能平铺（会议口径：
  *   教师「勾选几个学期看过哪些课」、学生「几年上过哪些课」）。当前库里只有一个学期
  *   （`26-27-1`），但分组逻辑按任意学期数实现，补数据后自动生效。
- *
- * ★ 教师保存当前 100% 失败（后端 `biz_user_ext.user_role` 缺失，见 api/admin/profiles.ts 注释）。
- *   组件不隐藏保存按钮（那是掩耳盗铃），而是在失败时给出可读原因 + 顶部持久提示条，
- *   并明确「已报后端线」，避免用户反复点。
  */
-import { computed, reactive, ref, watch } from 'vue';
-import { ElMessage } from 'element-plus';
+import { computed, ref, watch } from 'vue';
 import ZkIcon from '@/components/ZkIcon.vue';
-import {
-  getTeacherProfile,
-  updateTeacherProfile,
-  type StudentProfile,
-  type TeacherProfile,
-  type TeacherTaughtCourse
-} from '@/api/admin/profiles';
-import { useUserStore } from '@/store/user';
-
-/** 与 AdminProfileController#updateTeacher 的 @ss.hasPermi('admin:profiles:edit') 对应 */
-const userStore = useUserStore();
-const canEditProfile = computed(() => userStore.hasPermi('admin:profiles:edit'));
+import type { StudentProfile, TeacherProfile, TeacherTaughtCourse } from '@/api/admin/profiles';
 
 const props = defineProps<{
   mode: 'teacher' | 'student';
   userId: string;
   profile: TeacherProfile | StudentProfile | null;
   loading: boolean;
+  /** 有没有 `admin:users:edit`；没有就只展示，不给一个点了报 403 的按钮 */
+  canEdit?: boolean;
 }>();
-const emit = defineEmits<{ (e: 'saved'): void }>();
+const emit = defineEmits<{ (e: 'saved'): void; (e: 'edit'): void }>();
+
 
 const isTeacher = computed(() => props.mode === 'teacher');
 const tProfile = computed(() => (props.mode === 'teacher' ? (props.profile as TeacherProfile | null) : null));
@@ -129,77 +122,6 @@ const groupedCourses = computed(() => {
 
 // 切人时把学期筛选复位，否则上一个人的学期条件会挡住新人的记录
 watch(() => props.userId, () => { termFilter.value = ''; });
-
-/* ---------------- 教师编辑 ---------------- */
-const editing = ref(false);
-const saving = ref(false);
-const editForm = reactive({ nickName: '', deptName: '', jobTitle: '', status: '0' });
-/** 后端缺陷一旦命中就记住：顶部挂持久提示，避免用户反复点保存反复失败 */
-const backendBroken = ref('');
-
-function startEdit() {
-  const p = tProfile.value;
-  if (!p) return;
-  editForm.nickName = p.nickName ?? '';
-  editForm.deptName = p.deptName ?? '';
-  editForm.jobTitle = p.jobTitle ?? '';
-  editForm.status = String(p.status ?? '0');
-  editing.value = true;
-}
-
-function cancelEdit() {
-  editing.value = false;
-}
-
-async function submitEdit() {
-  if (!editForm.nickName.trim()) {
-    ElMessage.warning('昵称不能为空');
-    return;
-  }
-  saving.value = true;
-  /* ★ 2026-11-12 读后端源码 `AdminProfileController#updateTeacher` 确认契约：
-   *     @RequestBody Map<String,String> body → 只取 body.get("jobTitle")
-   *   即 nickName / deptName / status **在服务端被直接丢弃**，改了对数据库零影响。
-   *   所以这里只提交 jobTitle；其余三项在表单里是只读展示，不给「填了也没用」的输入框。 */
-  const want = { jobTitle: editForm.jobTitle.trim() || null };
-  try {
-    await updateTeacherProfile(props.userId, want);
-
-    /* ★ 后端 `updateJobTitle` 末尾是 `upsertJobTitle(...) == 1`：MySQL UPSERT 的 UPDATE 分支
-     *   affected_rows 是 2（INSERT 才是 1）⇒ data 恒为 false，与有没有写进去无关。
-     *   实测：jobTitle null→讲师确实落库，响应仍是 {code:0, data:false}。
-     *   所以返回值不可作判据，唯一可信的是保存后回读比对。 */
-    const back = await getTeacherProfile(props.userId);
-    const norm = (v: unknown) => {
-      const s = v === null || v === undefined ? '' : String(v).trim();
-      return s === '' ? null : s;
-    };
-    if (norm(back?.jobTitle) !== norm(want.jobTitle)) {
-      backendBroken.value =
-        '保存未生效：职称回读值与提交值不一致（后端返回 code=0，但 upsert 的返回判定写成了 ==1，' +
-        'UPDATE 分支恒为 false，可能没落库）。已记入回报。';
-      ElMessage.error('保存未生效：职称未落库，请查看面板顶部提示');
-      emit('saved'); // 重拉真实值，避免用户以为改成了
-      return;
-    }
-
-    ElMessage.success('已保存');
-    editing.value = false;
-    backendBroken.value = '';
-    emit('saved');
-  } catch (e) {
-    const msg = String((e as Error)?.message ?? '');
-    if (/user_role|doesn't have a default value/i.test(msg)) {
-      backendBroken.value = '保存失败：后端更新教师资料的 SQL 没带 biz_user_ext.user_role（NOT NULL 无默认值），属后端缺陷，前端无法绕过。已记入回报，待后端修复后此按钮即可用。';
-      ElMessage.error('保存失败：后端接口缺陷（user_role 缺失），详见面板顶部提示');
-    } else {
-      backendBroken.value = '';
-      ElMessage.error(`保存失败：${msg.slice(0, 100) || '未知错误'}`);
-    }
-  } finally {
-    saving.value = false;
-  }
-}
 </script>
 
 <template>
@@ -215,65 +137,23 @@ async function submitEdit() {
     </template>
 
     <template v-else>
-      <!-- 后端缺陷提示（命中过一次就一直显示，直到保存成功） -->
-      <div v-if="backendBroken" class="banner-warn">
-        <ZkIcon name="alert-triangle" :size="15" style="flex: none; margin-top: 1px" />
-        <span>{{ backendBroken }}</span>
-      </div>
-
       <!-- ① 基本信息 -->
       <section class="sec">
         <div class="sec-head">
           <span class="sec-title">基本信息</span>
-          <template v-if="isTeacher">
-            <template v-if="!editing">
-              <el-button v-if="canEditProfile" size="small" @click="startEdit">
-                <ZkIcon name="pencil" :size="13" style="margin-right: 4px" />编辑
-              </el-button>
-              <span v-else class="small muted">无编辑权限</span>
-            </template>
-            <template v-else>
-              <el-button size="small" :disabled="saving" @click="cancelEdit">取消</el-button>
-              <el-button size="small" type="primary" :loading="saving" @click="submitEdit">保存</el-button>
-            </template>
-          </template>
-          <!-- 学生只读：后端没有 PUT 端点。这里给一句说明而不是禁用按钮，
-               免得用户以为"功能坏了"。 -->
-          <span v-else class="small muted">学生资料本期只读（后端未提供编辑端点）</span>
+          <el-button v-if="props.canEdit" size="small" @click="emit('edit')">
+            <ZkIcon name="pencil" :size="13" style="margin-right: 4px" />编辑资料
+          </el-button>
+          <span v-else class="small muted">无编辑权限</span>
         </div>
 
-        <div v-if="!editing" class="kv-grid">
+        <div class="kv-grid">
           <div class="kv"><span class="k">姓名</span><span class="v">{{ profile.nickName || '—' }}</span></div>
           <div class="kv"><span class="k">账号</span><span class="v mono">{{ profile.userName || '—' }}</span></div>
           <div v-if="isTeacher" class="kv"><span class="k">院系</span><span class="v">{{ tProfile?.deptName || '—' }}</span></div>
           <div v-if="isTeacher" class="kv"><span class="k">职称</span><span class="v">{{ tProfile?.jobTitle || '—' }}</span></div>
           <div v-if="!isTeacher" class="kv"><span class="k">班级</span><span class="v">{{ sProfile?.className || '未绑定班级' }}</span></div>
           <div class="kv"><span class="k">状态</span><span class="v">{{ statusText(profile.status) }}</span></div>
-        </div>
-
-        <div v-else class="edit-grid">
-          <!-- ★ 2026-11-12 读后端源码定案：PUT /teachers/{id}/profile 的 body 只取 jobTitle，
-               姓名/院系/状态在服务端被丢弃。所以编辑态只放「职称」一个输入框，
-               其余作为只读回显——留着可填的框、存完报「未生效」比不给填更气人。 -->
-          <div class="edit-item edit-note">
-            本页可改字段只有「职称」；姓名 / 院系 / 状态由账号管理、基础数据维护
-          </div>
-          <div class="edit-item">
-            <span class="k">姓名</span>
-            <div class="edit-readonly">{{ editForm.nickName || '—' }}</div>
-          </div>
-          <div class="edit-item">
-            <span class="k">院系</span>
-            <div class="edit-readonly">{{ editForm.deptName || '—' }}</div>
-          </div>
-          <div class="edit-item">
-            <span class="k">职称</span>
-            <el-input v-model="editForm.jobTitle" maxlength="32" placeholder="如 副教授" style="width: 180px" />
-          </div>
-          <div class="edit-item">
-            <span class="k">状态</span>
-            <div class="edit-readonly">{{ statusText(editForm.status) }}</div>
-          </div>
         </div>
       </section>
 
@@ -368,18 +248,6 @@ async function submitEdit() {
   display: flex;
   flex-direction: column;
 }
-.banner-warn {
-  display: flex;
-  gap: 8px;
-  padding: 9px 12px;
-  margin-bottom: 14px;
-  border: 1px solid #fde68a;
-  background: #fffbeb;
-  color: #92400e;
-  border-radius: var(--r-md, 8px);
-  font-size: 12.5px;
-  line-height: 1.7;
-}
 .sec {
   padding: 4px 0 14px;
   border-bottom: 1px dashed var(--border, #eef0f4);
@@ -420,40 +288,6 @@ async function submitEdit() {
 }
 .kv .v {
   color: var(--ink-800, #1f2937);
-}
-.edit-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px 18px;
-}
-.edit-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-}
-.edit-item .k {
-  width: 40px;
-  color: var(--ink-400, #9aa3b2);
-}
-/* 只读字段：外观刻意区别于输入框，避免用户以为能改 */
-.edit-readonly {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 200px;
-  padding: 5px 10px;
-  border: 1px dashed var(--border, #e3e8ef);
-  border-radius: 6px;
-  color: var(--ink-600, #5b6472);
-  background: var(--bg-soft, #f7f9fc);
-}
-/* 整行说明：告诉用户为什么只有职称能改 */
-.edit-note {
-  flex-basis: 100%;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--ink-400, #9aa3b2);
 }
 .chip-list {
   display: flex;

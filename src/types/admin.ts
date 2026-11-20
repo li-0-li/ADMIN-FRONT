@@ -20,6 +20,15 @@ export interface AdminUserVo {
   deptName: string;
   schoolId: string;
   schoolName: string;
+  /**
+   * 学籍归属（`biz_user_ext`）。列表接口已下发（2026-11-20 实测），
+   * 学生编辑弹窗的回显与筛选都靠它。
+   * ★ 注意 `clazzName` 恒为 null —— 后端只带了 id，班级名没回填，
+   *   要显示班级名请用详情接口（StudentProfile.className）或 clazz 候选映射。
+   */
+  clazzId?: string | null;
+  clazzName?: string | null;
+  majorId?: string | null;
   userNo: string;
   bizStatus: string;
   mustChangePwd: boolean;
@@ -58,6 +67,12 @@ export interface UserSaveBo {
   deptId?: string | null;
   userNo?: string;
   remark?: string;
+  /**
+   * 学生所属班级（`biz_user_ext.clazz_id`）—— 学生归属的唯一入口，
+   * 后端以班级为准反推 school_id / major_id（clazz 表自带这两列）。
+   * ★ 只有传了才写；传 null 等于「不修改」⇒ 清空班级这条动作本期不支持。
+   */
+  clazzId?: string;
 }
 
 /** BasicDataQueryBo */

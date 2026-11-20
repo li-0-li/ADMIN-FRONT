@@ -6,31 +6,67 @@ import { request } from '@/api/request';
  * 来源三口径（T-01 设计 §1.2-⑩ 上游）：教研室默认 / 教师自设 / 管理员代设。
  * 管理端这里是「管理员代设」入口：读某教师当前的可授课程集合，整组覆盖保存。
  *
- * ★ 8080 实测（2026-11-10）：
- * - GET  /teachers/{teacherId}/capabilities ⇒ { code:0, data: [] }（未设置时为空数组）
- * - POST /teachers/{teacherId}/capabilities，body { courseIds: string[] }——
- *   ghost 教师报「教师账号不存在或已被删除」，说明路径与教师校验在；body 键名按
- *   REST 惯例取 courseIds，验收时用真实教师 set+revert 复核一次（见页面注释）。
- * - 课程维度反查端点（course → 可授教师）暂无 ⇒ 排课候选过滤待后端补，先不做 N+1。
+ * ★ 8080 实测（2026-11-10 首次接线，2026-11-20 复核更正）：
+ * - GET  /teachers/{teacherId}/capabilities ⇒ `{ code:0, data: [{capabilityId, courseId, courseName, …}] }`
+ *   （未设置时为空数组）——是对象数组，不是课程 id 集合。
+ * - POST /teachers/{teacherId}/capabilities，body { courseIds: string[] } ⇒ 返回**实际新增数**；
+ *   已存在的自动跳过（INSERT IGNORE）⇒ 这是追加语义，撤销要另走 DELETE。
+ * - DELETE /capabilities/{capabilityId} ⇒ 按资格行主键撤销一条。
+ * - 课程维度反查 `GET /courses/{courseId}/capability-teachers` 已具备（菜单 3364）。
  *
- * ★ 权限点后端未定档（未在 sys_menu 见 teacher capability 号段）⇒ 前端暂不做
- *   hasPermi 门禁，入口只对管理端账号可见（整页本就管理员专属）；权限点落定后补 v-if。
+ * ★ 权限点已定档（sys_menu 2026-11-20 核对）：
+ *   admin:capabilities:add(3347) / :remove(3348) / :courseTeachers(3364) / :list(3387)，均已授权 admin 角色。
+ *   页面侧用 store.hasPermi 做门禁，非超管账号按真实权限显示或隐藏入口。
  */
 
-/** 某教师当前可授课程 id 集合（元素为字符串雪花 id，与全站主键口径一致） */
+/**
+ * 某教师当前的可授课程资格行。
+ *
+ * ★ 2026-11-20 更正：这个端点返回的是**对象数组**
+ *   `[{capabilityId, courseId, courseName, courseNo, source, createTime, teacherId}]`，
+ *   不是课程 id 字符串数组。旧声明写成 `string[]`，账号页 `ids.map(String)` 回显时
+ *   会把对象 String 成 "[object Object]" ⇒ 打开弹窗原有勾选全丢。
+ *   需要 id 集合的地方一律 `list.map(c => String(c.courseId))`。
+ */
+export interface TeacherCapabilityVo {
+  /** 资格行主键，撤销时按它 DELETE */
+  capabilityId: string;
+  courseId: string;
+  courseName?: string;
+  courseNo?: string;
+  /** 来源三口径：dept_default / self / admin / course */
+  source?: string;
+  createTime?: string;
+  teacherId?: string;
+}
+
 export function getTeacherCapabilities(teacherId: string | number) {
-  return request<string[]>({
+  return request<TeacherCapabilityVo[]>({
     url: `/api/v1/admin/teachers/${teacherId}/capabilities`,
     method: 'get'
   });
 }
 
-/** 整组覆盖保存某教师的可授课程；空数组语义（清空/回退教研室默认）以后端实现为准 */
+/**
+ * 追加授予可上课资格。
+ *
+ * ★ 语义是 **INSERT IGNORE 追加**，不是「整组覆盖」（源码 AdminCapabilityServiceImpl#grant：
+ *   `grantCapabilities(teacherId, courseIds, source, …)` + 「已存在自动跳过，返回实际新增数」）。
+ *   所以取消勾选**不会**被这里删掉 —— 必须调 {@link revokeTeacherCapability} 逐条撤销。
+ */
 export function saveTeacherCapabilities(teacherId: string | number, courseIds: string[]) {
-  return request<unknown>({
+  return request<number>({
     url: `/api/v1/admin/teachers/${teacherId}/capabilities`,
     method: 'post',
     data: { courseIds }
+  });
+}
+
+/** 撤销一条资格（按资格行主键，不是课程 id）。权限点 admin:capabilities:remove（菜单 3348）。 */
+export function revokeTeacherCapability(capabilityId: string | number) {
+  return request<boolean>({
+    url: `/api/v1/admin/capabilities/${capabilityId}`,
+    method: 'delete'
   });
 }
 

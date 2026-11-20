@@ -12,9 +12,11 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import ProfileDetail from '@/components/ProfileDetail.vue';
+import PeopleEditDialog from '@/components/PeopleEditDialog.vue';
 import { listDeptTree, listUsers, type DeptNodeVo } from '@/api/admin/users';
 import { listClasses } from '@/api/admin/basicdata';
 import { getStudentProfile, getTeacherProfile, type StudentProfile, type TeacherProfile } from '@/api/admin/profiles';
+import { useUserStore } from '@/store/user';
 import type { AdminUserVo } from '@/types/admin';
 
 const props = defineProps<{ mode: 'teacher' | 'student' }>();
@@ -182,6 +184,25 @@ function onSaved() {
   void loadProfile();
 }
 
+/* ---------------- 编辑资料 ----------------
+ * 入口在右详情「基本信息」标题右侧（由 ProfileDetail 发 edit 事件），
+ * 弹窗本身两页共用：教师版多「职称 + 可授课程」，学生版多「班级」。
+ * 权限：admin:users:edit（与账号管理页同一道闸）。 */
+const userStore = useUserStore();
+const canEditUser = computed(() => userStore.hasPermi('admin:users:edit'));
+const editVisible = ref(false);
+const editingRow = ref<AdminUserVo | null>(null);
+
+function openEdit() {
+  const row = rows.value.find((r) => String(r.userId) === selectedUserId.value);
+  if (!row) {
+    ElMessage.warning('先从左列表选一位' + (isTeacher.value ? '教师' : '学生'));
+    return;
+  }
+  editingRow.value = row;
+  editVisible.value = true;
+}
+
 onMounted(() => {
   void fetchList(false);
   // 筛选候选与能力探测并行，别挡列表首屏
@@ -313,10 +334,19 @@ onBeforeUnmount(() => {
         :user-id="selectedUserId"
         :profile="profile"
         :loading="detailLoading"
+        :can-edit="canEditUser"
         @saved="onSaved"
+        @edit="openEdit"
       />
     </div>
   </div>
+
+  <PeopleEditDialog
+    v-model="editVisible"
+    :mode="props.mode"
+    :user="editingRow"
+    @saved="onSaved"
+  />
 </template>
 
 <style scoped>
