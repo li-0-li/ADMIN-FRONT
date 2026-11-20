@@ -6,7 +6,7 @@ import ZkIcon from '@/components/ZkIcon.vue';
 import { useUserStore } from '@/store/user';
 import { autoArrange, createSchedule, deleteSchedule, fetchClazzPool, listCourseOfferings, listCoursePool, listSchedules, moveSchedule, publishSchedules, swapSchedules, updateLessonStatus } from '@/api/admin/schedules';
 import type { ClazzPoolItem, OfferingBrief, ScheduleCreateBody, ScheduleSwapBody, ScheduleUpdateBody } from '@/api/admin/schedules';
-import { createOffering, deleteCourse, updateOfferingScheduleConfig } from '@/api/admin/courses';
+import { createOffering, deleteCourse, updateCourse, updateOfferingScheduleConfig } from '@/api/admin/courses';
 import { listClasses, listClassrooms, listMajors, listSchools, listTerms, updateClassroom } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
 import { listPeriods } from '@/api/admin/periods';
@@ -815,6 +815,10 @@ const grid = computed(() =>
  *     `Array.isArray()` 能力探测，旧包下自动退化为「未知」，不报错、不误判。
  */
 type PoolCourse = CourseBrief & {
+  /** 课程编号（后端 AdminCourseVo.courseNo）：配置弹窗改学时时回传 updateCourse 必填字段（2026-11-20） */
+  courseNo?: string;
+  /** 学分（后端 AdminCourseVo.credit，0~9.9）：updateCourse 回传时原样带上，避免编辑接口清掉 */
+  credit?: number | null;
   major?: string;
   targetClasses?: string[];
   /**
@@ -3051,6 +3055,8 @@ async function loadConfigOffering() {
   configOffering.value = null;
   configExisting.value = false;
   configSnapshot.value = { teacherId: '', clazzName: '' };
+  // 学时输入框以课程总览现值起算（换课后重置，不带上一门课的输入）
+  cfgHoursInput.value = cfgOverviewHours.value || null;
   if (!form.courseId || createPresetCell.value) return;
   try {
     const list = await listCourseOfferings(form.courseId);
@@ -3094,9 +3100,9 @@ async function submitConfigOnly() {
     ElMessage.warning(createWeekRangeError.value);
     return;
   }
-  // 2026-11-20：学时来自课程总览且只读——没填学时算不出节次/结束周，先指路补学时
+  // 2026-11-20：学时可编辑——没填/清空算不出节次与结束周，先拦
   if (!cfgHoursKnown.value) {
-    ElMessage.warning('该课程未填学时，算不出结束周：请先到「课程管理 → 编辑」补学时再保存配置');
+    ElMessage.warning('请填写学时（1 节次 = 2 学时），否则算不出结束周');
     return;
   }
   // 课程配置模式：节次铺不进学期窗口（每周节数太少/起始周太靠后）说明撞到学期/教学周上限，
@@ -3119,7 +3125,30 @@ async function submitConfigOnly() {
   const weekCount = Math.max(1, cfgWeekTo.value - repeatForm.weekFrom + 1);
   const lessonsPerWeek = Math.max(1, repeatForm.weekly);
   saving.value = true;
+  let hoursSynced = false;
   try {
+    // 学时改了 ⇒ 先同步回课程总览（2026-11-20 业主：更改学时并排课之后总览那边也要改）。
+    // 放在配置保存之前：同步失败就整体中止，避免出现「配置按新学时、总览还是旧学时」的劈叉。
+    if (cfgCourseHours.value !== cfgOverviewHours.value) {
+      const row = courseById.value.get(String(form.courseId));
+      // updateCourse 必填 courseNo/courseName —— 池子没加载完就拦下，别发一个残缺请求
+      if (!row?.courseNo || !row.courseName) {
+        ElMessage.warning('课程数据未加载完成，请刷新页面后重试');
+        saving.value = false;
+        return;
+      }
+      await updateCourse(form.courseId, {
+        courseNo: row.courseNo,
+        courseName: row.courseName,
+        major: row.major,
+        credit: row.credit ?? undefined,
+        hours: cfgCourseHours.value,
+        courseType: row.courseType ?? undefined
+      });
+      // 池子就地更新（courseById 由 poolCourses 派生），别处引用学时（如配置体检）立即看到新值
+      if (row) row.hours = cfgCourseHours.value;
+      hoursSynced = true;
+    }
     let offeringId = configOffering.value?.offeringId;
     if (!offeringId) {
       const clazzId = form.clazzName ? clazzIdByName.value[form.clazzName] : undefined;
@@ -3180,9 +3209,9 @@ async function submitConfigOnly() {
     ElMessage.success(
       configExisting.value
         ? `配置已更新（第 ${repeatForm.weekFrom}~${repeatForm.weekTo} 周 · 每周 ${lessonsPerWeek} 节）${
-            teachingTouched ? '；教师/班级变更已同步到已排课次' : ''
-          }`
-        : '课程配置已保存。课表请在上方点「自动排课」生成，或把待排课程拖进格子手动排'
+            hoursSynced ? '；学时已同步到课程总览' : ''
+          }${teachingTouched ? '；教师/班级变更已同步到已排课次' : ''}`
+        : `课程配置已保存${hoursSynced ? '；学时已同步到课程总览' : ''}`
     );
   } catch {
     /* 请求层已弹后端原话（40902 重复配置 / 422 等） */
@@ -3718,22 +3747,28 @@ const effectiveRepeatTimes = computed(() => {
   return wt - wf + 1;
 });
 
-/* ---------- 课程配置模式：学时固定，周范围随节奏派生（2026-11-20 业主终口径） ----------
- * 口径：**学时在课程总览（建课第 1 步）设置，配置弹窗只读展示、不再提供输入**。
- *   · 学时 = 课程池 AdminCourseVo.hours（只读）；节次 = ⌈学时 ÷ 2⌉（1 节次 = 2 学时，
- *     与建课向导第 2 步、总节次配置体检同口径）
- *   · 改每周节数 / 起始周 ⇒ 结束周 = 起始周 + ⌈节次 ÷ 每周节数⌉ − 1 实时重算（学时不动）
- *   · 结束周只读派生，不再提供输入框——学时固定后「改结束周」没有自由度，
- *     之前双向联动的弹回/补满问题整个消失
+/* ---------- 课程配置模式：学时可编辑 + 保存同步总览，周范围随节奏派生（2026-11-20 业主定案） ----------
+ * 口径（业主 11-20 中午改定）：
+ *   · 学时输入框可编辑，初始值 = 课程总览现值，旁边展示「总览原设置 N 学时」作参照；
+ *     保存时若与总览不一致 ⇒ 先 PUT updateCourse 同步回课程总览（失败则整体中止），
+ *     再保存配置，totalLessons = ⌈学时 ÷ 2⌉（1 节次 = 2 学时，与建课向导第 2 步同口径）
+ *   · 改每周节数 / 起始周 / 学时 ⇒ 结束周 = 起始周 + ⌈节次 ÷ 每周节数⌉ − 1 实时重算
+ *   · 结束周只读派生（禁用输入框）——改结束周没有自由度，双向联动的弹回/补满问题不再存在
  *   · 节次铺不进学期窗口（每周节数太少/起始周太靠后）⇒ 红字提示并拦住保存
- *   · 课程没填学时 ⇒ 不派生、拦保存并指路「课程管理 → 编辑」补学时
+ *   · 学时留空 ⇒ 不派生、拦保存
  * ★ 拖拽排课模式（createPresetCell）不参与：那里总课时仍是用户手填，口径不变。 */
 const cfgPerWeek = computed(() => Math.max(1, Math.round(Number(repeatForm.weekly) || 1)));
-/** 课程学时（只读，来自课程总览；0 = 未填） */
-const cfgCourseHours = computed(() => {
+/** 学时输入（2026-11-20 业主终口径：**可编辑**——保存时若与课程总览不一致，同步回课程总览） */
+const cfgHoursInput = ref<number | null>(null);
+/** 课程总览当前学时（只用于展示「总览原设置 N 学时」的参照） */
+const cfgOverviewHours = computed(() => {
   const h = Number(courseById.value.get(String(form.courseId || ''))?.hours ?? 0);
   return Number.isFinite(h) && h > 0 ? Math.round(h) : 0;
 });
+/** 当前生效学时（输入框为空/非法 = 0，不参与派生） */
+const cfgCourseHours = computed(() =>
+  cfgHoursInput.value != null && Number(cfgHoursInput.value) > 0 ? Math.round(Number(cfgHoursInput.value)) : 0
+);
 const cfgHoursKnown = computed(() => cfgCourseHours.value > 0);
 /** 学时换算成节次：1 节次 = 110 分钟 = 2 学时（未填学时 = 0，不参与派生） */
 const cfgLessonCount = computed(() => (cfgHoursKnown.value ? Math.ceil(cfgCourseHours.value / 2) : 0));
@@ -3753,12 +3788,6 @@ const cfgOverflowLessons = computed(() => {
   const wf = Math.max(1, Math.round(Number(repeatForm.weekFrom) || 1));
   const capacity = Math.max(0, cfgWeekTo.value - wf + 1) * cfgPerWeek.value;
   return Math.max(0, cfgLessonCount.value - capacity);
-});
-/** 节次除不尽每周节数时，最后一周实际排几节（0 = 正好满周） */
-const cfgPartialLastWeek = computed(() => {
-  if (cfgLessonCount.value <= 0) return 0;
-  const rem = cfgLessonCount.value % cfgPerWeek.value;
-  return rem === 0 ? 0 : rem;
 });
 /** 已有配置回填期间暂停派生（否则回填出来的原样窗口会被「按课时重算」改掉） */
 const cfgBackfilling = ref(false);
@@ -3791,9 +3820,9 @@ const createWeekRangeError = computed(() => {
 const extraSlots = reactive(Array.from({ length: 4 }, () => ({ weekday: 1, periodNo: 1 })));
 const extraSlotList = computed(() => extraSlots.slice(0, Math.max(0, repeatForm.weekly - 1)));
 /* ---------- 派生执行体 ----------
- * 学时固定（课程总览只读）⇒ 配置模式只剩一个联动方向：改每周节数 / 起始周 ⇒
- * 结束周按「⌈学时÷2⌉ ÷ 每周节数」重算。仍用输入框 @change 直接驱动，不靠 watch。 */
-/** 改每周节数 / 起始周 ⇒ 结束周按固定节次重算（学时来自课程总览，不可改） */
+ * 配置模式只有一个联动方向：改每周节数 / 起始周 / 学时 ⇒ 结束周按「⌈学时÷2⌉ ÷ 每周节数」重算。
+ * 仍用输入框 @change 直接驱动，不靠 watch。 */
+/** 改每周节数 / 起始周 / 学时 ⇒ 结束周按「节次 ÷ 每周节数」重算 */
 function syncCfgWeekToFromLessons() {
   if (createPresetCell.value || cfgBackfilling.value) return;
   const to = cfgWeekTo.value;
@@ -5897,11 +5926,6 @@ watch(
           />
           <span v-if="createPresetCell" class="small muted">大于 1 时可为每节分别选星期</span>
         </div>
-        <div v-if="!createPresetCell" class="small muted" style="width: 100%">
-          上限 {{ weekLessonsMax }} 节（每天 {{ PERIODS.length }} 节次 × 5 个工作日，即整个课表格子数）；
-          学时以课程总览为准（只读），改每周节数或起始周，结束周按「学时 ÷ 2 ÷ 每周节数」自动重算。
-          这里不选上课时间：保存配置后点「自动排课」，系统按教师/教室/班级空闲生成课表
-        </div>
       </el-form-item>
       <el-form-item
         v-for="(s, i) in extraSlotList"
@@ -5956,17 +5980,9 @@ watch(
           <span class="small muted">周（自动算出）</span>
           <span class="small muted" style="margin-left: 8px">上限 {{ createWeekMax }} 周</span>
         </div>
-        <!-- 已有配置提示（2026-11-19 更新口径）：一门课只允许一条配置，教师/班级现在也能改，
-             改动会同步到该课已排课次（业主定案「改配置并同步课表」） -->
-        <div v-if="!createPresetCell && configExisting" class="small muted" style="width: 100%; margin-top: 6px">
-          该课程已有一条配置：本次保存会更新节奏；若改了教师或班级，会一并同步到已排课次
-        </div>
+        <!-- 拖拽模式的重复方式说明（功能性提示，保留）：配置模式的说明显然删掉了 -->
         <div v-if="createPresetCell && repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
           {{ repeatAnchorLabel }} · {{ repeatHint }}
-        </div>
-        <div v-else-if="!createPresetCell" class="small muted" style="width: 100%">
-          学时以课程总览为准（只读）；改每周节数或起始周，结束周自动按「学时 ÷ 2 ÷ 每周节数」重算。
-          自动排课只会把课铺进这个周窗口，窗口外的周次不会排课
         </div>
         <!-- 单双周锚定说明（2026-10-29）：默认按学期起点算奇偶，从哪周排都不错位；
              学期未配开始日期才回退「锚定当前浏览周」，此时才有对调风险（橙色提示去补日期） -->
@@ -5986,27 +6002,28 @@ watch(
           {{ createWeekRangeError }}
         </div>
       </el-form-item>
-      <!-- 学时（2026-11-20 业主终口径）：学时在课程总览（建课第 1 步）设置，这里只读展示不可改；
+      <!-- 学时（2026-11-20 业主终口径）：可编辑；保存时与课程总览不一致会同步回总览。
            节次 = ⌈学时 ÷ 2⌉，结束周按「节次 ÷ 每周节数」自动派生 -->
       <el-form-item v-if="!createPresetCell" label="学时">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
-          <span v-if="cfgHoursKnown" style="font-weight: 600">{{ cfgCourseHours }} 学时</span>
-          <span v-else class="small" style="color: var(--warning, #b45309)">
-            该课程未填学时：请先到「课程管理 → 编辑」补学时，这里才能算出结束周
-          </span>
+          <el-input-number
+            v-model="cfgHoursInput"
+            :min="1"
+            :max="999"
+            :step="1"
+            step-strictly
+            style="width: 130px"
+            @change="syncCfgWeekToFromLessons"
+          />
           <template v-if="cfgHoursKnown">
+            <span class="small muted">= {{ cfgLessonCount }} 节次</span>
+            <span v-if="cfgOverviewHours > 0" class="small muted">总览原设置 {{ cfgOverviewHours }} 学时</span>
             <span v-if="cfgOverflowLessons > 0" class="small" style="color: var(--error, #d92d20)">
-              {{ cfgLessonCount }} 节次在本学期排不下：第 {{ repeatForm.weekFrom }}~{{ cfgWeekTo }} 周最多
-              {{ cfgPerWeek * (cfgWeekTo - repeatForm.weekFrom + 1) }} 节次，还差 {{ cfgOverflowLessons }} 节次——
-              请加大每周节数，或把起始周提前
-            </span>
-            <span v-else class="small muted">
-              = {{ cfgLessonCount }} 节次 ÷ 每周 {{ cfgPerWeek }} 节 ⇒ 第 {{ repeatForm.weekFrom }}~{{ cfgWeekTo }} 周<template
-                v-if="cfgPartialLastWeek > 0"
-                >（第 {{ cfgWeekTo }} 周只排 {{ cfgPartialLastWeek }} 节）</template
-              >
+              第 {{ repeatForm.weekFrom }}~{{ cfgWeekTo }} 周最多排
+              {{ cfgPerWeek * (cfgWeekTo - repeatForm.weekFrom + 1) }} 节次，还差 {{ cfgOverflowLessons }} 节次
             </span>
           </template>
+          <span v-else class="small muted">未填写</span>
         </div>
       </el-form-item>
       <!-- 总课时：仅拖拽排课模式保留输入（课时可小于窗口满额，前满后少） -->
