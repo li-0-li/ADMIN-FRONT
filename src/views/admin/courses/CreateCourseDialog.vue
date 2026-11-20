@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import {
   checkCourseNo,
@@ -8,10 +8,12 @@ import {
   createCourse,
   createOffering,
   nextCourseNo,
+  updateCourse,
   updateOfferingScheduleConfig
 } from '@/api/admin/courses';
 import type { CourseCreateBo } from '@/api/admin/courses';
 import { listClasses, listMajors, listTerms } from '@/api/admin/basicdata';
+import { listPeriods } from '@/api/admin/periods';
 import { listUsers } from '@/api/admin/users';
 import type { Clazz, Major, Term } from '@/types/admin';
 import type { AdminUserVo } from '@/types/admin';
@@ -55,6 +57,14 @@ const visible = computed({
 const step = ref<1 | 2>(1);
 /** step1 成功后持有的课程（step2 的归属）；courseNo 可空 —— 外部入口（详情抽屉）只有 id+名称 */
 const created = ref<{ courseId: string; courseName: string; courseNo?: string } | null>(null);
+/**
+ * 第 2 步回第 1 步改基础信息（2026-11-20 业主：「第二步应当可以返回第一步」）。
+ * ★ 此时课程已经在 step1 落库，再点「创建」会撞编号 ⇒ 这条路径改为 PUT 更新，
+ *   不再 POST。外部入口（props.startCourse）没有第 1 步，不提供返回。
+ */
+const editingBase = ref(false);
+/** 已建课程的原始编号：编号没改就跳过占用预检（自己查自己永远是 40901） */
+const originCourseNo = ref('');
 
 watch(
   () => props.visible,
@@ -67,6 +77,8 @@ watch(
       created.value = null;
       step.value = 1;
     }
+    editingBase.value = false;
+    originCourseNo.value = '';
     courseNoError.value = '';
     joinCodeError.value = '';
     // 每次打开都从「第 1 周起、每周 1 节」起算，避免带上一次填的节奏；
@@ -74,6 +86,7 @@ watch(
     schedForm.weekFrom = 1;
     schedForm.lessonsPerWeek = 1;
     void loadMajors();
+    void loadPeriodsPerDay();
   }
 );
 
@@ -159,6 +172,11 @@ async function onNoBlur() {
     courseNoError.value = '编号格式：2~20 位大写字母/数字/连字符，以字母或数字开头';
     return;
   }
+  // 从第 2 步返回第 1 步改信息：编号没动就跳过预检（原编号本来就占用着）
+  if (editingBase.value && no === originCourseNo.value) {
+    courseNoError.value = '';
+    return;
+  }
   noChecking.value = true;
   try {
     const res = await checkCourseNo('0', no);
@@ -183,22 +201,58 @@ async function submitBase() {
     ElMessage.warning('请先解决课程编号的问题再提交');
     return;
   }
+  const courseNo = baseForm.courseNo.trim().toUpperCase();
+  const courseName = baseForm.courseName.trim();
+  const payload: CourseCreateBo = {
+    ...baseForm,
+    courseNo,
+    courseName,
+    major: baseForm.major?.trim() || undefined,
+    courseType: baseForm.courseType || undefined,
+    description: baseForm.description?.trim() || undefined
+  };
+
+  /* ---- 分支 A：从第 2 步返回改信息（课程已建好）⇒ PUT 更新，不能再 POST ---- */
+  if (editingBase.value && created.value) {
+    if (courseNo !== originCourseNo.value) {
+      try {
+        await ElMessageBox.confirm(
+          `课程编号将从「${originCourseNo.value}」改为「${courseNo}」。编号变更不影响已开的课与课次，但已打印的课表/通知若引用旧编号需留意。确定修改？`,
+          '修改课程编号',
+          { confirmButtonText: '确定修改', cancelButtonText: '取消', type: 'warning' }
+        );
+      } catch {
+        return;
+      }
+    }
+    baseSaving.value = true;
+    try {
+      await updateCourse(created.value.courseId, payload);
+      created.value = { ...created.value, courseName, courseNo };
+      originCourseNo.value = courseNo;
+      editingBase.value = false;
+      step.value = 2;
+      ElMessage.success(`「${courseName}」基础信息已更新`);
+      emit('created');
+    } catch {
+      /* request.ts 已弹后端原话（40901 编号占用 / 422 校验不过等） */
+    } finally {
+      baseSaving.value = false;
+    }
+    return;
+  }
+
+  /* ---- 分支 B：首次建课 ⇒ POST ---- */
   baseSaving.value = true;
   try {
-    const res = await createCourse({
-      ...baseForm,
-      courseNo: baseForm.courseNo.trim().toUpperCase(),
-      courseName: baseForm.courseName.trim(),
-      major: baseForm.major?.trim() || undefined,
-      courseType: baseForm.courseType || undefined,
-      description: baseForm.description?.trim() || undefined
-    });
-    created.value = { courseId: res.courseId, courseName: baseForm.courseName.trim(), courseNo: res.courseNo };
+    const res = await createCourse(payload);
+    created.value = { courseId: res.courseId, courseName, courseNo: res.courseNo };
+    originCourseNo.value = String(res.courseNo ?? courseNo).toUpperCase();
     step.value = 2;
     if (res.duplicateName) {
-      ElMessage.warning(`基础课程已创建，但同校已有同名课程「${baseForm.courseName.trim()}」，请留意区分`);
+      ElMessage.warning(`基础课程已创建，但同校已有同名课程「${courseName}」，请留意区分`);
     } else {
-      ElMessage.success(`基础课程「${baseForm.courseName.trim()}」已创建（${res.courseNo}）`);
+      ElMessage.success(`基础课程「${courseName}」已创建（${res.courseNo}）`);
     }
     emit('created');
   } catch (err) {
@@ -210,6 +264,20 @@ async function submitBase() {
   } finally {
     baseSaving.value = false;
   }
+}
+
+/** 第 2 步 → 第 1 步（只对本次新建流程有效；外部入口没有第 1 步） */
+function backToStep1() {
+  if (!created.value || props.startCourse) return;
+  originCourseNo.value = String(created.value.courseNo ?? baseForm.courseNo ?? '').toUpperCase();
+  editingBase.value = true;
+  step.value = 1;
+}
+
+/** 回第 1 步看了但不想改：直接退回第 2 步（课程已建好，无需任何请求） */
+function cancelEditBase() {
+  editingBase.value = false;
+  step.value = 2;
 }
 
 /* ================= step2：开课信息 ================= */
@@ -273,6 +341,30 @@ const HOURS_PER_PERIOD = 2;
 const schedForm = reactive({
   weekFrom: 1,
   lessonsPerWeek: 1
+});
+
+/* 每周节次上限（2026-11-20 业主质疑「上限为什么是 7 节」）：
+ * 7 是早期随手拍的数，既没有依据，也和智能排课页的 5 对不上。
+ * 真正的物理上限来自排课网格：每天能排的节次数（class_period 启用行数，现网 5 节次/天）
+ * × 一周 5 个工作日 = 25 节次/周；超了就是配置了一条排不下的节奏。
+ * 接口拿不到节次表时按 5 节次/天兜底，与排课页的兜底网格同口径。
+ * 界面上把「每天几节 × 几天」直接写出来，用户可以自己核对，不再是黑盒数字。 */
+const WORKDAYS_PER_WEEK = 5;
+const periodsPerDay = ref(5);
+const maxLessonsPerWeek = computed(() => Math.max(1, periodsPerDay.value * WORKDAYS_PER_WEEK));
+
+async function loadPeriodsPerDay() {
+  try {
+    const res = await listPeriods({ page: 1, pageSize: 20 });
+    const n = (res?.list ?? []).filter((p) => p && p.seq != null).length;
+    if (n > 0) periodsPerDay.value = n;
+  } catch {
+    /* 节次接口不可用：保持 5 节次/天兜底 */
+  }
+}
+
+watch(maxLessonsPerWeek, (m) => {
+  if (schedForm.lessonsPerWeek > m) schedForm.lessonsPerWeek = m;
 });
 
 /** 课程学时：详情抽屉带进来的，或 step1 刚填的（第 2 步只读展示，用于折算节次与结束周） */
@@ -421,7 +513,11 @@ async function submitOffering() {
 /** 标题：外部入口（列表点「未配置」/ 抽屉「新增配置」）直接落在第 2 步，
  *  此时并没有在「新建课程」，标题再说新建会让人以为要重复建课。 */
 const dialogTitle = computed(() => {
-  if (step.value === 1) return '新建课程 · 第 1 步（基础信息）';
+  if (step.value === 1) {
+    return editingBase.value
+      ? `修改基础信息 ·「${created.value?.courseName ?? baseForm.courseName}」`
+      : '新建课程 · 第 1 步（基础信息）';
+  }
   if (!created.value) return '新建课程';
   return props.startCourse
     ? `课程配置 ·「${created.value.courseName}」`
@@ -445,7 +541,13 @@ function close() {
       <div class="step" :class="{ on: step >= 1, done: step > 1 }">1 基础课程</div>
       <div class="step-arrow">→</div>
       <div class="step" :class="{ on: step >= 2 }">2 课程配置</div>
-      <span class="steps-note">两步各自独立提交，第 1 步成功后可直接关闭</span>
+      <span class="steps-note">
+        {{
+          editingBase
+            ? '第 1 步已提交，这里保存是更新这门课，不会重复建课'
+            : '两步各自独立提交，第 1 步成功后可直接关闭'
+        }}
+      </span>
     </div>
 
     <!-- ============ step1 基础信息 ============ -->
@@ -580,14 +682,14 @@ function close() {
                 v-model="schedForm.lessonsPerWeek"
                 class="cfg-num"
                 :min="1"
-                :max="7"
+                :max="maxLessonsPerWeek"
                 controls-position="right"
               />
             </div>
             <div class="cfg-cell">
               <span class="cfg-lab">学时</span>
               <span class="cfg-auto" :class="{ 'cfg-auto-warn': hoursMissing }">
-                <template v-if="!hoursMissing">第 1 步已填 {{ schedPreview.hours }} 学时</template>
+                <template v-if="!hoursMissing">{{ schedPreview.hours }} 学时</template>
                 <template v-else>该课程未填学时</template>
               </span>
             </div>
@@ -610,7 +712,8 @@ function close() {
             </template>
           </div>
           <div class="field-tip">
-            学时取自第 1 步，这里只定「第几周开始、每周几节」，结束周按「学时 ÷ 2 ÷ 每周节次」自动算出；
+            每周节次上限 {{ maxLessonsPerWeek }} 节（每天 {{ periodsPerDay }} 节次 × {{ WORKDAYS_PER_WEEK }} 个工作日）。
+            这里只定「第几周开始、每周几节」，结束周按「学时 ÷ 2 ÷ 每周节次」自动算出；
             这段节奏会随配置一起保存，智能排课即可直接自动排这门课。
           </div>
         </div>
@@ -619,12 +722,14 @@ function close() {
 
     <template #footer>
       <template v-if="step === 1">
-        <el-button @click="close">取消</el-button>
+        <el-button v-if="editingBase" @click="cancelEditBase">不修改，返回第 2 步</el-button>
+        <el-button v-else @click="close">取消</el-button>
         <el-button type="primary" :loading="baseSaving" @click="submitBase">
-          创建基础课程（进入第 2 步）
+          {{ editingBase ? '保存修改（回到第 2 步）' : '创建基础课程（进入第 2 步）' }}
         </el-button>
       </template>
       <template v-else>
+        <el-button v-if="!startCourse" class="footer-back" @click="backToStep1">上一步</el-button>
         <el-button @click="close">完成并关闭</el-button>
         <el-button type="primary" :loading="offerSaving" @click="submitOffering">
           <ZkIcon name="plus" :size="14" style="margin-right: 4px" />保存配置
@@ -669,6 +774,12 @@ function close() {
   display: flex;
   gap: 8px;
   width: 100%;
+}
+/* 第 2 步的「上一步」放左侧，和右侧的「完成并关闭 / 保存配置」分开，
+   避免误点到关闭。dialog footer 是 text-align:right 的块，用 float 才是稳的。 */
+.footer-back {
+  float: left;
+  margin-left: 0;
 }
 .field-error {
   width: 100%;

@@ -1,0 +1,1 @@
+import{r as e}from"./request-vcgxesTQ.js";function t(t){return e({url:`/api/v1/admin/periods`,method:`get`,params:{page:1,pageSize:10,...t},silent:!0})}export{t};
