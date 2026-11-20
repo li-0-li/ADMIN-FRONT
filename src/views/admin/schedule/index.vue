@@ -3063,13 +3063,22 @@ async function loadConfigOffering() {
       if (tc && !form.clazzName) form.clazzName = tc;
       configSnapshot.value = { teacherId: String(form.teacherId || ''), clazzName: String(form.clazzName || '') };
       // 节奏回填：让用户看到现在存的是什么再改
+      // ★ 回填期间暂停「结束周按课时派生」（cfgBackfilling）：否则存量配置里
+      //   「总课时 < 窗口满额」（前满后少）的那种，窗口会被自动收缩成刚好装下课时，
+      //   用户看到的就是一个跟库里不一样的结束周。
+      cfgBackfilling.value = true;
       repeatForm.weekFrom = Number(list[0].weekFrom ?? 1);
       repeatForm.weekly = Math.max(1, Number(list[0].lessonsPerWeek ?? 1));
       if (list[0].weekCount) repeatForm.weekTo = Math.min(createWeekMax.value, repeatForm.weekFrom + Number(list[0].weekCount) - 1);
       if (list[0].totalLessons) repeatForm.total = Number(list[0].totalLessons);
+      await nextTick();
+      cfgBackfilling.value = false;
     }
   } catch {
     /* 查询失败按无配置处理，保存时后端会把重复配置的 40902 拦出来 */
+  } finally {
+    // 查询失败/回填中断也要解除暂停，否则整块联动就此失效
+    cfgBackfilling.value = false;
   }
 }
 
@@ -3081,6 +3090,15 @@ async function submitConfigOnly() {
   }
   if (createWeekRangeError.value) {
     ElMessage.warning(createWeekRangeError.value);
+    return;
+  }
+  // 课程配置模式：结束周已按总课时自动延后；仍排不完说明撞到学期/教学周上限，
+  // 存下去会变成「配置说 32 课时、实际只能排 18 课时」，这里直接拦住。
+  // 放在「选课/选教师」之前：这是纯节奏问题，先让用户把课时改对，别再依次报一串必填。
+  if (cfgOverflowLessons.value > 0) {
+    ElMessage.warning(
+      `总课时 ${cfgTotalLessons.value} 课时在本学期排不下（第 ${repeatForm.weekFrom}~${cfgWeekTo.value} 周最多 ${cfgPerWeek.value * (cfgWeekTo.value - repeatForm.weekFrom + 1)} 课时，还差 ${cfgOverflowLessons.value} 课时）：请减少总课时，或加大每周节数`
+    );
     return;
   }
   if (!form.courseId) {
@@ -3354,12 +3372,11 @@ async function openCreate(
   // 周次区间默认整学期：起点第 1 周、结束周 = 该学期真实周数（#11 上限跟学期走）
   repeatForm.weekFrom = 1;
   repeatForm.weekTo = defaultWeekTo.value;
-  // 每周多节：额外节位给个顺手默认（第 2 节默认排到下一工作日、同时段），并同步总节数满额
+  // 每周多节：额外节位给个顺手默认（第 2 节默认排到下一工作日、同时段）
   for (const s of extraSlots) {
     s.weekday = form.weekday >= 5 ? 1 : form.weekday + 1;
     s.periodNo = form.periodNo;
   }
-  syncRepeatTotal();
   presetCourseId.value = preset.courseId ?? '';
   form.courseId = preset.courseId ?? '';
   // 每次开窗重置「显示全部教师」：上一门课勾过的宽集不该带进下一门课
@@ -3373,6 +3390,15 @@ async function openCreate(
   // 2026-11-17 业主口径：这个弹窗就是「课程配置」——上课时间（第几节 + 具体时段）不在这里选，
   // 由系统自动分配空位；只有从格子拖进来/点进来时落点已定，才沿用格子坐标。
   createPresetCell.value = weekday != null && periodNo != null;
+  // 课程配置模式：每周节次/总课时按当前周窗口重新起算 —— 弹窗是复用的，
+  // 不清会带着上一门课的课时进来（总课时现在是主控值，带错就整段节奏都错）。
+  if (!createPresetCell.value) {
+    repeatForm.weekly = 1;
+    repeatForm.total = Math.max(1, repeatForm.weekTo - repeatForm.weekFrom + 1);
+  }
+  // 必须在 createPresetCell 定下来之后调用：拖拽模式要把总课时同步成满额，
+  // 配置模式 syncRepeatTotal 内部直接 return（总课时是主控值）。
+  syncRepeatTotal();
   createTitle.value = createPresetCell.value
     ? `拖动排课 · 周${CN[(weekday as number) - 1]} ${period?.label ?? ''}`
     : '课程配置';
@@ -3684,6 +3710,32 @@ const effectiveRepeatTimes = computed(() => {
   return wt - wf + 1;
 });
 
+/* ---------- 课程配置模式：周范围 × 总课时实时联动（2026-11-19 业主） ----------
+ * 口径：**总课时是主控值，结束周是派生值**。
+ *   所需周数 = ⌈总课时 ÷ 每周节数⌉；结束周 = 起始周 + 所需周数 − 1
+ * 所以改起始周 / 每周节数 / 总课时，结束周立刻重算 —— 走「向右延后」去容纳课时，
+ * 而不是把总课时砍小（业主原话「周范围变化优先延后」）。
+ * 结束周被学期/教学周上限截断、课时铺不完时给红字并拦住保存。
+ * ★ 拖拽排课模式（createPresetCell）不参与：那里单双周/重复方式参与计算，
+ *   结束周是用户手选的窗口，总课时随窗口满额伸缩（原有口径保持不变）。 */
+const cfgPerWeek = computed(() => Math.max(1, Math.round(Number(repeatForm.weekly) || 1)));
+const cfgTotalLessons = computed(() => Math.max(1, Math.round(Number(repeatForm.total) || 1)));
+/** 铺完这些课时需要几周（不少于 1） */
+const cfgWeeksNeeded = computed(() => Math.max(1, Math.ceil(cfgTotalLessons.value / cfgPerWeek.value)));
+/** 派生结束周（已按学期/教学周上限收敛） */
+const cfgWeekTo = computed(() => {
+  const wf = Math.max(1, Math.round(Number(repeatForm.weekFrom) || 1));
+  return Math.min(createWeekMax.value, wf + cfgWeeksNeeded.value - 1);
+});
+/** 被子学期上限截断后还差多少课时排不下（0 = 装得下） */
+const cfgOverflowLessons = computed(() => {
+  const wf = Math.max(1, Math.round(Number(repeatForm.weekFrom) || 1));
+  const capacity = Math.max(0, cfgWeekTo.value - wf + 1) * cfgPerWeek.value;
+  return Math.max(0, cfgTotalLessons.value - capacity);
+});
+/** 已有配置回填期间暂停派生（否则回填出来的原样窗口会被「按课时重算」改掉） */
+const cfgBackfilling = ref(false);
+
 /** 弹窗可提交性（A4 + #6/#11）：学期必选 + 周起止合法 ⇒ 否则禁用「确定」并给出可读原因。
  *  校验放在前端而不是靠后端：ScheduleCreateBo 没有 weekFrom 字段，后端根本不知道用户填了什么，
  *  逐条铺日期是前端完成的 ⇒ 前端不校验就没人校验。 */
@@ -3707,6 +3759,8 @@ const extraSlots = reactive(Array.from({ length: 4 }, () => ({ weekday: 1, perio
 const extraSlotList = computed(() => extraSlots.slice(0, Math.max(0, repeatForm.weekly - 1)));
 /** 每周节数 / 周次区间变化时，总节数回到满额（用户随后可手动改小） */
 function syncRepeatTotal() {
+  // 课程配置模式：总课时是主控值，改每周节数只让结束周延后（见下方派生 watch）
+  if (!createPresetCell.value) return;
   repeatForm.total = Math.max(1, repeatForm.weekly * effectiveRepeatTimes.value);
 }
 /** 换学期 ⇒ 周次区间重新按新学期收敛（A4 + #11）：学期周数变了，旧的结束周可能越界。
@@ -3720,13 +3774,41 @@ watch(
     syncRepeatTotal();
   }
 );
-/** 周起止手动调整后，总节数不能大于新的满额（否则「前满后少」的提示会算错） */
+/** 拖拽排课模式：周起止手动调整后，总节数不能大于新的满额（否则「前满后少」的提示会算错）。
+ *  课程配置模式不走这里——那里总课时是主控值，由下方派生 watch 反过来延后结束周。 */
 watch(
   () => [repeatForm.weekFrom, repeatForm.weekTo, repeatForm.mode] as const,
   () => {
+    if (!createPresetCell.value) return;
     const full = Math.max(1, repeatForm.weekly * effectiveRepeatTimes.value);
     if (repeatForm.total > full) repeatForm.total = full;
     if (repeatForm.total < 1) repeatForm.total = 1;
+  }
+);
+/** 课程配置模式：起始周 / 每周节数 / 总课时任一变化 ⇒ 结束周实时重算并向右延后。
+ *  「周范围变化优先延后」的落点就在这里：起始周后移、每周节数变小、总课时调大，
+ *  都靠推后结束周来消化，绝不反过来把总课时压小。 */
+watch(
+  () => [repeatForm.weekFrom, repeatForm.weekly, repeatForm.total] as const,
+  () => {
+    if (createPresetCell.value || cfgBackfilling.value) return;
+    const to = cfgWeekTo.value;
+    if (repeatForm.weekTo !== to) repeatForm.weekTo = to;
+  }
+);
+/** 课程配置模式：手改结束周也不允许小于课时所需 —— 直接延后回去并说明原因，
+ *  避免出现「课时填了 32、窗口只留 10 周」这种保存后永远排不完的配置。 */
+watch(
+  () => repeatForm.weekTo,
+  (to) => {
+    if (createPresetCell.value || cfgBackfilling.value) return;
+    const need = cfgWeekTo.value;
+    if (to < need) {
+      repeatForm.weekTo = need;
+      ElMessage.info(
+        `总课时 ${cfgTotalLessons.value} 课时需要 ${cfgWeeksNeeded.value} 周（每周 ${cfgPerWeek.value} 节），结束周已延后到第 ${need} 周`
+      );
+    }
   }
 );
 /** 本次的全部「节位」：第 1 节 = 表单星期/节次，第 2~weekly 节 = extraSlots 前几项 */
@@ -4022,6 +4104,51 @@ function resetPoolPick() {
   for (const e of autoEntries.value) poolPick[e.key] = true;
 }
 
+/* ---------- 逐节单双周（2026-11-19 业主口径）----------
+ * 「该课程的每节课都可以设置单双周」：一门课每周 N 节，第 i 节可以单独定 每周/单周/双周。
+ * 例：每周 2 节，第 1 节每周、第 2 节单周 ⇒ 单周上 2 节、双周只上 1 节。
+ * ★ 取值按签（entry.key）存，长度 = 该课排课设置里的「每周节次」；
+ *   打开弹窗时回填开课记录里上次存的方案（course_offering.week_patterns），不必每轮重选。
+ * ★ 只作用于自动排课；手动拖排/新增课次那边的「单双周重复」是另一套（按课次生成），互不影响。 */
+type WeekPattern = 'all' | 'odd' | 'even';
+const autoPatterns = reactive<Record<string, WeekPattern[]>>({});
+
+/** 该签对应的「每周几节」——自动排课按它铺课，所以单双周也按它给几行 */
+function slotsOf(e: PoolEntry): number {
+  const off = offeringByCourse.value[String(e.courseId)]?.[0];
+  return Math.min(7, Math.max(1, Number(off?.lessonsPerWeek ?? 1)));
+}
+
+/** 打开弹窗时把每张签的单双周补齐 / 回填（长度对齐每周节次） */
+function resetAutoPatterns() {
+  for (const e of autoEntries.value) {
+    const n = slotsOf(e);
+    const off = offeringByCourse.value[String(e.courseId)]?.[0];
+    const stored = String(off?.weekPatterns ?? '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    autoPatterns[e.key] = Array.from({ length: n }, (_, i) => {
+      const v = stored[i];
+      return v === 'odd' || v === 'even' ? (v as WeekPattern) : 'all';
+    });
+  }
+}
+
+/** 行内按钮文案：「每周×2」/「1 节单周」——弹窗里空间有限，只给结论，明细点开看 */
+function patternText(e: PoolEntry) {
+  const arr = autoPatterns[e.key] ?? [];
+  if (!arr.length) return '每周';
+  const odd = arr.filter((v) => v === 'odd').length;
+  const even = arr.filter((v) => v === 'even').length;
+  if (!odd && !even) return `每周×${arr.length}`;
+  const bits: string[] = [];
+  if (odd) bits.push(`${odd} 节单周`);
+  if (even) bits.push(`${even} 节双周`);
+  if (arr.length - odd - even) bits.push(`${arr.length - odd - even} 节每周`);
+  return bits.join('·');
+}
+
 function pickAllEntries(v: boolean) {
   for (const e of autoEntries.value) poolPick[e.key] = v;
 }
@@ -4044,6 +4171,8 @@ function openAuto() {
   autoIncludeScheduled.value = false;
   // 勾选状态也每次重置为「全选」：上一轮手动取消的课不该悄悄影响这一轮
   resetPoolPick();
+  // 单双周按每门课的「每周节次」重建并回填上次方案（2026-11-19）
+  resetAutoPatterns();
   if (!autoEntries.value.length) {
     ElMessage.warning(
       autoNotConfigured.value
@@ -4266,6 +4395,9 @@ async function runAuto() {
           courseId: e.courseId,
           targetClass: entryClass(e).trim() || autoClass.value || undefined,
           preferredClassroomId: autoLockRoomId.value || undefined,
+          // 逐节单双周（2026-11-19）：按「参与排课」里逐课设置传；全每周也要传，
+          // 这样把某门课从「隔周」改回「每周」后重排，后端才会覆盖掉上次存的方案。
+          weekPatterns: autoPatterns[e.key]?.length ? autoPatterns[e.key] : undefined,
           // 只排当前学期（2026-11-13）：不传时后端也会排除已结束学期，但显式传更准
           termId: filters.termId || currentTermId.value || undefined
         });
@@ -5798,7 +5930,8 @@ watch(
           {{ repeatAnchorLabel }} · {{ repeatHint }}
         </div>
         <div v-else-if="!createPresetCell" class="small muted" style="width: 100%">
-          自动排课只会把课铺进这个周窗口；窗口外的周次不会排课
+          结束周随「总课时 ÷ 每周节数」实时延后：先把总课时填够，周范围会自己往后让开；
+          自动排课只会把课铺进这个周窗口，窗口外的周次不会排课
         </div>
         <!-- 单双周锚定说明（2026-10-29）：默认按学期起点算奇偶，从哪周排都不错位；
              学期未配开始日期才回退「锚定当前浏览周」，此时才有对调风险（橙色提示去补日期） -->
@@ -5819,19 +5952,37 @@ watch(
         </div>
       </el-form-item>
       <!-- 总课时（2026-11-13 业主反馈：「总节数」改叫「总课时」——录音口径「一共多少课时」）
-           满额可改小 —— 不够分时从最后一周往前少排（前满后少） -->
+           ★ 2026-11-19 课程配置模式：总课时是主控值 —— 填多少，结束周就按「课时 ÷ 每周节数」
+             向右延后到刚好装下，而不是反过来把课时压在窗口容量内（业主：周范围变化优先延后）。 -->
       <el-form-item v-if="!createPresetCell || repeatForm.mode !== 'once'" label="总课时">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
           <el-input-number
             v-model="repeatForm.total"
             :min="1"
-            :max="repeatForm.weekly * effectiveRepeatTimes"
+            :max="createPresetCell ? repeatForm.weekly * effectiveRepeatTimes : cfgPerWeek * createWeekMax"
             style="width: 130px"
           />
-          <span v-if="repeatForm.total < repeatForm.weekly * effectiveRepeatTimes" class="small" style="color: var(--warning, #b45309)">
-            不足满额 {{ repeatForm.weekly * effectiveRepeatTimes }} 课时：从最后一周往前少排（前满后少）
-          </span>
-          <span v-else class="small muted">共 {{ repeatForm.weekly * effectiveRepeatTimes }} 课时（每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 周）</span>
+          <!-- 拖拽排课：保持原口径（课时可小于窗口满额，前满后少） -->
+          <template v-if="createPresetCell">
+            <span v-if="repeatForm.total < repeatForm.weekly * effectiveRepeatTimes" class="small" style="color: var(--warning, #b45309)">
+              不足满额 {{ repeatForm.weekly * effectiveRepeatTimes }} 课时：从最后一周往前少排（前满后少）
+            </span>
+            <span v-else class="small muted">共 {{ repeatForm.weekly * effectiveRepeatTimes }} 课时（每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 周）</span>
+          </template>
+          <!-- 课程配置：实时算给用户看「这些课时需要几周、铺到第几周」 -->
+          <template v-else>
+            <span v-if="cfgOverflowLessons > 0" class="small" style="color: var(--error, #d92d20)">
+              第 {{ repeatForm.weekFrom }}~{{ cfgWeekTo }} 周最多排
+              {{ cfgPerWeek * (cfgWeekTo - repeatForm.weekFrom + 1) }} 课时，还差 {{ cfgOverflowLessons }} 课时排不下：
+              请减少总课时，或加大每周节数
+            </span>
+            <span v-else class="small muted">
+              {{ cfgTotalLessons }} 课时 ÷ 每周 {{ cfgPerWeek }} 节 = 需要 {{ cfgWeeksNeeded }} 周 ⇒ 第
+              {{ repeatForm.weekFrom }}~{{ cfgWeekTo }} 周<template v-if="repeatForm.weekTo > cfgWeekTo"
+                >（窗口留到第 {{ repeatForm.weekTo }} 周，多出的周不排课）</template
+              >
+            </span>
+          </template>
         </div>
       </el-form-item>
     </el-form>
@@ -5927,7 +6078,8 @@ watch(
       <div class="detail-row">
         <span class="detail-k">范围</span>
         <div class="small" style="flex: 1; min-width: 0">
-          {{ autoTermRangeLabel }}；每门课按每周 1 次铺满，一门课一次写 <b>{{ termWeekCount }}</b> 条课次
+          {{ autoTermRangeLabel }}；每门课按自己的排课设置铺（每周节次、逐节单双周），
+          「同课同天只排一节」只是优先，排不满时才叠到同一天
         </div>
       </div>
       <!-- 排课规则说明已上移到弹窗开头（紧跟「把待排课程…」那句）：夹在「范围」与「预警」中间会打断信息流 -->
@@ -6002,6 +6154,28 @@ watch(
                 }"
               >{{ e.courseName }}</span>
               <span v-if="e.inSchedule" class="badge badge-warning" style="flex: none">已在课表</span>
+              <!-- 逐节单双周（2026-11-19）：点开按「第 1 节 / 第 2 节 …」分别设每周-单周-双周 -->
+              <el-popover placement="top-end" :width="250" trigger="click">
+                <template #reference>
+                  <el-button size="small" style="flex: none; min-width: 78px" :disabled="poolPick[e.key] === false">
+                    {{ patternText(e) }}
+                  </el-button>
+                </template>
+                <div class="pat-head">单双周（按每周第几节设）</div>
+                <div
+                  v-for="(p, i) in autoPatterns[e.key] ?? []"
+                  :key="`pat-${e.key}-${i}`"
+                  class="pat-row"
+                >
+                  <span class="small">第 {{ i + 1 }} 节</span>
+                  <el-select v-model="autoPatterns[e.key][i]" size="small" style="width: 96px">
+                    <el-option label="每周" value="all" />
+                    <el-option label="单周" value="odd" />
+                    <el-option label="双周" value="even" />
+                  </el-select>
+                </div>
+                <div class="pat-tip">单周 = 第 1/3/5… 周，双周 = 第 2/4/6… 周（按学期起点算）</div>
+              </el-popover>
               <el-select
                 v-model="poolClazz[e.key]"
                 size="small"
@@ -6009,7 +6183,7 @@ watch(
                 filterable
                 placeholder="未指定"
                 :disabled="poolPick[e.key] === false"
-                style="width: 148px; flex: none"
+                style="width: 128px; flex: none"
               >
                 <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
               </el-select>
@@ -7596,6 +7770,29 @@ watch(
   color: #3d5573;
   font-size: 12.5px;
   line-height: 1.6;
+}
+
+/* 自动排课弹窗里的「逐节单双周」浮层（2026-11-19）：
+   每行「第 N 节 + 每周/单周/双周」，行距压紧，5 行也不会把浮层撑高 */
+.pat-head {
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1, #1f2937);
+}
+.pat-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.pat-tip {
+  margin-top: 8px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  text-align: left;
+  color: var(--text-3, #6b7280);
 }
 </style>
 

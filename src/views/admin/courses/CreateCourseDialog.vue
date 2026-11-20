@@ -11,9 +11,9 @@ import {
   updateOfferingScheduleConfig
 } from '@/api/admin/courses';
 import type { CourseCreateBo } from '@/api/admin/courses';
-import { listClasses, listTerms } from '@/api/admin/basicdata';
+import { listClasses, listMajors, listTerms } from '@/api/admin/basicdata';
 import { listUsers } from '@/api/admin/users';
-import type { Clazz, Term } from '@/types/admin';
+import type { Clazz, Major, Term } from '@/types/admin';
 import type { AdminUserVo } from '@/types/admin';
 
 /**
@@ -69,10 +69,11 @@ watch(
     }
     courseNoError.value = '';
     joinCodeError.value = '';
-    // 每次打开都从「第 1 周起、每周 1 节、学时取课程本身」起算，避免带上一次填的节奏
+    // 每次打开都从「第 1 周起、每周 1 节」起算，避免带上一次填的节奏；
+    // 学时不再在这里填（2026-11-19 业主：第 1 步填过就不该在第 2 步再填一遍）。
     schedForm.weekFrom = 1;
     schedForm.lessonsPerWeek = 1;
-    schedForm.hours = courseHours.value;
+    void loadMajors();
   }
 );
 
@@ -118,6 +119,17 @@ const baseRules = {
   courseName: [
     { required: true, message: '课程名称不能为空', trigger: 'blur' },
     { max: 100, message: '课程名称不能超过 100 字', trigger: 'blur' }
+  ],
+  /* 学时是第 1 步的必填项（2026-11-19）：第 2 步的「结束周」由它折算，
+     这里不填，第 2 步就只能卡住不给保存，不如在填的时候就拦住。 */
+  hours: [
+    {
+      validator: (_r: unknown, v: number | null, cb: (e?: Error) => void) => {
+        if (v == null || Number(v) <= 0) cb(new Error('请填写学时；排课节奏按「学时 ÷ 2 = 节次」折算'));
+        else cb();
+      },
+      trigger: 'blur'
+    }
   ]
 };
 
@@ -150,7 +162,9 @@ async function onNoBlur() {
   noChecking.value = true;
   try {
     const res = await checkCourseNo('0', no);
-    courseNoError.value = res.available ? '' : `编号 ${no} 已被占用，请更换或重新取号`;
+    courseNoError.value = res.available
+      ? ''
+      : `编号 ${no} 已被占用：若上次只完成了第 1 步，这门课其实已经建好（去课程列表补配置即可）；想新建请换号或点「自动生成」`;
   } catch {
     courseNoError.value = '';
     /* 预检接口挂了不阻断提交：落库还有唯一键双保险，撞键由后端 40901 提示 */
@@ -181,16 +195,18 @@ async function submitBase() {
     });
     created.value = { courseId: res.courseId, courseName: baseForm.courseName.trim(), courseNo: res.courseNo };
     step.value = 2;
-    // 沿用 step1 刚填的学时作为排课节奏的默认总学时（可在这里改）
-    schedForm.hours = courseHours.value;
     if (res.duplicateName) {
       ElMessage.warning(`基础课程已创建，但同校已有同名课程「${baseForm.courseName.trim()}」，请留意区分`);
     } else {
       ElMessage.success(`基础课程「${baseForm.courseName.trim()}」已创建（${res.courseNo}）`);
     }
     emit('created');
-  } catch {
-    /* request.ts 已弹后端原话（40901/42201 等） */
+  } catch (err) {
+    /* request.ts 已弹后端原话；编号冲突再落到字段下方，避免「弹窗一闪而过、不知道错在哪个字段」 */
+    const msg = err instanceof Error ? err.message : String((err as { message?: string })?.message ?? '');
+    if (msg.includes('课程编号') || msg.includes('已被占用') || msg.includes('已存在')) {
+      courseNoError.value = msg;
+    }
   } finally {
     baseSaving.value = false;
   }
@@ -211,6 +227,23 @@ const terms = ref<Term[]>([]);
 const teachers = ref<AdminUserVo[]>([]);
 const clazzes = ref<Clazz[]>([]);
 const optionsLoading = ref(false);
+/** 面向专业（2026-11-19）：改下拉，数据来自基础数据的 major 表；仍允许手填（历史专业名不在表里） */
+const majors = ref<Major[]>([]);
+const majorsLoading = ref(false);
+
+/** 专业列表：第 1 步就要用，所以打开弹窗即拉，不等进第 2 步 */
+async function loadMajors() {
+  if (majorsLoading.value) return;
+  majorsLoading.value = true;
+  try {
+    const res = await listMajors({ page: 1, pageSize: 200 });
+    majors.value = (res?.list ?? []).filter((m) => m.status !== 'disabled');
+  } catch {
+    majors.value = [];
+  } finally {
+    majorsLoading.value = false;
+  }
+}
 
 /** step2 只在持有课程（step1 成功或外部传入）时可用 */
 const canOffer = computed(() => !!created.value?.courseId);
@@ -232,28 +265,29 @@ const offerRules = {
 const HOURS_PER_PERIOD = 2;
 
 /* 2026-11-16 业主：「按学时算」按钮不要，直接输入总学时就行。
- * 排课节奏只留三个可填项 —— 起始周 / 每周节次 / 总学时，其余全部派生：
- *   总节次 = 总学时 ÷ 2（1 节次 = 50 分钟 × 2 + 10 分钟课间 = 2 学时）
+ * 2026-11-19 业主：学时已在第 1 步填过，第 2 步不该再填一遍 ⇒ 这里只读，直接取第 1 步的值。
+ * 排课节奏只留两个可填项 —— 起始周 / 每周节次，其余全部派生：
+ *   总节次 = 学时 ÷ 2（1 节次 = 50 分钟 × 2 + 10 分钟课间 = 2 学时）
  *   结束周 = 起始周 + ⌈总节次 ÷ 每周节次⌉ − 1
- * 这样不用点按钮、也不会出现「填了节次又填周数互相打架」。
- * 学时默认带课程本身的 hours（详情抽屉传入或 step1 刚填），可在此覆盖。 */
+ * 这样不会出现「两个地方填学时、改了一处另一处没跟上」的错配。 */
 const schedForm = reactive({
   weekFrom: 1,
-  lessonsPerWeek: 1,
-  /** 总学时（可编辑；默认取课程学时） */
-  hours: null as number | null
+  lessonsPerWeek: 1
 });
 
-/** 课程学时：详情抽屉带进来的，或 step1 刚填的（仅用于填默认值） */
+/** 课程学时：详情抽屉带进来的，或 step1 刚填的（第 2 步只读展示，用于折算节次与结束周） */
 const courseHours = computed<number | null>(() => {
   const h = props.startCourse?.hours ?? baseForm.hours;
   return h == null || h === ('' as unknown) ? null : Number(h);
 });
 
+/** 外部入口（详情抽屉「为这门课开课」）进来的课可能没填学时 ⇒ 这里只提示，不给在第 2 步补填 */
+const hoursMissing = computed(() => courseHours.value === null || Number(courseHours.value) <= 0);
+
 const schedPreview = computed(() => {
   const perWeek = Math.max(1, Math.floor(Number(schedForm.lessonsPerWeek) || 1));
   const from = Math.max(1, Math.floor(Number(schedForm.weekFrom) || 1));
-  const h = Number(schedForm.hours);
+  const h = Number(courseHours.value);
   const hours = Number.isFinite(h) && h > 0 ? h : null;
   const periods = hours === null ? null : Math.ceil(hours / HOURS_PER_PERIOD);
   const weeks = periods === null ? null : Math.ceil(periods / perWeek);
@@ -337,11 +371,11 @@ async function submitOffering() {
     ElMessage.warning('请先解决加课码的问题再提交');
     return;
   }
-  // 排课节奏：只填「起始周 / 每周节次 / 总学时」，节次数与结束周全由学时派生。
-  // 学时为空 ⇒ 算不出节次，直接拦住（与详情页「修改配置」同口径）。
+  // 排课节奏：学时取第 1 步（只读），这里只校验「能不能算出节次与结束周」。
+  // 学时为空（外部入口的老课）⇒ 算不出，直接拦住并指路。
   const { hours, periods, weekTo, spanWeeks, perWeek } = schedPreview.value;
   if (hours === null || periods === null || weekTo === null || spanWeeks === null) {
-    ElMessage.warning('排课节奏：请填写本课总学时，系统按「学时 ÷ 2 = 节次」自动排周次');
+    ElMessage.warning('这门课还没填学时，算不出结束周：请先到「课程管理 → 编辑」补学时');
     return;
   }
   offerSaving.value = true;
@@ -439,14 +473,28 @@ function close() {
       <el-form-item label="课程名称" prop="courseName">
         <el-input v-model="baseForm.courseName" placeholder="1~100 字；同名课程允许（会提醒）" />
       </el-form-item>
+      <!-- 面向专业（2026-11-19 业主）：从基础数据的专业表里选，不再手敲。
+           仍开 allow-create：历史课里的专业名可能不在表内，改名/补录时不能被卡住。 -->
       <el-form-item label="面向专业">
-        <el-input v-model="baseForm.major" placeholder="可空" />
+        <el-select
+          v-model="baseForm.major"
+          placeholder="选择专业（可留空）"
+          filterable
+          clearable
+          allow-create
+          default-first-option
+          :loading="majorsLoading"
+          style="width: 100%"
+        >
+          <el-option v-for="(m, i) in majors" :key="m.majorId ?? i" :label="m.name ?? ''" :value="m.name ?? ''" />
+        </el-select>
       </el-form-item>
       <el-form-item label="学分">
         <el-input-number v-model="baseForm.credit" :min="0" :max="9.9" :step="0.5" :precision="1" style="width: 140px" />
       </el-form-item>
-      <el-form-item label="学时">
-        <el-input-number v-model="baseForm.hours" :min="0" :max="999" style="width: 140px" />
+      <el-form-item label="学时" prop="hours">
+        <el-input-number v-model="baseForm.hours" :min="1" :max="999" style="width: 140px" />
+        <div class="field-tip">必填；第 2 步的排课节奏按「学时 ÷ 2 = 节次」折算，不再重复填写</div>
       </el-form-item>
       <el-form-item label="课程类型">
         <el-select v-model="baseForm.courseType" placeholder="可空" clearable style="width: 200px">
@@ -537,15 +585,11 @@ function close() {
               />
             </div>
             <div class="cfg-cell">
-              <span class="cfg-lab">总学时</span>
-              <el-input-number
-                v-model="schedForm.hours"
-                class="cfg-num"
-                :min="2"
-                :max="500"
-                controls-position="right"
-                placeholder="填本课学时"
-              />
+              <span class="cfg-lab">学时</span>
+              <span class="cfg-auto" :class="{ 'cfg-auto-warn': hoursMissing }">
+                <template v-if="!hoursMissing">第 1 步已填 {{ schedPreview.hours }} 学时</template>
+                <template v-else>该课程未填学时</template>
+              </span>
             </div>
             <div class="cfg-cell">
               <span class="cfg-lab">结束周</span>
@@ -555,23 +599,21 @@ function close() {
               </span>
             </div>
           </div>
-          <div class="small" :class="schedPreview.hours === null || schedPreview.overflow ? 'sched-warn' : 'field-tip'">
+          <div class="small" :class="hoursMissing || schedPreview.overflow ? 'sched-warn' : 'field-tip'">
             <template v-if="schedPreview.periods !== null">
               {{ schedPreview.hours }} 学时 = {{ schedPreview.periods }} 节次（1 节次 = 2 学时：50 分钟 × 2 + 10
               分钟课间）；每周 {{ schedPreview.perWeek }} 节 ⇒ 第 {{ schedPreview.from }}~{{ schedPreview.weekTo }} 周，共
               {{ schedPreview.spanWeeks }} 教学周<template v-if="schedPreview.overflow">（超出 30 周上限，已截到第 30 周；请加每周节次）</template>。
             </template>
-            <template v-else>请填写本课总学时，节次数与结束周会自动算出来。</template>
+            <template v-else>
+              该课程还没填学时，算不出结束周。请到「课程管理 → 编辑」补上学时后，再回来配排课节奏。
+            </template>
           </div>
           <div class="field-tip">
-            结束周与节次数由「总学时 ÷ 2 ÷ 每周节次」自动算出，不用手填；这段节奏会随配置一起保存，智能排课即可直接自动排这门课。
+            学时取自第 1 步，这里只定「第几周开始、每周几节」，结束周按「学时 ÷ 2 ÷ 每周节次」自动算出；
+            这段节奏会随配置一起保存，智能排课即可直接自动排这门课。
           </div>
         </div>
-      </el-form-item>
-      <!-- 教学大纲不在这里填：它是「认证材料」里的一类，由教师在自己端上传，
-           管理端只做配置（学期/教师/班级/加课码/周数），不代填教学材料。 -->
-      <el-form-item label="教学材料">
-        <span class="field-tip">说课视频、教学教案、教学进度表、教学大纲由教师在教师端上传，此处不填</span>
       </el-form-item>
     </el-form>
 
@@ -696,6 +738,12 @@ function close() {
   color: var(--text, #344054);
   white-space: nowrap;
   overflow: hidden;
+}
+/* 学时缺失（外部入口进来的老课）——用警示色，和「待填学时」的灰提示区分开 */
+.cfg-auto-warn {
+  border-color: var(--warn-300, #f0c36d);
+  background: var(--warn-50, #fffaf0);
+  color: var(--warn-700, #8a6116);
 }
 /* 节次数与周跨度对不上时的提示（只提示不阻断，与详情页同口径） */
 .sched-warn {

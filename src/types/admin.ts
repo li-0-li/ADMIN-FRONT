@@ -637,6 +637,11 @@ export interface AdminOfferingVo {
   lessonsPerWeek?: number | null;
   /** 一共多少课时（节次口径；null = 按周数×每周节次自然铺满） */
   totalLessons?: number | null;
+  /**
+   * 逐节单双周（2026-11-19）：逗号分隔的 all/odd/even，第 i 项 = 每周第 i 节。
+   * 例："all,odd" = 每周 2 节，第 1 节每周、第 2 节只有单周。null/空 = 全部每周。
+   */
+  weekPatterns?: string | null;
   /** 排课节奏是否已配置（0=未配置，不可参与自动排课；1=已配置） */
   scheduleConfigured?: number | null;
   /** active 进行中 / archived 已归档 */

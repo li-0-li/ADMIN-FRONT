@@ -139,6 +139,27 @@ function isChoice(qType: string) {
   return qType === 'single' || qType === 'multi';
 }
 
+/** 难度短标签：列表列宽有限，不用「3 · 中等」这种长文案 */
+const DIFF_SHORT: Record<number, string> = { 1: '很易', 2: '较易', 3: '中等', 4: '较难', 5: '很难' };
+function diffShort(d?: number | null) {
+  const n = Number(d);
+  return DIFF_SHORT[n] ?? '—';
+}
+
+/** 难度档位给颜色用（1-2 绿 / 3 蓝 / 4-5 橙红），脏值一律按中等 */
+function diffLevel(d?: number | null) {
+  const n = Number(d);
+  if (!n || n < 1 || n > 5) return 3;
+  return n;
+}
+
+/** 选项文字摘要：参考答案那一行要显示"A · 选项内容"，太长会撑破弹窗 */
+function optBrief(t?: string | null) {
+  const s = String(t ?? '').replace(/\s+/g, ' ').trim();
+  if (!s) return '（未填内容）';
+  return s.length > 16 ? `${s.slice(0, 16)}…` : s;
+}
+
 /* ---------------- 详情 ---------------- */
 const detailVisible = ref(false);
 const detailLoading = ref(false);
@@ -421,64 +442,97 @@ onMounted(async () => {
       <el-button class="tb-icon" :loading="loading" title="刷新列表（保留当前筛选）" @click="fetchList">
         <ZkIcon v-if="!loading" name="refresh-cw" :size="15" />
       </el-button>
-      <span class="small muted">题库挂基础课程，与学期无关</span>
+      <div class="tb-hint">
+        <span class="tb-hint-main">题库挂基础课程</span>
+        <span class="tb-hint-sub">与学期无关，换课程即换题目</span>
+      </div>
     </div>
-    <div class="right" style="gap: 10px">
+    <div class="right">
       <el-select
         v-model="courseId"
         placeholder="选择课程"
         filterable
         :loading="courseLoading"
-        style="width: 220px"
+        class="w-course"
         @change="onCourseChange"
       >
         <el-option v-for="c in courseOptions" :key="c.courseId" :label="c.courseName || c.courseId" :value="String(c.courseId)" />
       </el-select>
-      <el-select v-model="query.qType" placeholder="全部题型" clearable style="width: 120px" @change="onSearch">
+      <el-select v-model="query.qType" placeholder="全部题型" clearable class="w-sm" @change="onSearch">
         <el-option v-for="t in Q_TYPES" :key="t.value" :label="t.label" :value="t.value" />
       </el-select>
-      <el-select v-model="query.difficulty" placeholder="全部难度" clearable style="width: 120px" @change="onSearch">
+      <el-select v-model="query.difficulty" placeholder="全部难度" clearable class="w-sm" @change="onSearch">
         <el-option v-for="d in DIFFICULTY_OPTIONS" :key="d.value" :label="d.label" :value="d.value" />
       </el-select>
       <el-input
         v-model="query.keyword"
         placeholder="题干关键词"
         clearable
-        style="width: 180px"
+        class="w-key"
         @keyup.enter="onSearch"
         @clear="onSearch"
       />
-      <el-button @click="onSearch">搜索</el-button>
-      <el-button v-if="hasFilter" link @click="resetQuery">清空条件</el-button>
+      <el-button class="tb-btn" type="primary" @click="onSearch">
+        <ZkIcon name="search" :size="15" style="margin-right: 4px" />搜索
+      </el-button>
+      <el-button class="tb-btn tb-btn-reset" :disabled="!hasFilter" @click="resetQuery">
+        <ZkIcon name="undo-2" :size="15" style="margin-right: 4px" />重置
+      </el-button>
     </div>
   </div>
 
-  <div class="card card-pad">
+  <div class="card">
+    <!-- 卡头：只讲"这块是什么、现在是不是筛选态"，条数统一放到页脚，避免同一个数字出现两次 -->
+    <div class="list-head">
+      <span class="lh-title">题目列表</span>
+      <span class="small muted">{{ hasFilter ? '已按条件筛选' : '显示该课程全部题目' }}</span>
+    </div>
+
     <el-table
       v-loading="loading"
       :data="rows"
-      size="small"
       style="width: 100%"
       :row-key="(r: QuestionVo) => r.questionId"
     >
-      <el-table-column label="题干" min-width="320" show-overflow-tooltip>
-        <template #default="{ row }">{{ contentBrief(row.content) }}</template>
-      </el-table-column>
-      <el-table-column label="题型" width="96">
+      <el-table-column type="index" label="#" width="48" :index="(i: number) => (query.page - 1) * query.pageSize + i + 1" />
+      <el-table-column label="题干" min-width="300" show-overflow-tooltip>
         <template #default="{ row }">
-          <span class="q-tag">{{ qTypeLabel(row.qType) }}</span>
+          <span :class="{ 'q-empty': !String(row.content ?? '').trim() }">{{ contentBrief(row.content) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="难度" width="100">
-        <template #default="{ row }">{{ difficultyLabel(row.difficulty) }}</template>
+      <el-table-column label="题型" width="104">
+        <template #default="{ row }">
+          <span class="q-badge" :class="`qb-${row.qType}`">{{ qTypeLabel(row.qType) }}</span>
+        </template>
       </el-table-column>
-      <el-table-column label="默认分值" width="92" align="right">
-        <template #default="{ row }">{{ row.defaultScore ?? '—' }}</template>
+      <el-table-column label="难度" width="124">
+        <template #default="{ row }">
+          <div class="diff" :title="difficultyLabel(row.difficulty)">
+            <i
+              v-for="i in 5"
+              :key="i"
+              :class="[{ on: i <= diffLevel(row.difficulty) }, `dl-${diffLevel(row.difficulty)}`]"
+            />
+            <span class="diff-txt">{{ diffShort(row.difficulty) }}</span>
+          </div>
+        </template>
       </el-table-column>
-      <el-table-column label="创建时间" width="160">
-        <template #default="{ row }">{{ row.createTime || '—' }}</template>
+      <el-table-column label="默认分值" width="88" align="right">
+        <template #default="{ row }">
+          <span v-if="row.defaultScore != null" class="score">{{ row.defaultScore }}<em>分</em></span>
+          <span v-else class="muted">—</span>
+        </template>
       </el-table-column>
-      <el-table-column label="操作" :width="canEdit || canRemove ? 150 : 80" fixed="right">
+      <!-- 只显示日期：题库的"创建时间"精确到分没有决策价值，但 16 字符会把 1280 下的题干挤没；
+           完整时间挂在 title 上，需要时悬停可看 -->
+      <el-table-column label="创建时间" width="118">
+        <template #default="{ row }">
+          <span class="small muted" :title="row.createTime || ''">{{ (row.createTime || '').slice(0, 10) || '—' }}</span>
+        </template>
+      </el-table-column>
+      <!-- 142 = 三个 30px 文字按钮 + 两道 12px 间距 + 单元格左右 padding；
+           给窄了 el-table 会在单元格里出省略号，把「删除」吃掉 -->
+      <el-table-column label="操作" class-name="q-op" :width="canEdit || canRemove ? 142 : 76" fixed="right">
         <template #default="{ row }">
           <el-button link size="small" @click="openDetail(row)">查看</el-button>
           <el-button v-if="canEdit" link size="small" @click="openEdit(row)">编辑</el-button>
@@ -488,7 +542,7 @@ onMounted(async () => {
 
       <template #empty>
         <div class="empty-block">
-          <ZkIcon name="file-text" :size="26" />
+          <ZkIcon name="file-text" :size="24" />
           <div class="empty-title">
             {{ !courseId ? '先选一门课程' : loadError ? '数据未取到' : hasFilter ? '当前筛选下没有题目' : '这门课还没有题目' }}
           </div>
@@ -500,13 +554,17 @@ onMounted(async () => {
           <div class="empty-actions">
             <el-button v-if="loadError" size="small" @click="fetchList">重新加载</el-button>
             <el-button v-else-if="hasFilter" size="small" @click="resetQuery">清空筛选</el-button>
-            <el-button v-else-if="courseId && canAdd" size="small" @click="openCreate">新增题目</el-button>
+            <el-button v-else-if="courseId && canAdd" size="small" type="primary" plain @click="openCreate">新增题目</el-button>
           </div>
         </div>
       </template>
     </el-table>
 
-    <div class="pager">
+    <div class="between list-foot">
+      <span class="small muted">
+        <template v-if="loadError">记录数未取到（加载失败）</template>
+        <template v-else>共 {{ total }} 道题{{ hasFilter ? '（已筛选）' : '' }}</template>
+      </span>
       <el-pagination
         v-model:current-page="query.page"
         v-model:page-size="query.pageSize"
@@ -534,15 +592,17 @@ onMounted(async () => {
       </el-form-item>
 
       <el-form-item label="难度 / 分值">
-        <el-select v-model="form.difficulty" style="width: 130px">
-          <el-option v-for="d in DIFFICULTY_OPTIONS" :key="d.value" :label="d.label" :value="d.value" />
-        </el-select>
-        <span class="small muted" style="margin: 0 8px">默认分值</span>
-        <el-input-number v-model="form.defaultScore" :min="0" :max="100" :step="1" style="width: 110px" />
+        <div class="row2">
+          <el-select v-model="form.difficulty" style="width: 132px">
+            <el-option v-for="d in DIFFICULTY_OPTIONS" :key="d.value" :label="d.label" :value="d.value" />
+          </el-select>
+          <span class="row2-sep">默认分值</span>
+          <el-input-number v-model="form.defaultScore" :min="0" :max="100" :step="1" style="width: 120px" />
+        </div>
       </el-form-item>
 
       <el-form-item label="题干" prop="content">
-        <el-input v-model="form.content" type="textarea" :rows="3" maxlength="5000" show-word-limit placeholder="题目内容" />
+        <el-input v-model="form.content" type="textarea" :rows="4" maxlength="5000" show-word-limit placeholder="题目内容，可换行" />
       </el-form-item>
 
       <!-- 选择题选项：动态表单，不让人手填 JSON -->
@@ -564,13 +624,18 @@ onMounted(async () => {
       <!-- 答案：形态随题型变 -->
       <el-form-item label="参考答案">
         <template v-if="form.qType === 'single'">
-          <el-radio-group v-model="form.answer">
-            <el-radio v-for="o in form.options" :key="o.key" :value="o.key">{{ o.key }}</el-radio>
+          <!-- 带上选项内容：只看 A/B 得回头核对上面填了什么，容易选错 -->
+          <el-radio-group v-model="form.answer" class="ans-group">
+            <el-radio v-for="o in form.options" :key="o.key" :value="o.key">
+              <span class="ans-label"><b>{{ o.key }}.</b>{{ optBrief(o.text) }}</span>
+            </el-radio>
           </el-radio-group>
         </template>
         <template v-else-if="form.qType === 'multi'">
-          <el-checkbox-group v-model="multiAnswerKeys">
-            <el-checkbox v-for="o in form.options" :key="o.key" :value="o.key">{{ o.key }}</el-checkbox>
+          <el-checkbox-group v-model="multiAnswerKeys" class="ans-group">
+            <el-checkbox v-for="o in form.options" :key="o.key" :value="o.key">
+              <span class="ans-label"><b>{{ o.key }}.</b>{{ optBrief(o.text) }}</span>
+            </el-checkbox>
           </el-checkbox-group>
         </template>
         <template v-else-if="form.qType === 'judge'">
@@ -616,42 +681,56 @@ onMounted(async () => {
   </el-dialog>
 
   <!-- 详情 -->
-  <el-dialog v-model="detailVisible" title="题目详情" width="640px">
-    <div v-loading="detailLoading">
+  <el-dialog v-model="detailVisible" title="题目详情" width="660px">
+    <div v-loading="detailLoading" class="detail">
       <template v-if="detail">
-        <div class="detail-row">
-          <span class="detail-k">题型</span>
-          <span>{{ qTypeLabel(detail.qType) }}　·　难度 {{ difficultyLabel(detail.difficulty) }}　·　默认分值 {{ detail.defaultScore ?? '—' }}</span>
+        <!-- 一行元信息：题型徽标 + 难度刻度 + 分值 + 创建时间，替代原来「题型　·　难度 X　·　分值」的密集长句 -->
+        <div class="detail-meta">
+          <span class="q-badge" :class="`qb-${detail.qType}`">{{ qTypeLabel(detail.qType) }}</span>
+          <div class="diff" :title="difficultyLabel(detail.difficulty)">
+            <i
+              v-for="i in 5"
+              :key="i"
+              :class="[{ on: i <= diffLevel(detail.difficulty) }, `dl-${diffLevel(detail.difficulty)}`]"
+            />
+            <span class="diff-txt">{{ diffShort(detail.difficulty) }}</span>
+          </div>
+          <span class="meta-item">默认分值 <b>{{ detail.defaultScore ?? '—' }}</b></span>
+          <span class="meta-item">创建于 <b>{{ (detail.createTime || '').slice(0, 16) || '—' }}</b></span>
         </div>
-        <div class="detail-row">
-          <span class="detail-k">题干</span>
-          <span class="detail-v">{{ detail.content }}</span>
+
+        <div class="sec">
+          <div class="sec-k">题干</div>
+          <div class="sec-v">{{ detail.content || '—' }}</div>
         </div>
-        <div v-if="safeOptions(detail).length" class="detail-row">
-          <span class="detail-k">选项</span>
-          <span class="detail-v">
-            <div v-for="o in safeOptions(detail)" :key="o.key">{{ o.key }}. {{ o.text }}</div>
-          </span>
+
+        <div v-if="safeOptions(detail).length" class="sec">
+          <div class="sec-k">选项</div>
+          <div class="sec-v opt-view">
+            <div v-for="o in safeOptions(detail)" :key="o.key" class="opt-view-row">
+              <span class="opt-letter">{{ o.key }}</span>
+              <span class="opt-text">{{ o.text || '（空）' }}</span>
+            </div>
+          </div>
         </div>
-        <div v-else-if="isChoice(detail.qType)" class="detail-row">
-          <span class="detail-k">选项</span>
-          <span class="detail-v muted">库里没有可用选项数据（可能保存时为空或解析失败）</span>
+        <div v-else-if="isChoice(detail.qType)" class="sec">
+          <div class="sec-k">选项</div>
+          <div class="sec-v muted">库里没有可用选项数据（可能保存时为空或解析失败）</div>
         </div>
-        <div class="detail-row">
-          <span class="detail-k">答案</span>
-          <span class="detail-v">{{ detail.answer || '—' }}</span>
+
+        <div class="sec">
+          <div class="sec-k">答案</div>
+          <div class="sec-v answer-box">{{ detail.answer || '—' }}</div>
         </div>
-        <div v-if="detail.analysis" class="detail-row">
-          <span class="detail-k">解析</span>
-          <span class="detail-v">{{ detail.analysis }}</span>
+
+        <div v-if="detail.analysis" class="sec">
+          <div class="sec-k">解析</div>
+          <div class="sec-v">{{ detail.analysis }}</div>
         </div>
-        <div v-if="detail.judgeConfig" class="detail-row">
-          <span class="detail-k">判题配置</span>
-          <span class="detail-v mono">{{ JSON.stringify(detail.judgeConfig) }}</span>
-        </div>
-        <div class="detail-row">
-          <span class="detail-k">创建时间</span>
-          <span>{{ detail.createTime || '—' }}</span>
+
+        <div v-if="detail.judgeConfig" class="sec">
+          <div class="sec-k">判题配置</div>
+          <div class="sec-v"><pre class="code-block">{{ JSON.stringify(detail.judgeConfig, null, 2) }}</pre></div>
         </div>
       </template>
     </div>
@@ -662,14 +741,210 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.q-tag {
-  display: inline-block;
-  padding: 1px 8px;
-  border-radius: 999px;
-  background: var(--brand-50, #eef2ff);
-  color: var(--brand-700, #4338ca);
+/* ---------- 工具栏 ----------
+ * 右侧控件固定一档：课程 200 / 题型·难度 120 / 关键词 180 / 搜索·重置 76。
+ * 题库页筛选项比别的页多一个「课程」，窄屏必须允许换行，否则整页出横向滚动条。 */
+.toolbar {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+.toolbar .left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.toolbar .right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  row-gap: 8px;
+}
+.toolbar :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+.toolbar :deep(.tb-icon) {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: var(--r-md, 8px);
+  border-color: var(--border-strong, #cbd5e1);
+  color: var(--ink-600, #475569);
+}
+.toolbar :deep(.tb-icon:hover) {
+  border-color: var(--brand-400, #46d6ca);
+  color: var(--brand-700, #0f766e);
+  background: var(--brand-50, #effefb);
+}
+.toolbar :deep(.tb-btn) {
+  height: 32px;
+  min-width: 72px;
+  padding: 0 12px;
+  border-radius: var(--r-md, 8px);
+  font-size: 14px;
+  box-sizing: border-box;
+}
+.toolbar :deep(.tb-btn-reset) {
+  border-color: var(--border-strong, #cbd5e1);
+  color: var(--ink-700, #334155);
+}
+.toolbar :deep(.tb-btn-reset:hover:not(.is-disabled)) {
+  border-color: var(--brand-400, #46d6ca);
+  color: var(--brand-700, #0f766e);
+  background: var(--brand-50, #effefb);
+}
+.toolbar :deep(.w-course) {
+  width: 176px;
+}
+.toolbar :deep(.w-sm) {
+  width: 112px;
+}
+.toolbar :deep(.w-key) {
+  width: 160px;
+}
+/* 左侧提示：课程名在上（用户第一眼要知道在看哪门课），口径说明在下，别和按钮挤成一行 */
+.tb-hint {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+  min-width: 0;
+}
+.tb-hint-main {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-700, #334155);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tb-hint-sub {
   font-size: 12px;
+  color: var(--ink-400, #94a3b8);
+}
+
+/* ---------- 卡片头 / 页脚 ---------- */
+.list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--border, #e3eaec);
+}
+.lh-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink-900, #0f172a);
+}
+.list-foot {
+  padding: 12px 16px;
+  border-top: 1px solid var(--border, #e3eaec);
+}
+
+/* ---------- 表格单元 ---------- */
+/* 题型徽标：6 种题型各一色，扫一眼能分出来；未知题型走中性灰而不是跟着变透明 */
+.q-badge {
+  display: inline-block;
+  padding: 1px 9px;
+  border-radius: var(--r-full, 9999px);
+  font-size: 12px;
+  font-weight: 600;
   line-height: 18px;
+  white-space: nowrap;
+}
+.qb-single {
+  background: var(--brand-50, #effefb);
+  color: var(--brand-700, #0f766e);
+}
+.qb-multi {
+  background: #eef2ff;
+  color: #4338ca;
+}
+.qb-judge {
+  background: var(--warning-soft, #fef3c7);
+  color: var(--warning-strong, #b45309);
+}
+.qb-blank {
+  background: var(--success-soft, #dcfce7);
+  color: var(--success-strong, #15803d);
+}
+.qb-short {
+  background: #f5f3ff;
+  color: #6d28d9;
+}
+.qb-program {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+.q-badge:not(.qb-single):not(.qb-multi):not(.qb-judge):not(.qb-blank):not(.qb-short):not(.qb-program) {
+  background: var(--bg-soft, #f1f5f6);
+  color: var(--ink-600, #475569);
+}
+/* 操作列三个文字按钮必须同排：默认 white-space:normal 会把「删除」挤到第二行，行高直接翻倍 */
+:deep(.q-op .cell) {
+  white-space: nowrap;
+}
+/* 空题干用灰斜体标出来，避免和"题目内容就是空白"混淆 */
+.q-empty {
+  color: var(--ink-400, #94a3b8);
+  font-style: italic;
+}
+
+/* 难度：5 格刻度 + 短文案。用刻度而不是"3 · 中等"，是为了让整列纵向可比 */
+.diff {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.diff i {
+  width: 5px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--border-strong, #cbd5e1);
+  opacity: 0.55;
+}
+.diff i.on {
+  opacity: 1;
+}
+.diff i.on.dl-1,
+.diff i.on.dl-2 {
+  background: var(--success, #16a34a);
+}
+.diff i.on.dl-3 {
+  background: var(--info, #0ea5a0);
+}
+.diff i.on.dl-4,
+.diff i.on.dl-5 {
+  background: var(--warning, #d97706);
+}
+.diff-txt {
+  margin-left: 4px;
+  font-size: 12px;
+  color: var(--ink-500, #64748b);
+}
+.score {
+  font-weight: 600;
+  color: var(--ink-900, #0f172a);
+}
+.score em {
+  margin-left: 2px;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 500;
+  color: var(--ink-400, #94a3b8);
+}
+/* ---------- 新增/编辑弹窗 ---------- */
+.row2 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.row2-sep {
+  font-size: 12px;
+  color: var(--ink-500, #64748b);
 }
 .opt-list {
   width: 100%;
@@ -678,13 +953,54 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 6px;
+  padding: 3px 6px;
+  margin: 0 -6px 4px;
+  border-radius: var(--r-md, 8px);
+}
+.opt-row:hover {
+  background: var(--bg-subtle, #f8fafb);
 }
 .opt-key {
   width: 20px;
-  text-align: center;
+  height: 20px;
+  flex: none;
+  border-radius: var(--r-sm, 4px);
+  background: var(--bg-soft, #f1f5f6);
+  color: var(--ink-600, #475569);
+  font-size: 12px;
   font-weight: 700;
-  color: var(--ink-500, #6b7280);
+  line-height: 20px;
+  text-align: center;
+}
+/* 选项行尾的删除按钮宽度固定：宽度随内容抖动会让上下两个输入框右边框对不齐 */
+.opt-row :deep(.el-button) {
+  width: 24px;
+  padding: 0;
+  flex: none;
+}
+/* 单选题/多选题的答案列成竖排：选项文字一长，横排会挤成两行还看不全 */
+.ans-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+.ans-group :deep(.el-radio),
+.ans-group :deep(.el-checkbox) {
+  margin-right: 0;
+  height: auto;
+  min-height: 26px;
+}
+.ans-label {
+  display: inline-flex;
+  gap: 6px;
+  min-width: 0;
+  white-space: normal;
+  line-height: 1.5;
+}
+.ans-label b {
+  flex: none;
+  color: var(--ink-700, #334155);
 }
 .judge-cfg {
   display: flex;
@@ -692,50 +1008,117 @@ onMounted(async () => {
   gap: 8px;
   flex-wrap: wrap;
 }
-.detail-row {
+/* ---------- 详情弹窗 ----------
+ * 改成「元信息一行 + 分节内容」：题干/选项/答案各占一段，长文本有边界框，
+ * 不再是一条条灰标签 + 虚线，读长题干时不至于分不清哪段是题干哪段是解析。 */
+.detail {
+  min-height: 120px;
+}
+.detail-meta {
   display: flex;
-  gap: 10px;
-  padding: 7px 0;
-  border-bottom: 1px dashed var(--border, #eef0f4);
-  font-size: 13px;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 0 0 12px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border, #e3eaec);
 }
-.detail-row:last-child {
+.meta-item {
+  font-size: 12px;
+  color: var(--ink-500, #64748b);
+}
+.meta-item b {
+  font-weight: 600;
+  color: var(--ink-700, #334155);
+}
+.sec {
+  padding: 10px 0;
+  border-bottom: 1px dashed var(--border, #e3eaec);
+}
+.sec:last-child {
   border-bottom: none;
+  padding-bottom: 0;
 }
-.detail-k {
-  width: 72px;
-  flex: none;
-  color: var(--ink-400, #9aa3b2);
+.sec-k {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-400, #94a3b8);
+  margin-bottom: 5px;
 }
-.detail-v {
-  flex: 1;
-  min-width: 0;
+.sec-v {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--ink-900, #0f172a);
   white-space: pre-wrap;
   word-break: break-word;
 }
-.mono {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
+.opt-view {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  white-space: normal;
+}
+.opt-view-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.opt-letter {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: var(--r-sm, 4px);
+  background: var(--bg-soft, #f1f5f6);
+  color: var(--ink-600, #475569);
   font-size: 12px;
+  font-weight: 700;
+  line-height: 20px;
+  text-align: center;
+}
+.opt-text {
+  flex: 1;
+  min-width: 0;
+}
+/* 答案是这一屏最该被看到的东西 ⇒ 单独给底色，而不是和题干同一种黑字 */
+.answer-box {
+  padding: 8px 12px;
+  border-radius: var(--r-md, 8px);
+  background: var(--brand-50, #effefb);
+  border: 1px solid var(--brand-200, #b2f6ea);
+  color: var(--brand-800, #115e59);
+  font-weight: 600;
+}
+.code-block {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--r-md, 8px);
+  background: var(--bg-soft, #f1f5f6);
+  border: 1px solid var(--border, #e3eaec);
+  font-family: var(--font-mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-700, #334155);
+  overflow: auto;
+  max-height: 220px;
 }
 .empty-block {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
-  padding: 28px 16px;
-  color: var(--ink-400, #9aa3b2);
+  gap: 5px;
+  /* 32px 的纵向留白 + 表格自带的最小高度，空态会撑出半屏白；
+     收到 20px 并给一个 min-height，空表看着是"这块暂时没内容"，不是"页面没加载完" */
+  padding: 20px 16px;
+  min-height: 168px;
+  justify-content: center;
+  color: var(--ink-400, #94a3b8);
 }
 .empty-title {
   font-size: 14px;
   font-weight: 600;
-  color: var(--ink-700, #374151);
+  color: var(--ink-700, #334155);
 }
 .empty-actions {
-  margin-top: 4px;
-}
-.pager {
-  display: flex;
-  justify-content: flex-end;
-  padding-top: 12px;
+  margin-top: 6px;
 }
 </style>

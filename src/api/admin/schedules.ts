@@ -148,6 +148,12 @@ export interface AutoArrangeBody {
   weekdays?: number[];
   periodNos?: string[];
   weekParity?: 'all' | 'odd' | 'even';
+  /**
+   * 逐节单双周（2026-11-19）：每项 all/odd/even，第 i 项 = 每周第 i 节。
+   * 例：每周 2 节 + ['all','odd'] ⇒ 第 1 节每周、第 2 节只有单周。
+   * ★ 不传 = 沿用开课记录里存的方案（`course_offering.week_patterns`）；传了会记回该开课记录。
+   */
+  weekPatterns?: Array<'all' | 'odd' | 'even'>;
   targetClass?: string;
   preferredClassroomId?: string | number;
   /** 只排该学期的开课（2026-11-13）：不传则后端排除已结束学期，避免排进历史学期 */
@@ -220,6 +226,11 @@ export interface OfferingBrief {
   lessonsPerWeek?: number | null;
   /** 一共多少课时（节次口径；null = 按周数×每周节次自然铺满；2026-11-17 配置弹窗回填用） */
   totalLessons?: number | null;
+  /**
+   * 逐节单双周（`course_offering.week_patterns`，2026-11-19）：逗号分隔的 all/odd/even，
+   * 第 i 项 = 每周第 i 节。自动排课弹窗据此回填上次选的隔周方案。
+   */
+  weekPatterns?: string | null;
   /**
    * 这条开课记录是否已保存排课设置（`course_offering.schedule_configured`，1=已配）。
    * ★ 2026-11-16 新增：待排池要判「已配置课程」，光看课程行的 `offeringUnconfigured`
