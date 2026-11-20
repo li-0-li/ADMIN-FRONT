@@ -27,6 +27,12 @@ const props = defineProps<{
   loading: boolean;
   /** 有没有 `admin:users:edit`；没有就只展示，不给一个点了报 403 的按钮 */
   canEdit?: boolean;
+  /**
+   * 所属院系 / 学院名。教师详情自己带（`TeacherProfile.deptName`），
+   * 学生详情接口**不带**这个字段 ⇒ 由父组件把列表行的 `deptName` 传进来，
+   * 否则「编辑里能改学院、详情里却看不到学院」会让人以为没保存上。
+   */
+  deptName?: string | null;
 }>();
 const emit = defineEmits<{ (e: 'saved'): void; (e: 'edit'): void }>();
 
@@ -152,6 +158,7 @@ watch(() => props.userId, () => { termFilter.value = ''; });
           <div class="kv"><span class="k">账号</span><span class="v mono">{{ profile.userName || '—' }}</span></div>
           <div v-if="isTeacher" class="kv"><span class="k">院系</span><span class="v">{{ tProfile?.deptName || '—' }}</span></div>
           <div v-if="isTeacher" class="kv"><span class="k">职称</span><span class="v">{{ tProfile?.jobTitle || '—' }}</span></div>
+          <div v-if="!isTeacher" class="kv"><span class="k">学院</span><span class="v">{{ props.deptName || '未入学院' }}</span></div>
           <div v-if="!isTeacher" class="kv"><span class="k">班级</span><span class="v">{{ sProfile?.className || '未绑定班级' }}</span></div>
           <div class="kv"><span class="k">状态</span><span class="v">{{ statusText(profile.status) }}</span></div>
         </div>

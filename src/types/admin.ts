@@ -61,8 +61,11 @@ export interface UserSaveBo {
   phone?: string;
   roleKeys?: string[];
   /**
-   * 编号 66：后端 mapper 的 `if test="deptId != 0"` 把**显式 null** 落成「清空所属院系」，
-   * 缺省=保持原值。契约里原来只有 `string`，页面无法表达「主动摘掉院系」⇒ 甲本轮故意不提供该项。
+   * 所属院系 / 学院（`sys_user.dept_id`）—— 教师与学生都写这一个字段。
+   * `null` 会被后端 mapper 的 `deptId != 0` 判断落成「清空所属院系」，缺省 = 保持原值，
+   * 所以师生编辑弹窗只在有值时下发，不提供「清空」入口。
+   * 学生传了 `clazzId` 时，`school_id` / `major_id` 由班级覆盖推导；`dept_id` **不会**被覆盖
+   * （后端 `fillDeptFromClazz` 只在 deptId 为空时兜底）⇒ 学院与班级的一致性由前端把关。
    */
   deptId?: string | null;
   userNo?: string;

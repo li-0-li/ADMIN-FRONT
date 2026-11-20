@@ -7,9 +7,17 @@
  * 统一改走账号接口 `PUT /api/v1/admin/users`（UserSaveBo），它才是这些字段的正主：
  *   nickName / phone / email / userNo / remark / deptId / clazzId / roleKeys
  *
- * 两页差异（只差一个归属维度，其余控件与布局完全相同）：
+ * 两页差异（控件与布局相同，只是维度不同）：
  *   教师 → 院系（deptId，若依院系树本校子树）+ 职称（走 profile 端点）+ 可授课程
- *   学生 → 班级（clazzId，后端以班级为准反推学校/专业）
+ *   学生 → 学院（deptId，同一个 sys_dept.dept_id）+ 班级（clazzId，后端以班级为准反推学校/专业）
+ *
+ * ★ 学生「学院」为什么要单独给一个下拉（2026-11-20 业主口径）：
+ *   学生的学院原本只能由班级间接决定（clazz.dept_id）。未分班的学生就完全没有学院，
+ *   转院系也只能靠「先换班」这一个动作。后端 `PUT /admin/users` 本身吃 `deptId`，
+ *   且 `fillDeptFromClazz()` 只在**没传 deptId** 时才用班级兜底（显式传值一律尊重调用方），
+ *   所以前端可以放心独立写它。代价是要自己守住一致性：
+ *     - 选班级 ⇒ 自动把学院回填成该班级的 dept_id（后端不会替你校）；
+ *     - 改学院但班级仍挂在别的院系 ⇒ 保存前拦下来，否则落库就是「人在计科院、班在软件学院」。
  *
  * ★ 三条实测口径（2026-11-20，运行包 app-admin-66a5cb0c）：
  *  1. `clazzId` 传了才写，**传 null 表示「不修改」** ⇒ 学生班级只能换绑，无法清空。
@@ -71,7 +79,7 @@ const form = reactive({
   userNo: '',
   phone: '',
   email: '',
-  /** 教师：所属院系（sys_dept.dept_id） */
+  /** 教师：所属院系；学生：所属学院（都是 sys_user.dept_id） */
   deptId: '' as string,
   /** 学生：所属班级（clazz.clazz_id）；空串 = 该学生未分班 */
   clazzId: '' as string,
@@ -95,7 +103,8 @@ function isTeacherProd() {
 
 /* ---------------- 候选：院系 / 班级 / 课程 ---------------- */
 const deptOptions = ref<{ id: string; name: string }[]>([]);
-const clazzOptions = ref<{ id: string; name: string }[]>([]);
+/** 班级候选带 deptId：学生页要按「学院」过滤，并在选班后反填学院 */
+const clazzOptions = ref<{ id: string; name: string; deptId: string }[]>([]);
 const courseOptions = ref<AdminCourseVo[]>([]);
 /** 候选取不到时置灰下拉并在浮层底部说明，不静默给空下拉（会被读成「库里没有」） */
 const deptFailed = ref(false);
@@ -104,12 +113,23 @@ const courseFailed = ref(false);
 
 /** 院系候选 = 若依院系树里「本校根子树」的节点（与账号管理、师生筛选同一口径） */
 const ROOT_DEPT_ID = '200';
+/** 本校根节点 id（`deptOptionsOf` 算出后写入）：挂在根节点上等于「没有具体院系/学院」 */
+let rootDeptId = ROOT_DEPT_ID;
 function deptOptionsOf(list: DeptNodeVo[]) {
   const self = list.find((d) => String(d.deptId) === ROOT_DEPT_ID);
   const chain = (self?.ancestors ?? '').split(',').map((s) => s.trim()).filter((s) => s && s !== '0');
   const rootId = chain.length ? chain[0] : ROOT_DEPT_ID;
-  return list
-    .filter((d) => String(d.deptId) === rootId || (d.ancestors ?? '').split(',').map((s) => s.trim()).includes(rootId))
+  rootDeptId = rootId;
+  const under = list.filter((d) => {
+    const id = String(d.deptId);
+    // ★ 排除根节点本身：学校根不是「院系」，把它列进下拉会让人把学生挂到学校上，
+    //   那等于没归属到任何学院（院系筛选、按院系统计都会漏人）
+    if (id === rootId) return false;
+    return (d.ancestors ?? '').split(',').map((s) => s.trim()).includes(rootId);
+  });
+  // 只有根节点、还没建任何下属部门时退回根节点，避免下拉直接空掉
+  const picked = under.length ? under : list.filter((d) => String(d.deptId) === rootId);
+  return picked
     .map((d) => ({ id: String(d.deptId), name: d.deptName }))
     .sort((a, b) => a.name.localeCompare(b.name, 'zh'));
 }
@@ -126,16 +146,39 @@ async function loadDepts() {
 
 async function loadClazzes() {
   try {
+    // 一次取 500 条（本校班级量级远低于此），学院筛选在前端做：换学院不必再打一次接口
     const res = await listClasses({ page: 1, pageSize: 500 });
     clazzOptions.value = (res.list ?? []).map((c: Clazz) => ({
       id: String(c.clazzId ?? ''),
-      name: c.clazzName || c.clazzCode || String(c.clazzId ?? '')
+      name: c.clazzName || c.clazzCode || String(c.clazzId ?? ''),
+      deptId: c.deptId ? String(c.deptId) : ''
     }));
     clazzFailed.value = clazzOptions.value.length === 0;
   } catch {
     clazzFailed.value = true;
   }
 }
+
+/** 学生页：班级候选按已选学院过滤；班级自身没登记院系时不过滤掉（宁可多给，不要凭空消失） */
+const clazzChoices = computed(() => {
+  const d = form.deptId;
+  if (!d) return clazzOptions.value;
+  return clazzOptions.value.filter((c) => !c.deptId || c.deptId === d);
+});
+
+/** 选班级后把学院反填成班级所属院系（后端不会替我们校验这两者是否一致） */
+function syncDeptFromClazz() {
+  if (isTeacher.value || !form.clazzId) return;
+  const c = clazzOptions.value.find((x) => x.id === form.clazzId);
+  if (c?.deptId && c.deptId !== form.deptId) form.deptId = c.deptId;
+}
+
+/** 学院与在册班级所属院系不一致：即时提示（保存时同样会拦，这里只是别让人填完才看见） */
+const clazzMismatch = computed(() => {
+  if (isTeacher.value || !form.clazzId || !form.deptId) return false;
+  const c = clazzOptions.value.find((x) => x.id === form.clazzId);
+  return !!c?.deptId && c.deptId !== form.deptId;
+});
 
 async function loadCourses() {
   try {
@@ -212,10 +255,22 @@ async function hydrate() {
     jobs.push(loadDepts());
   } else {
     jobs.push(loadClazzes());
+    jobs.push(loadDepts());
   }
   await Promise.all(jobs);
+  // 候选到手后校正回显：挂在「学校根节点」上的账号等于没有具体院系/学院，
+  // 下拉里也没有这个选项 ⇒ 一律按未选处理（不改就不下发，原值保持不动）
+  if (form.deptId && form.deptId === rootDeptId) form.deptId = '';
+  // 班级候选到手后再补一次反填：打开瞬间 watch 触发时候选还是空的，拿不到 deptId
+  syncDeptFromClazz();
   loading.value = false;
 }
+
+/** 用户在界面上换班 ⇒ 立刻把学院跟着改（避免「改了班、学院还留着旧院系」） */
+watch(
+  () => form.clazzId,
+  () => syncDeptFromClazz()
+);
 
 watch(
   () => props.modelValue,
@@ -228,6 +283,22 @@ watch(
 async function submit() {
   const ok = await formRef.value?.validate().catch(() => false);
   if (!ok || !props.user) return;
+
+  /* 学生：学院与班级必须是同一个院系。后端两个字段各写各的（deptId 直接落 sys_user.dept_id，
+   * clazzId 只推导 school/major），不会替我们校这个一致性 ⇒ 必须在前端拦住，
+   * 否则会落出「人在计科院、班在软件学院」这种谁也解释不清的学籍。 */
+  if (!isTeacher.value && form.clazzId && form.deptId) {
+    const c = clazzOptions.value.find((x) => x.id === form.clazzId);
+    if (c?.deptId && c.deptId !== form.deptId) {
+      const nameOf = (id: string) => deptOptions.value.find((d) => d.id === id)?.name ?? id;
+      ElMessage.warning(
+        `「${c.name}」属于${nameOf(c.deptId)}，与所选学院「${nameOf(form.deptId)}」不一致。` +
+          `请改选本学院的班级，或把学院改回${nameOf(c.deptId)}`
+      );
+      return;
+    }
+  }
+
   const uid = String(props.user.userId);
   saving.value = true;
   try {
@@ -247,9 +318,10 @@ async function submit() {
           ? [...props.user.roleKeys]
           : [isTeacher.value ? 'teacher' : 'student']
     };
-    if (isTeacher.value) {
-      if (form.deptId) payload.deptId = form.deptId;
-    } else if (form.clazzId) {
+    // 学院 / 院系两页都写同一个字段（sys_user.dept_id）。空值不发 = 保持原值；
+    // 学生传空时后端还会按班级兜底（fillDeptFromClazz），不会把 dept_id 落成 NULL。
+    if (form.deptId) payload.deptId = form.deptId;
+    if (!isTeacher.value && form.clazzId) {
       // ★ 只在有值时发：clazzId=null 在后端是「不修改」，发空值既清不掉班、又白写一次
       payload.clazzId = form.clazzId;
     }
@@ -369,23 +441,41 @@ async function submit() {
           </el-form-item>
         </template>
         <template v-else>
+          <el-form-item label="学院">
+            <el-select
+              v-model="form.deptId"
+              filterable
+              :disabled="deptFailed"
+              placeholder="未入学院"
+              style="width: 100%"
+            >
+              <el-option v-for="o in deptOptions" :key="o.id" :label="o.name" :value="o.id" />
+              <template v-if="deptFailed" #footer>
+                <div class="opt-tip">院系候选取不到，可稍后重试或改由基础数据维护</div>
+              </template>
+            </el-select>
+          </el-form-item>
           <el-form-item label="班级">
             <!-- 不做 clearable：后端 clazzId 传空是「不修改」，给了 ✕ 也清不掉，属于假操作 -->
             <el-select
               v-model="form.clazzId"
               filterable
-              :disabled="clazzFailed"
+              :disabled="clazzFailed || (!!form.deptId && !clazzChoices.length)"
               :placeholder="form.clazzId ? '选择班级' : '未分班'"
               style="width: 100%"
             >
-              <el-option v-for="o in clazzOptions" :key="o.id" :label="o.name" :value="o.id" />
+              <el-option v-for="o in clazzChoices" :key="o.id" :label="o.name" :value="o.id" />
               <template v-if="clazzFailed" #footer>
                 <div class="opt-tip">班级候选取不到，可稍后重试或改由基础数据维护</div>
               </template>
+              <template v-else-if="form.deptId && !clazzChoices.length" #footer>
+                <div class="opt-tip">该学院下还没有班级，可先到基础数据里建班</div>
+              </template>
             </el-select>
           </el-form-item>
-          <div class="hint-cell">
-            换绑班级后，学校 / 专业由班级自动推导；本期不支持把学生改成「无班级」。
+          <div class="hint-cell full" :class="{ warn: clazzMismatch }">
+            <template v-if="clazzMismatch">学院与当前班级所属院系不一致，保存会被拦下：请改选本学院的班级，或把学院改回原院系。</template>
+            <template v-else>选班级会自动带出班级所属学院；学院与班级须同属一个院系。学校 / 专业由班级自动推导，本期不支持把学生改成「无班级」。</template>
           </div>
         </template>
 
@@ -447,6 +537,12 @@ async function submit() {
   font-size: 12px;
   line-height: 1.5;
   color: var(--ink-400, #9aa3b2);
+}
+/* 整行说明：跨两列，不再占一个输入位，所以去掉与输入框对齐的底部留白 */
+.hint-cell.full {
+  grid-column: 1 / -1;
+  padding-bottom: 0;
+  margin: -2px 0 14px;
 }
 .cap-item {
   margin-top: 2px;

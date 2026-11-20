@@ -141,6 +141,10 @@ const hasFilter = computed(() => !!query.keyword.trim() || !!query.dim || !!quer
 
 /* ---------------- 详情 ---------------- */
 const selectedUserId = ref('');
+/** 选中行本身：详情要展示「学院」等只存在于列表 VO 的字段（学生 profile 不带 deptName） */
+const selectedRow = computed(
+  () => rows.value.find((r) => String(r.userId) === selectedUserId.value) ?? null
+);
 const detailLoading = ref(false);
 const profile = ref<TeacherProfile | StudentProfile | null>(null);
 const detailError = ref('');
@@ -194,7 +198,7 @@ const editVisible = ref(false);
 const editingRow = ref<AdminUserVo | null>(null);
 
 function openEdit() {
-  const row = rows.value.find((r) => String(r.userId) === selectedUserId.value);
+  const row = selectedRow.value;
   if (!row) {
     ElMessage.warning('先从左列表选一位' + (isTeacher.value ? '教师' : '学生'));
     return;
@@ -335,6 +339,7 @@ onBeforeUnmount(() => {
         :profile="profile"
         :loading="detailLoading"
         :can-edit="canEditUser"
+        :dept-name="selectedRow?.deptName"
         @saved="onSaved"
         @edit="openEdit"
       />
