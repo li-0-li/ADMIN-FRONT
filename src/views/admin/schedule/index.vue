@@ -3742,6 +3742,12 @@ const cfgPartialLastWeek = computed(() => {
 });
 /** 已有配置回填期间暂停派生（否则回填出来的原样窗口会被「按课时重算」改掉） */
 const cfgBackfilling = ref(false);
+/** 「每周节数」上限（2026-11-20 业主：取消写死的 5 节）：
+ *  5 是早期随手拍的数，和建课向导的动态上限对不上。真正的物理上限来自排课网格：
+ *  每天节次数（节次表启用行数，PERIODS 就是主数据源）× 一周 5 个工作日，现网 5×5=25。
+ *  只对「课程配置」模式放开——拖拽模式下每一节都要手选星期，节位选择器只有
+ *  第 1 节 + 4 个备选，超过 5 节的节位没有星期可填，物理上就排不了。 */
+const weekLessonsMax = computed(() => Math.max(1, PERIODS.length) * 5);
 
 /** 弹窗可提交性（A4 + #6/#11）：学期必选 + 周起止合法 ⇒ 否则禁用「确定」并给出可读原因。
  *  校验放在前端而不是靠后端：ScheduleCreateBo 没有 weekFrom 字段，后端根本不知道用户填了什么，
@@ -5872,10 +5878,17 @@ watch(
            全部由自动排课生成；拖拽模式下每节可分别指定星期 -->
       <el-form-item label="每周节数">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center">
-          <el-input-number v-model="repeatForm.weekly" :min="1" :max="5" @change="syncRepeatTotal" style="width: 110px" />
+          <el-input-number
+            v-model="repeatForm.weekly"
+            :min="1"
+            :max="createPresetCell ? 5 : weekLessonsMax"
+            @change="syncRepeatTotal"
+            style="width: 110px"
+          />
           <span v-if="createPresetCell" class="small muted">大于 1 时可为每节分别选星期</span>
         </div>
         <div v-if="!createPresetCell" class="small muted" style="width: 100%">
+          上限 {{ weekLessonsMax }} 节（每天 {{ PERIODS.length }} 节次 × 5 个工作日，即整个课表格子数）；
           这里不选上课时间：保存配置后点「自动排课」，系统按教师/教室/班级空闲生成课表
         </div>
       </el-form-item>
