@@ -577,7 +577,16 @@ async function submitForm() {
     } else if (active.value === 'clazz') {
       formMode.value === 'create' ? await createClazz({ ...form }) : await updateClazz({ ...form });
     } else if (active.value === 'term') {
-      formMode.value === 'create' ? await createTerm({ ...form }) : await updateTerm({ ...form });
+      const body: Record<string, unknown> = { ...form };
+      /* ★ 全局 Jackson 日期格式是 `yyyy-MM-dd HH:mm:ss`（application.yml spring.jackson.date-format），
+       *   而表单/回显口径是纯日期 `2026-08-24` ⇒ 直接发会被 HttpMessageNotReadableException
+       *   拦下，用户看到「请求体格式不正确，请检查 JSON 结构」（2026-11-23 探针逐字段定位：
+       *   只要带 startDate/endDate 就炸，其余字段全好）。提交前补 00:00:00 归一到全局口径。 */
+      for (const k of ['startDate', 'endDate']) {
+        const v = body[k];
+        if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)) body[k] = v + ' 00:00:00';
+      }
+      formMode.value === 'create' ? await createTerm(body as never) : await updateTerm(body as never);
     } else if (active.value === 'room') {
       formMode.value === 'create' ? await createClassroom({ ...form }) : await updateClassroom({ ...form });
     }
