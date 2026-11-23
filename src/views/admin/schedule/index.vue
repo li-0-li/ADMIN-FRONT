@@ -5056,10 +5056,8 @@ watch(
       >
         <ZkIcon name="pencil" :size="16" style="margin-right: 4px" />手动排课
       </button>
-      <button v-if="canAuto" class="btn btn-primary" title="把待排课程自动找空闲时段排入课表" @click="openAuto">
-        <ZkIcon name="zap" :size="16" style="margin-right: 4px" />自动排课
-      </button>
-      <!-- 按班排课（批次5 B-9）：录音「必修课按行政班直接分进去」——选班拉必修课清单，逐门自动排 -->
+      <!-- 按班排课（批次5 B-9）：录音「必修课按行政班直接分进去」——选班拉必修课清单，逐门自动排。
+           2026-11-23 业主：与「自动排课」调换位置（按班排课在前）。 -->
       <button
         v-if="canClazzPool"
         class="btn btn-outline"
@@ -5068,6 +5066,9 @@ watch(
         @click="openClazzPool"
       >
         <ZkIcon name="layers" :size="16" style="margin-right: 4px" />按班排课
+      </button>
+      <button v-if="canAuto" class="btn btn-primary" title="把待排课程自动找空闲时段排入课表" @click="openAuto">
+        <ZkIcon name="zap" :size="16" style="margin-right: 4px" />自动排课
       </button>
     </div>
   </div>
