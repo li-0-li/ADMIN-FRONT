@@ -436,6 +436,18 @@ const OPTION_LOADERS: Record<string, () => Promise<void>> = {
   }
 };
 
+/** 学期总周数 = ⌈(结束 − 开始 + 1天) ÷ 7⌉，由起止日期派生、不落库
+ *  （term 表没有周数列；后端起止日期实返 "2026-08-24 00:00:00"，先截到 YYYY-MM-DD）。
+ *  注意口径：这是「学期一共有多少周」；排课实际能排几周由 系统配置 的
+ *  `teaching.week.count`（教学周上限，当前 18）另管，两者不是一回事。 */
+function weeksBetween(start?: unknown, end?: unknown): number | null {
+  const s = String(start ?? '').slice(0, 10);
+  const e = String(end ?? '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || !/^\d{4}-\d{2}-\d{2}$/.test(e)) return null;
+  const days = Math.round((Date.parse(e) - Date.parse(s)) / 86400000) + 1;
+  return days > 0 ? Math.ceil(days / 7) : null;
+}
+
 type FormField = {
   prop: string;
   label: string;
@@ -516,6 +528,13 @@ const dynamicOptions = (key: 'majors' | 'schools' | 'depts' | 'clazzes') =>
   : key === 'schools' ? schoolOptions.value
   : key === 'depts' ? deptOptions.value
   : clazzOptions.value;
+
+/** 编辑/新增学期时实时显示总周数（改起止日期跟着变；派生值只读，不随表单提交） */
+const termWeeksText = computed(() => {
+  if (active.value !== 'term') return '';
+  const w = weeksBetween(form.startDate, form.endDate);
+  return w == null ? '填好起止日期后自动推算' : `${w} 周`;
+});
 
 async function openCreate() {
   // 关联下拉数据先备齐再开弹窗，避免弹窗里下拉是空的
@@ -704,6 +723,7 @@ const columns = computed<Col[]>(() => {
         { prop: 'code', label: '学期编码' },
         { prop: 'startDate', label: '开始日期' },
         { prop: 'endDate', label: '结束日期' },
+        { prop: 'totalWeeks', label: '总周数', align: 'right', render: r => { const w = weeksBetween(r.startDate, r.endDate); return w == null ? '—' : String(w); } },
         { prop: 'isCurrent', label: '当前学期', align: 'center', render: r => (Number(r.isCurrent) === 1 ? '是' : '否') },
         { prop: 'status', label: '状态', badge: r => statusCls(r.status), render: r => statusLabel(r.status) }
       ];
@@ -994,6 +1014,15 @@ async function exportCsv() {
         <el-input-number v-else-if="f.type === 'number'" v-model="form[f.prop]" style="width: 100%" />
         <el-input v-else v-model="form[f.prop]" />
       </el-form-item>
+      <!-- 学期：起止日期决定总周数，派生展示（只读）。别把它做成可编辑字段——
+           term 表没有这列，真要改就改起止日期；排课能排几周另由 系统配置 的
+           teaching.week.count 管，与这里的学期总周数口径不同 -->
+      <el-form-item v-if="active === 'term'" label="总周数">
+        <div class="term-weeks">
+          <span class="tw-val">{{ termWeeksText }}</span>
+          <span class="tw-tip">由起止日期自动推算（每 7 天 1 周），只读；排课实际可排的教学周上限在「系统配置」里另设</span>
+        </div>
+      </el-form-item>
     </el-form>
     <template #footer>
       <el-button @click="formVisible = false">取消</el-button>
@@ -1003,6 +1032,23 @@ async function exportCsv() {
 </template>
 
 <style scoped>
+/* 学期弹窗「总周数」派生行：主值大一号，说明小字换行 */
+.term-weeks {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.5;
+}
+.term-weeks .tw-val {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink-900, #1f2937);
+}
+.term-weeks .tw-tip {
+  font-size: 12px;
+  color: var(--ink-400, #9aa3b2);
+}
+
 /* 编号 68：EP 分页器「当前页」实测是两层规则叠加——
    ① background-color: var(--el-color-primary)（桥接 = --brand-600 #0d9488）
    ② color: var(--el-pagination-hover-color)（默认又指回 --el-color-primary）
