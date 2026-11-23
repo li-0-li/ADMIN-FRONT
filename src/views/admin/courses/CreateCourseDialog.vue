@@ -14,6 +14,7 @@ import {
 import type { CourseCreateBo } from '@/api/admin/courses';
 import { listClasses, listMajors, listTerms } from '@/api/admin/basicdata';
 import { listPeriods } from '@/api/admin/periods';
+import { getTeachingWeek } from '@/api/admin/config';
 import { listUsers } from '@/api/admin/users';
 import type { Clazz, Major, Term } from '@/types/admin';
 import type { AdminUserVo } from '@/types/admin';
@@ -87,6 +88,7 @@ watch(
     schedForm.lessonsPerWeek = 1;
     void loadMajors();
     void loadPeriodsPerDay();
+    void loadTermWeekMax();
   }
 );
 
@@ -363,6 +365,25 @@ async function loadPeriodsPerDay() {
   }
 }
 
+/**
+ * 学期教学周上界（第几周为止）：`biz_config` teaching.week.from + count − 1，现网 1~18。
+ * ★ 2026-11-23：原本派生一律截到硬编码的第 30 周，64 学时 × 每周 1 节 = 32 周被截成 30 周，
+ * 配出来的教学班在 18 周的学期里根本排不满（还会带着一条 30 周的窗口去自动排课）。
+ * 与智能排课页 `loadCourseWeekWindow` 同口径，读不到就按 18 兜底。
+ */
+const termWeekMax = ref(18);
+
+async function loadTermWeekMax() {
+  try {
+    const res = await getTeachingWeek();
+    const from = Number(res?.weekFrom ?? 1) || 1;
+    const cnt = Number(res?.weekCount ?? termWeekMax.value) || termWeekMax.value;
+    termWeekMax.value = from + cnt - 1;
+  } catch {
+    /* 配置接口不可用：保持 18 兜底 */
+  }
+}
+
 watch(maxLessonsPerWeek, (m) => {
   if (schedForm.lessonsPerWeek > m) schedForm.lessonsPerWeek = m;
 });
@@ -384,7 +405,10 @@ const schedPreview = computed(() => {
   const periods = hours === null ? null : Math.ceil(hours / HOURS_PER_PERIOD);
   const weeks = periods === null ? null : Math.ceil(periods / perWeek);
   const rawTo = weeks === null ? null : from + weeks - 1;
-  const weekTo = rawTo === null ? null : Math.min(rawTo, 30);
+  const weekTo = rawTo === null ? null : Math.min(rawTo, termWeekMax.value);
+  /** 窗口内最多能排的节次 = 周跨度 × 每周节次；小于总节次 ⇒ 这学期排不完 */
+  const capacity = weekTo === null ? null : (weekTo - from + 1) * perWeek;
+  const shortfall = periods === null || capacity === null ? 0 : Math.max(0, periods - capacity);
   return {
     hours,
     perWeek,
@@ -393,8 +417,10 @@ const schedPreview = computed(() => {
     from,
     weekTo,
     spanWeeks: weekTo === null ? null : weekTo - from + 1,
-    /** 算出来的周跨度超出上限 30 周（会被截断 ⇒ 后段节次排不进去） */
-    overflow: rawTo !== null && rawTo > 30
+    capacity,
+    shortfall,
+    /** 算出来的结束周超出本学期教学周边界（会被截断 ⇒ 后段节次排不进去） */
+    overflow: rawTo !== null && rawTo > termWeekMax.value
   };
 });
 
@@ -465,9 +491,16 @@ async function submitOffering() {
   }
   // 排课节奏：学时取第 1 步（只读），这里只校验「能不能算出节次与结束周」。
   // 学时为空（外部入口的老课）⇒ 算不出，直接拦住并指路。
-  const { hours, periods, weekTo, spanWeeks, perWeek } = schedPreview.value;
+  const { hours, periods, weekTo, spanWeeks, perWeek, capacity, shortfall } = schedPreview.value;
   if (hours === null || periods === null || weekTo === null || spanWeeks === null) {
     ElMessage.warning('这门课还没填学时，算不出结束周：请先到「课程管理 → 编辑」补学时');
+    return;
+  }
+  // 节次铺不进本学期：先拦住，否则会存下一条「每周 N 节 × 18 周」根本排不完的配置
+  if (shortfall > 0) {
+    ElMessage.warning(
+      `每周 ${perWeek} 节 × ${spanWeeks} 周（第 ${schedForm.weekFrom}~${weekTo} 周）最多排 ${capacity} 节次，还差 ${shortfall} 节次排不进本学期，请提高每周节次`
+    );
     return;
   }
   offerSaving.value = true;
@@ -498,7 +531,9 @@ async function submitOffering() {
         ? `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}；排课节奏 第 ${schedForm.weekFrom}~${weekTo} 周 · 每周 ${perWeek} 节 · 共 ${periods} 节次（= ${hours} 学时）。排课请到「智能排课」页`
         : `已保存「${created.value.courseName}」的课程配置（${res.termCode}），加课码 ${res.joinCode}；排课节奏未保存，可在课程详情里补`
     );
-    // 一门课只允许一条配置（业主 2026-11-16：「配置完就是配置完了」）：
+    // 一门课可以有多条配置（2026-11-23 放开「只允许一条」）：保存即告知父页面刷新，
+    // 否则从课程详情点「新增教学班」存完，抽屉里还是旧的那一条，看起来像没保存成功。
+    emit('created');
     // 保存即结束直接关窗，不再追问「是否自动排课」——业主 11-16 下午反馈
     // 「点击保存怎么就排课进去了」：配置是配置、排课是排课，两件事分开。
     // 排课只发生在「智能排课」页的显式操作（自动排课 / 手动拖排）。
@@ -701,11 +736,13 @@ function close() {
               </span>
             </div>
           </div>
-          <div class="small" :class="hoursMissing || schedPreview.overflow ? 'sched-warn' : 'field-tip'">
+          <div class="small" :class="hoursMissing || schedPreview.overflow || schedPreview.shortfall > 0 ? 'sched-warn' : 'field-tip'">
             <template v-if="schedPreview.periods !== null">
               {{ schedPreview.hours }} 学时 = {{ schedPreview.periods }} 节次（1 节次 = 2 学时：50 分钟 × 2 + 10
               分钟课间）；每周 {{ schedPreview.perWeek }} 节 ⇒ 第 {{ schedPreview.from }}~{{ schedPreview.weekTo }} 周，共
-              {{ schedPreview.spanWeeks }} 教学周<template v-if="schedPreview.overflow">（超出 30 周上限，已截到第 30 周；请加每周节次）</template>。
+              {{ schedPreview.spanWeeks }} 教学周<template v-if="schedPreview.overflow">（超出本学期第 {{ termWeekMax }} 周边界，已截到第 {{ termWeekMax }} 周）</template>。<template
+                v-if="schedPreview.shortfall > 0"
+                >本学期这个窗口最多排 {{ schedPreview.capacity }} 节次，还差 {{ schedPreview.shortfall }} 节次：请提高每周节次（或把起始周提前）。</template>
             </template>
             <template v-else>
               该课程还没填学时，算不出结束周。请到「课程管理 → 编辑」补上学时后，再回来配排课节奏。

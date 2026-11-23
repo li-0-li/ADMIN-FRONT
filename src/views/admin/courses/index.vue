@@ -8,7 +8,9 @@ import { changeCourseStatus, deleteCourse, exportCourses, getCourse, listCourses
 import type { AdminCourseOrderBy, AdminCourseVo } from '@/api/admin/courses';
 import { getCertDetail } from '@/api/admin/certifications';
 import { autoArrange, listSchedules } from '@/api/admin/schedules';
-import { listTerms } from '@/api/admin/basicdata';
+import { listClasses, listTerms } from '@/api/admin/basicdata';
+import { getTeachingWeek } from '@/api/admin/config';
+import { listUsers } from '@/api/admin/users';
 import { useUserStore } from '@/store/user';
 import type { AdminCourseDetailVo, AdminOfferingVo, CertDetail, CertMaterial } from '@/types/admin';
 import CreateCourseDialog from './CreateCourseDialog.vue';
@@ -120,8 +122,71 @@ const schedCfgForm = reactive({
   weekFrom: 1,
   lessonsPerWeek: 1,
   /** 总学时（可编辑；默认取该配置已有节次×2，否则取课程学时） */
-  hours: null as number | null
+  hours: null as number | null,
+  /**
+   * 授课教师（2026-11-23）：教学班 = 教师 + 班级 + 节奏，三项都要能在这里改。
+   * 后端 schedule-config 的 teacherId 不传 = 不改，所以下面用快照做「只在动过时提交」。
+   */
+  teacherId: '',
+  /** 面向班级（clazzId 字符串数组）：[] = 改成不绑班级（选修课） */
+  clazzIds: [] as string[]
 });
+
+/* ---------- 教学班编辑用的教师 / 班级下拉（惰性加载，只在本页展开编辑时才拉） ---------- */
+const teacherPicker = ref<Array<{ value: string; label: string }>>([]);
+const clazzPicker = ref<Array<{ value: string; label: string }>>([]);
+const pickersLoading = ref(false);
+let pickersLoaded = false;
+
+/**
+ * 学期教学周上界（第几周为止）：`biz_config` teaching.week.from + count − 1，现网 1~18。
+ * 2026-11-23：与建课向导、智能排课页同口径 —— 一律截到硬编码第 30 周的话，
+ * 64 学时 × 每周 1 节会配出一条 30 周的窗口，在 18 周的学期里根本排不满。
+ */
+const termWeekMax = ref(18);
+let termWeekLoaded = false;
+
+async function ensureTermWeekMax() {
+  if (termWeekLoaded) return;
+  termWeekLoaded = true;
+  try {
+    const res = await getTeachingWeek();
+    const from = Number(res?.weekFrom ?? 1) || 1;
+    const cnt = Number(res?.weekCount ?? termWeekMax.value) || termWeekMax.value;
+    termWeekMax.value = from + cnt - 1;
+  } catch {
+    /* 配置接口不可用：保持 18 兜底 */
+  }
+}
+
+/** 拉教师与班级全量选项；失败不阻塞节奏编辑（教师/班级两栏退化成只读文本） */
+async function ensurePickers() {
+  if (pickersLoaded || pickersLoading.value) return;
+  pickersLoading.value = true;
+  try {
+    const [ts, cs] = await Promise.all([
+      listUsers({ roleKey: 'teacher', page: 1, pageSize: 200 }),
+      listClasses({ page: 1, pageSize: 300 })
+    ]);
+    teacherPicker.value = (ts?.list ?? [])
+      .filter(u => u.userId !== undefined && u.userId !== null)
+      .map(u => ({ value: String(u.userId), label: u.nickName || u.username || String(u.userId) }));
+    clazzPicker.value = (cs?.list ?? [])
+      .filter(c => c.clazzId)
+      .map(c => ({ value: String(c.clazzId), label: String(c.clazzName ?? c.clazzId) }));
+    pickersLoaded = teacherPicker.value.length > 0;
+  } catch {
+    /* 请求层已提示；两个下拉留空，保存时不提交教师/班级字段 */
+  } finally {
+    pickersLoading.value = false;
+  }
+}
+
+/** 打开编辑时的教师 / 班级快照：保存时做差集，没动过就不提交（避免无意义覆盖已排课次） */
+const schedCfgTeacherSnapshot = ref('');
+const schedCfgClassSnapshot = ref<string[]>([]);
+/** 库里存的班级名有对不上 id 的（历史占位值 / 班级已删）⇒ 班级改动不可靠，本次不允许改班级 */
+const schedCfgClassUnresolved = ref(false);
 
 /** 表单内实时换算：总学时 → 节次 → 结束周（全部是派生值，不落库） */
 const schedCfgPreview = computed(() => {
@@ -132,7 +197,10 @@ const schedCfgPreview = computed(() => {
   const periods = hours === null ? null : Math.ceil(hours / HOURS_PER_PERIOD);
   const weeks = periods === null ? null : Math.ceil(periods / perWeek);
   const rawTo = weeks === null ? null : from + weeks - 1;
-  const weekTo = rawTo === null ? null : Math.min(rawTo, 30);
+  const weekTo = rawTo === null ? null : Math.min(rawTo, termWeekMax.value);
+  /** 窗口内最多能排的节次 = 周跨度 × 每周节次；小于总节次 ⇒ 这学期排不完 */
+  const capacity = weekTo === null ? null : (weekTo - from + 1) * perWeek;
+  const shortfall = periods === null || capacity === null ? 0 : Math.max(0, periods - capacity);
   return {
     hours,
     perWeek,
@@ -141,8 +209,10 @@ const schedCfgPreview = computed(() => {
     from,
     weekTo,
     spanWeeks: weekTo === null ? null : weekTo - from + 1,
-    /** 算出来的结束周超出 30 周上限（会被截断 ⇒ 后段节次排不进去） */
-    overflow: rawTo !== null && rawTo > 30
+    capacity,
+    shortfall,
+    /** 算出来的结束周超出本学期教学周边界（会被截断 ⇒ 后段节次排不进去） */
+    overflow: rawTo !== null && rawTo > termWeekMax.value
   };
 });
 
@@ -196,13 +266,46 @@ function schedCfgLabel(o: AdminOfferingVo) {
   return `第 ${from}~${from + weeks - 1} 周 · 每周 ${perWeek} 节 · 共 ${total} 节次（= ${total * HOURS_PER_PERIOD} 学时）`;
 }
 
-function openSchedCfg(o: AdminOfferingVo) {
+async function openSchedCfg(o: AdminOfferingVo) {
   schedCfgId.value = o.offeringId;
   schedCfgForm.weekFrom = o.weekFrom ?? 1;
   schedCfgForm.lessonsPerWeek = o.lessonsPerWeek ?? 1;
   // 总学时默认取课程本身的学时（学时是课程权威属性，配置只是把它摊到周次上）；
   // 课程没填学时才用已存配置反推（周跨度 × 每周节次 × 2）。
   schedCfgForm.hours = detailData.value?.hours ?? (o.weekCount ? o.weekCount * (o.lessonsPerWeek ?? 1) * HOURS_PER_PERIOD : null);
+
+  // 教学班 = 教师 + 班级 + 节奏（2026-11-23）：教师与班级也在这里改，保存时一并提交
+  schedCfgForm.teacherId = o.teacherId ? String(o.teacherId) : '';
+  schedCfgTeacherSnapshot.value = schedCfgForm.teacherId;
+  schedCfgForm.clazzIds = [];
+  schedCfgClassSnapshot.value = [];
+  schedCfgClassUnresolved.value = false;
+
+  await Promise.all([ensurePickers(), ensureTermWeekMax()]);
+  // 教师不在 roleKey=teacher 名单里（历史数据/已停用账号）⇒ 补一项，否则下拉显示裸 ID
+  if (schedCfgForm.teacherId && !teacherPicker.value.some(t => t.value === schedCfgForm.teacherId)) {
+    teacherPicker.value = [
+      { value: schedCfgForm.teacherId, label: o.teacherName || `教师 #${schedCfgForm.teacherId}` },
+      ...teacherPicker.value
+    ];
+  }
+  // 库里存的是班级名数组，下拉要的是 clazzId ⇒ 按名字反查（历史占位值先剔掉）
+  const names = (Array.isArray(o.targetClasses) ? o.targetClasses : [])
+    .map(x => String(x ?? '').trim())
+    .filter(x => !isNoClazzName(x));
+  const byName = new Map(clazzPicker.value.map(c => [c.label, c.value]));
+  const ids: string[] = [];
+  for (const n of names) {
+    const id = byName.get(n);
+    if (id) {
+      if (!ids.includes(id)) ids.push(id);
+    } else {
+      // 名字对不上 id（班级被删/改过名）⇒ 本次只读展示，不许提交班级，免得把已绑班级清空
+      schedCfgClassUnresolved.value = true;
+    }
+  }
+  schedCfgForm.clazzIds = ids;
+  schedCfgClassSnapshot.value = [...ids];
 }
 
 /** 当前编辑的这条配置库里存的周跨度（用于提示「保存后会按学时改成几周」） */
@@ -219,15 +322,40 @@ async function saveSchedCfg(o: AdminOfferingVo) {
     ElMessage.warning('请先填写该配置的总学时，节次数与结束周会自动算出');
     return;
   }
+  // 节次铺不进本学期：拦住，否则会存下一条「每周 N 节 × 18 周」根本排不完的配置
+  if (schedCfgPreview.value.shortfall > 0) {
+    ElMessage.warning(
+      `每周 ${lessonsPerWeek} 节 × ${spanWeeks} 周（第 ${weekFrom}~${weekTo} 周）最多排 ${schedCfgPreview.value.capacity} 节次，还差 ${schedCfgPreview.value.shortfall} 节次排不进本学期，请提高每周节次`
+    );
+    return;
+  }
   schedCfgSaving.value = true;
   try {
-    await updateOfferingScheduleConfig(o.offeringId, {
+    // 教学班三项一起提交：节奏必传；教师/班级只在动过时传（后端不传 = 不改，避免无意义覆盖已排课次）
+    const payload: Parameters<typeof updateOfferingScheduleConfig>[1] = {
       weekFrom: schedCfgForm.weekFrom,
       weekCount: spanWeeks,
       lessonsPerWeek,
       totalLessons: periods
-    });
-    ElMessage.success('排课配置已保存，自动排课将按新节奏执行');
+    };
+    const teacherNow = String(schedCfgForm.teacherId || '');
+    const teacherChanged = !!teacherNow && teacherNow !== schedCfgTeacherSnapshot.value;
+    const classNow = [...schedCfgForm.clazzIds].sort();
+    const classBefore = [...schedCfgClassSnapshot.value].sort();
+    const classChanged = classNow.join(',') !== classBefore.join(',');
+    if (classChanged && schedCfgClassUnresolved.value) {
+      ElMessage.warning('这条配置的班级与班级名单对不上（班级可能已被删除或改名），本次未改班级；可到「智能排课」页的课程配置里重新绑定');
+      return;
+    }
+    if (teacherChanged) payload.teacherId = teacherNow;
+    if (classChanged) payload.clazzIds = classNow;
+    const teachingChanged = teacherChanged || classChanged;
+    await updateOfferingScheduleConfig(o.offeringId, payload);
+    ElMessage.success(
+      teachingChanged
+        ? '教学班已保存：教师与班级已同步到已排课次，节奏按新设置执行'
+        : '排课配置已保存，自动排课将按新节奏执行'
+    );
     schedCfgId.value = '';
     detailOfferLoading.value = true;
     try {
@@ -1446,7 +1574,7 @@ onMounted(async () => {
             <span v-if="!(detailData?.offerings ?? []).length" class="badge badge-neutral">未配置</span>
             <span v-else-if="drawerConfigured" class="badge badge-success">已配置</span>
             <!-- 有配置但不完整（缺教师/节奏/必修缺班级）：仍按未配置引导补全（2026-11-16 业主口径） -->
-            <el-tooltip v-else-if="canOffer" content="配置不完整（缺教师/节奏或必修缺班级），点「修改配置」补全" placement="top">
+            <el-tooltip v-else-if="canOffer" content="配置不完整（缺教师/节奏或必修缺班级），点下方「编辑教学班」补全" placement="top">
               <button type="button" class="badge badge-neutral badge-action" @click.stop="openOfferFor({ courseId: detailCourse.courseId, courseName: detailCourse.courseName, hours: detailData?.hours ?? detailCourse.hours ?? null })">
                 未配置<ZkIcon name="chevron-right" :size="11" />
               </button>
@@ -1486,7 +1614,7 @@ onMounted(async () => {
           </el-button>
           <span v-else-if="drawerConfigured" class="small muted" style="margin-left: 8px">已配置完成</span>
           <!-- 有配置但不完整：不能再说「已配置完成」（2026-11-16 业主：选完才能进已配置）。
-               教师/班级的补全需开课编辑接口（已派单），节奏可在行内「修改配置」里补。 -->
+               教师/班级的补全走行内「编辑教学班」（2026-11-23 起教师与班级都可改），节奏也在同一块里补。 -->
           <span v-else class="small" style="margin-left: 8px; color: var(--el-color-warning)">配置未完成：缺教师 / 节奏{{ isElectiveType(detailCourse?.courseType) ? '' : ' / 必修缺班级' }}</span>
         </div>
         <div v-loading="detailOfferLoading">
@@ -1519,12 +1647,44 @@ onMounted(async () => {
                     type="primary"
                     style="margin-left: 6px"
                     @click="schedCfgId === o.offeringId ? (schedCfgId = '') : openSchedCfg(o)"
-                  >{{ schedCfgId === o.offeringId ? '收起' : '修改配置' }}</el-button>
+                  >{{ schedCfgId === o.offeringId ? '收起' : '编辑教学班' }}</el-button>
                 </div>
                 <div v-if="schedCfgId === o.offeringId" class="cfg-block">
                   <!-- 抽屉只有 ~240px 可用宽，改成单列「定宽标签 + 数字框」网格：
                        填三个值即可，结束周与节次数由总学时自动派生（不再有「按学时算」按钮）。 -->
                   <div class="cfg-grid">
+                    <!-- 教学班身份（2026-11-23 业主：教师/班级要在课程总览里就能改）：
+                         同一门课两个老师各带一个班 = 两条配置，各自改各自的教师与班级。 -->
+                    <div class="cfg-cell">
+                      <span class="cfg-lab">授课教师</span>
+                      <el-select
+                        v-model="schedCfgForm.teacherId"
+                        size="small"
+                        filterable
+                        class="cfg-num"
+                        :loading="pickersLoading"
+                        placeholder="选择授课教师"
+                      >
+                        <el-option v-for="t in teacherPicker" :key="t.value" :label="t.label" :value="t.value" />
+                      </el-select>
+                    </div>
+                    <div class="cfg-cell">
+                      <span class="cfg-lab">上课班级</span>
+                      <el-select
+                        v-model="schedCfgForm.clazzIds"
+                        size="small"
+                        filterable
+                        multiple
+                        collapse-tags
+                        collapse-tags-tooltip
+                        clearable
+                        class="cfg-num"
+                        :loading="pickersLoading"
+                        placeholder="可不选（选修课常不绑班级）"
+                      >
+                        <el-option v-for="c in clazzPicker" :key="c.value" :label="c.label" :value="c.value" />
+                      </el-select>
+                    </div>
                     <div class="cfg-cell">
                       <span class="cfg-lab">起始周</span>
                       <el-input-number v-model="schedCfgForm.weekFrom" class="cfg-num" :min="1" :max="30" size="small" controls-position="right" />
@@ -1555,6 +1715,9 @@ onMounted(async () => {
                   </div>
                   <div class="cfg-actions">
                     <el-button size="small" type="primary" :loading="schedCfgSaving" @click="saveSchedCfg(o)">保存</el-button>
+                    <span v-if="schedCfgClassUnresolved" class="small" style="margin-left: 8px; color: var(--el-color-warning)">
+                      班级与班级名单对不上，本次只能改教师与节奏
+                    </span>
                   </div>
                   <div
                     class="small"
@@ -1568,7 +1731,10 @@ onMounted(async () => {
                     <template v-if="schedCfgPreview.periods !== null">
                       {{ schedCfgPreview.hours }} 学时 = <b>{{ schedCfgPreview.periods }}</b> 节次（1 节次 08:00–09:50 = 2 学时：50 分钟 × 2 + 10 分钟课间）；每周
                       {{ schedCfgPreview.perWeek }} 节 ⇒ 第 {{ schedCfgPreview.from }}~{{ schedCfgPreview.weekTo }} 周，共
-                      {{ schedCfgPreview.spanWeeks }} 教学周<template v-if="schedCfgPreview.overflow">（超出 30 周上限，已截到第 30 周；请加每周节次）</template><template
+                      {{ schedCfgPreview.spanWeeks }} 教学周<template v-if="schedCfgPreview.overflow">（超出本学期第 {{ termWeekMax }} 周边界，已截到第 {{ termWeekMax }} 周）</template>。<template
+                        v-if="schedCfgPreview.shortfall > 0"
+                        >本学期这个窗口最多排 {{ schedCfgPreview.capacity }} 节次，还差 {{ schedCfgPreview.shortfall }} 节次：请提高每周节次。</template
+                      ><template
                         v-if="schedCfgStoredWeeks !== null && schedCfgStoredWeeks !== schedCfgPreview.spanWeeks"
                         >（当前配置存的是 {{ schedCfgStoredWeeks }} 教学周，保存后按学时改为 {{ schedCfgPreview.spanWeeks }} 周）</template
                       >。
