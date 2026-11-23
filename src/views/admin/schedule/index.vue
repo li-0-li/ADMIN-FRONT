@@ -2964,6 +2964,14 @@ const form = reactive({ termId: '', courseId: '', teacherId: '', classroomId: ''
 const createTitle = ref('新增课次');
 /** 打开弹窗时落点是否已定（从课表格子拖进来/点进来）：已定则节次沿用格子，不做自动分配（2026-11-17） */
 const createPresetCell = ref(false);
+/**
+ * 拖拽排课弹窗「高级设置」展开态（2026-11-23）。
+ *
+ * 业主口径：在课表格子里点「+」，要做的只有一件事——选是哪门课。教师、班级是排课上下文，
+ * 页头筛过、或课程的开课记录里已经定了，不该每建一节课次再选一遍。
+ * 所以拖拽模式下默认只露「课程」，教师/班级/教室/周次全部收进这里，需要改时再展开。
+ */
+const advancedOpen = ref(false);
 /** 新增课次弹窗里的「上课班级」下拉，@opened 时把焦点直接放到这个必填项 */
 const clazzSelRef = ref<{ focus?: () => void } | null>(null);
 let focusClazzOnOpen = false;
@@ -3003,6 +3011,18 @@ const createCourseCfg = computed<CfgVerdict | null>(() => {
   return c ? cfgVerdictOf(c) : null;
 });
 
+/** 拖拽排课弹窗收起高级设置时，摘要行里显示的教师名（下拉里查不到就退回裸 ID，别显示空白） */
+const createTeacherLabel = computed(() => {
+  const v = String(form.teacherId || '');
+  if (!v) return '未指定';
+  return teacherOptions.value.find(o => String(o.value) === v)?.label || `教师 #${v}`;
+});
+/** 摘要行的落点：周几 + 第几节（落点来自格子，用户点完就不该再需要确认一次） */
+const createSlotLabel = computed(() => {
+  const p = PERIODS.find(x => x.seq === form.periodNo);
+  return `周${CN[form.weekday - 1] ?? ''} ${p?.label ?? ''}`.trim();
+});
+
 /** 课程自带的授课教师——只作**默认值**，不再是唯一可选值（2026-11-11） */
 const autoTeacherId = computed(() => {
   const hit = form.courseId ? courseById.value.get(String(form.courseId)) : undefined;
@@ -3024,6 +3044,12 @@ const autoTeacherId = computed(() => {
 watch(
   () => form.courseId,
   () => {
+    // 换课：上一次自动带出的班级不能留在新课程上（否则会把 A 班的课排到 B 班）；
+    // 人工改过的班级（≠ prefilledClazz）保留，尊重用户当次的选择。
+    if (prefilledClazz && form.clazzName === prefilledClazz) {
+      form.clazzName = '';
+      prefilledClazz = '';
+    }
     if (autoTeacherId.value) {
       form.teacherId = autoTeacherId.value;
     } else if (!form.courseId) {
@@ -3031,6 +3057,8 @@ watch(
     }
     // 选课变了就重圈候选教师（2026-11-12，见 loadCapabilityTeachers）
     void loadCapabilityTeachers(form.courseId);
+    // 拖拽模式下换课：重新按该课的开课记录补教师与班级（点格子进来时课程是空的，选完才拿得到）
+    void prefillTeachingForCell(form.courseId);
     // 「课程配置」模式：查该课是否已有配置（有 ⇒ 只能更新节奏，教师/班级只读展示）
     void loadConfigOffering();
   }
@@ -3374,6 +3402,40 @@ async function loadPickers() {
   }
 }
 
+/** 上一次由开课记录自动带出的班级名：换课时据此区分「自动填的」与「人工选的」 */
+let prefilledClazz = '';
+
+/**
+ * 拖拽排课（点格子「+」/ 拖入）时把教师与班级先填好（2026-11-23）。
+ * 取值优先级：
+ *   ① 页头筛选的教师/班级——用户眼前正在看谁，默认要排的就是谁；
+ *   ② 该课程的开课记录（`course_offering.teacher_id` / `target_classes`）——课程的既定授课安排；
+ *   ③ 兜底交给 `watch(form.courseId)` 按课程带出的默认教师。
+ * 三步都取不到（课程没登记、页头也没筛）就留空，保存时再展开高级设置让人补，不在这里瞎猜。
+ */
+async function prefillTeachingForCell(courseId: string) {
+  if (!createPresetCell.value) return;
+  if (filters.teacherId && !form.teacherId) form.teacherId = filters.teacherId;
+  if (filters.clazzName && !form.clazzName.trim()) form.clazzName = filters.clazzName;
+  const key = String(courseId || '');
+  if (!key) return;
+  let offs = offeringByCourse.value[key];
+  if (!offs) {
+    try {
+      offs = ((await listCourseOfferings(key)) ?? []) as OfferingBrief[];
+      offeringByCourse.value = { ...offeringByCourse.value, [key]: offs };
+    } catch {
+      offs = []; // 旧包/缺权限：保持空，不阻断打开弹窗
+    }
+  }
+  // 异步回来时用户可能已经改选课程/已关闭弹窗 ⇒ 只在课程未变时写回
+  if (String(form.courseId || '') !== key) return;
+  const first = offs?.[0];
+  if (!form.teacherId && first?.teacherId) form.teacherId = String(first.teacherId);
+  const tc = first?.targetClasses?.[0];
+  if (!form.clazzName.trim() && tc) form.clazzName = prefilledClazz = tc;
+}
+
 /**
  * 打开新增课次弹窗。
  * @param weekday / periodNo 拖放或点空白格时有值（预填）；从课程卡点击进入时为 null（弹窗内自选）
@@ -3401,11 +3463,14 @@ async function openCreate(
   majorNames.value = [];
   await loadPickers();
   form.classroomId = preset.classroomId ?? '';
-  form.clazzName = '';
+  form.clazzName = filters.clazzName || '';
+  prefilledClazz = '';
   form.weekday = weekday ?? 1;
   form.periodNo = periodNo ?? 1;
   // 学期默认取当前浏览学期（省一次点击），用户可改；未选则「确定」不可点（A4：不接受隐式归属）
   form.termId = String(filters.termId || currentTermId.value || '');
+  // 拖拽排课默认收起高级设置（2026-11-23）；学期没定下来时不收起——否则保存被拦在看不见的字段上
+  advancedOpen.value = false;
   // 周次区间默认整学期：起点第 1 周、结束周 = 该学期真实周数（#11 上限跟学期走）
   repeatForm.weekFrom = 1;
   repeatForm.weekTo = defaultWeekTo.value;
@@ -3419,9 +3484,8 @@ async function openCreate(
   // 每次开窗重置「显示全部教师」：上一门课勾过的宽集不该带进下一门课
   showAllTeachers.value = false;
 
-  // 拖动排课：课程自带授课教师 → 自动预选（教师不在可选列表里则不预选，交由人工选）
-  // 2026-10-29 起教师整体只读：watch(form.courseId) 统一从课程接口回填，这里不再单独处理
-  form.teacherId = '';
+  // 拖动排课：教师/班级按「页头筛选 → 该课开课记录 → 课程默认教师」预填（见 prefillTeachingForCell）
+  form.teacherId = filters.teacherId || '';
 
   const period = PERIODS.find(x => x.seq === periodNo);
   // 2026-11-17 业主口径：这个弹窗就是「课程配置」——上课时间（第几节 + 具体时段）不在这里选，
@@ -3429,8 +3493,12 @@ async function openCreate(
   createPresetCell.value = weekday != null && periodNo != null;
   // 课程配置模式：每周节次按默认 1 起算 —— 弹窗是复用的，不清会带着上一门课的节奏进来；
   // 学时来自课程总览（只读），结束周由「学时派生」统一算，不在这里赋值。
+  // 拖拽模式同样归 1（2026-11-23）：高级设置默认收起时，上周留下的「每周 3 节」会静默生效，
+  // 用户只看到「选了门课怎么排进 3 节」，展开高级设置可再改。
+  repeatForm.weekly = 1;
+  // 重复方式同样归位「每周」：单双周也是上次留下的，收起时看不见却会生效
+  if (createPresetCell.value) repeatForm.mode = 'all';
   if (!createPresetCell.value) {
-    repeatForm.weekly = 1;
     repeatForm.total = Math.max(1, repeatForm.weekTo - repeatForm.weekFrom + 1);
   }
   // 必须在 createPresetCell 定下来之后调用：拖拽模式把总课时同步成满额，
@@ -3440,9 +3508,13 @@ async function openCreate(
     ? `拖动排课 · 周${CN[(weekday as number) - 1]} ${period?.label ?? ''}`
     : '课程配置';
   createVisible.value = true;
-  // 班级是唯一推不出来的必填项（课程接口不带班级）⇒ 弹窗开完把焦点放上去，省一次"找框"的点击。
+  // 拖拽模式：教师、班级先按上下文填好，弹窗里就只剩「选课程」一件事
+  void prefillTeachingForCell(form.courseId);
+  // 学期没定、或周次窗口本身非法时不收起高级设置——被拦在看不见的字段上等于没提示
+  if (createPresetCell.value && (!form.termId || createWeekRangeError.value)) advancedOpen.value = true;
+  // 班级是唯一推不出来的必填项（课程接口不带班级）⇒ 展开高级设置时把焦点放上去，省一次"找框"的点击。
   // 焦点要等 @opened（EP 的开场动画结束）再设，nextTick 时输入框还没法接收焦点。
-  focusClazzOnOpen = !form.clazzName;
+  focusClazzOnOpen = advancedOpen.value && !form.clazzName;
 }
 
 function onCreateOpened() {
@@ -3499,10 +3571,12 @@ async function submitCreate() {
     return;
   }
   if (!form.termId) {
+    advancedOpen.value = true;
     ElMessage.warning('请先选择学期');
     return;
   }
   if (createWeekRangeError.value) {
+    advancedOpen.value = true;
     ElMessage.warning(createWeekRangeError.value);
     return;
   }
@@ -3511,11 +3585,14 @@ async function submitCreate() {
     return;
   }
   if (!form.teacherId) {
-    ElMessage.warning(form.courseId ? '该课程没有登记授课教师，请先在课程管理补全' : '请先选择课程（教师随课程自动带出）');
+    // 高级设置收起时这个字段看不见 ⇒ 先把区域展开，否则提示等于让人自己找
+    advancedOpen.value = true;
+    ElMessage.warning(form.courseId ? '该课程没有登记授课教师，请在高级设置里选一位' : '请先选择课程（教师随课程自动带出）');
     return;
   }
   if (!form.clazzName.trim()) {
-    ElMessage.warning('请选择上课班级');
+    advancedOpen.value = true;
+    ElMessage.warning('请选择上课班级（已展开高级设置）');
     return;
   }
   // 节次落点（2026-11-17 业主口径）：弹窗内不再选「第几节」——
@@ -3815,6 +3892,11 @@ const createWeekRangeError = computed(() => {
     return repeatForm.mode === 'odd' ? '该区间内没有单周，请调整起始周' : '该区间内没有双周，请调整起始周';
   }
   return '';
+});
+/** 拖拽模式收起高级设置时，学期/周次的问题都发生在看不见的字段上（保存按钮会直接置灰）
+ *  ⇒ 一旦出现就自动展开，别让人对着灰按钮猜原因 */
+watch(createWeekRangeError, v => {
+  if (v && createPresetCell.value) advancedOpen.value = true;
 });
 /** 每周第 2~5 节的时间（第 1 节 = 表单里的 星期/节次）；weekly 减小时多余项自动不渲染/不提交 */
 const extraSlots = reactive(Array.from({ length: 4 }, () => ({ weekday: 1, periodNo: 1 })));
@@ -5817,8 +5899,9 @@ watch(
     <el-form label-width="92px" label-position="right">
       <!-- 学期（2026-11-09 A4）：排课归属学期，必选、不接受手填。
            与页面顶部筛选的学期是两个概念——顶部决定「现在看哪一学期」，这里决定「这批课次写进哪一学期」。
-           选中学期后：用它的 startDate 锚定第 1 周，并用 startDate~endDate 算出结束周上限（#11）。 -->
-      <el-form-item label="学期" required>
+           选中学期后：用它的 startDate 锚定第 1 周，并用 startDate~endDate 算出结束周上限（#11）。
+           2026-11-23：拖拽排课时默认收起（已取当前浏览学期），需要跨学期排课再展开高级设置。 -->
+      <el-form-item v-if="!createPresetCell || advancedOpen" label="学期" required>
         <el-select v-model="form.termId" placeholder="请选择学期（决定周次锚定与上限）" filterable style="width: 100%">
           <el-option v-for="t in terms" :key="t.termId" :label="t.name" :value="String(t.termId)" />
         </el-select>
@@ -5845,11 +5928,36 @@ watch(
           style="color: var(--warning, #b45309); width: 100%"
         >
           该课属于「未配置课程」（{{ cfgGapSentence(createCourseCfg.gaps) }}）：
-          <b>手动排课不受影响</b>，按下面选好星期与周范围即可保存（节次自动分配）；
+          <b>手动排课不受影响</b>，
+          <template v-if="createPresetCell">选好课程直接保存即可（按默认整学期、每周 1 节铺开，要改周次请展开「高级设置」）。</template>
+          <template v-else>按下面选好周范围即可保存（节次自动分配）。</template>
           想以后用「自动排课」省事，到「课程管理 → 课程详情 → 开课记录」补齐授课教师与面向班级（<b>选修课可不填班级</b>），并保存「排课设置」。
         </div>
       </el-form-item>
-      <el-form-item label="授课教师" required>
+      <!-- 拖拽排课（2026-11-23 业主口径）：点格子的「+」只该选课程。教师、班级、周次都是排课上下文，
+           页头筛过 / 课程的开课记录里已经定了，默认只在下面这一行汇总展示，不占一个输入框的版面。 -->
+      <div v-if="createPresetCell" class="create-context">
+        <template v-if="!advancedOpen">
+          <div class="ctx-line">
+            <span class="ctx-k">教师</span><span class="ctx-v">{{ createTeacherLabel }}</span>
+            <span class="ctx-divider"></span>
+            <span class="ctx-k">班级</span><span class="ctx-v">{{ form.clazzName || '未指定' }}</span>
+          </div>
+          <div class="ctx-line">
+            <span class="ctx-k">时段</span><span class="ctx-v">{{ createSlotLabel }}</span>
+            <span class="ctx-divider"></span>
+            <span class="ctx-k">周次</span>
+            <span class="ctx-v">
+              {{ repeatForm.mode === 'once' ? '单次' : `第 ${repeatForm.weekFrom}~${repeatForm.weekTo} 周` }} · 每周
+              {{ repeatForm.weekly }} 节
+            </span>
+          </div>
+        </template>
+        <button class="ctx-link" type="button" @click="advancedOpen = !advancedOpen">
+          {{ advancedOpen ? '收起高级设置' : '高级设置（改教师 / 班级 / 教室 / 周次）' }}
+        </button>
+      </div>
+      <el-form-item v-if="!createPresetCell || advancedOpen" label="授课教师" required>
         <!-- 2026-11-11 放开手选（录音 A2：「老是自动带出都是有问题的啊，这里要支持选老师」）：
              默认按课程带出授课教师，但允许改成任一教师。
              2026-11-12 收口：候选默认只列**该课程有授课资格**的教师（录音「不能把上英语的排去上数学」），
@@ -5882,7 +5990,7 @@ watch(
           显示全部教师（含无该课程资格）
         </el-checkbox>
       </el-form-item>
-      <el-form-item label="上课班级">
+      <el-form-item v-if="!createPresetCell || advancedOpen" label="上课班级">
         <!-- 业主口径：班级可不选（选修课常不绑班），所以不挂 required。
              ★ 2026-11-19：已有配置也能改，改完同步到已排课次。 -->
         <el-select
@@ -5896,7 +6004,7 @@ watch(
           <el-option v-for="n in classListOptions" :key="n" :label="n" :value="n" />
         </el-select>
       </el-form-item>
-      <el-form-item v-if="createPresetCell" label="上课教室">
+      <el-form-item v-if="createPresetCell && advancedOpen" label="上课教室">
         <el-select v-model="form.classroomId" placeholder="可不填" clearable style="width: 100%">
           <el-option v-for="o in roomOptions" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
@@ -5907,7 +6015,7 @@ watch(
       </el-form-item>
       <!-- 星期/教室：仅拖拽模式（落点已定）可改；「课程配置」模式不选时间——
            2026-11-17 业主终口径：上课时间是自动排课排出来的，配置页不选 -->
-      <el-form-item v-if="createPresetCell" label="星期">
+      <el-form-item v-if="createPresetCell && advancedOpen" label="星期">
         <el-select v-model="form.weekday" style="width: 100%">
           <el-option v-for="d in WEEKDAYS" :key="d.v" :label="d.label" :value="d.v" />
         </el-select>
@@ -5915,7 +6023,7 @@ watch(
       <!-- 每周节数（2026-10-20）：一周多节的课一次排完
            2026-11-17 业主终口径：课程配置不选「星期」——上课时间（星期几 + 第几节 + 时段）
            全部由自动排课生成；拖拽模式下每节可分别指定星期 -->
-      <el-form-item label="每周节数">
+      <el-form-item v-if="!createPresetCell || advancedOpen" label="每周节数">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center">
           <el-input-number
             v-model="repeatForm.weekly"
@@ -5931,7 +6039,7 @@ watch(
         v-for="(s, i) in extraSlotList"
         :key="'extra-slot-' + i"
         :label="`第${i + 2}节`"
-        v-if="createPresetCell"
+        v-if="createPresetCell && advancedOpen"
       >
         <div style="display: flex; gap: 8px; width: 100%; align-items: center">
           <el-select v-model="s.weekday" style="width: 100%">
@@ -5943,7 +6051,7 @@ watch(
       <!-- 周次重复（2026-10-20）：拖拽排课一次 = 按周展开成整学期的课次
            2026-11-17 课程配置模式：这里显示的周范围 = 排课节奏的铺课窗口（weekFrom~weekTo），
            不再选重复方式（单双周等是排课时的概念，配置里没有） -->
-      <el-form-item :label="createPresetCell ? '重复' : '周范围'">
+      <el-form-item v-if="!createPresetCell || advancedOpen" :label="createPresetCell ? '重复' : '周范围'">
         <div v-if="createPresetCell" style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
           <el-select v-model="repeatForm.mode" style="flex: 1; min-width: 140px">
             <el-option v-for="(t, m) in REPEAT_TEXT" :key="m" :label="t" :value="m" />
@@ -6027,7 +6135,7 @@ watch(
         </div>
       </el-form-item>
       <!-- 总课时：仅拖拽排课模式保留输入（课时可小于窗口满额，前满后少） -->
-      <el-form-item v-if="createPresetCell && repeatForm.mode !== 'once'" label="总课时">
+      <el-form-item v-if="createPresetCell && advancedOpen && repeatForm.mode !== 'once'" label="总课时">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
           <el-input-number
             v-model="repeatForm.total"
@@ -6992,6 +7100,51 @@ watch(
 }
 .card-tag.is-warn {
   background: var(--warning);
+}
+/* 拖拽排课「只选课程」模式的上下文摘要（2026-11-23）：
+   把教师/班级/时段/周次压成两行灰底文字，替掉原来四个输入框的版面 */
+.create-context {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line, #e4e4e7);
+  border-radius: 8px;
+  background: var(--surface-2, #fafafa);
+  font-size: 12px;
+  color: var(--ink-700, #3f3f46);
+}
+.create-context .ctx-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  line-height: 1.9;
+}
+.create-context .ctx-k {
+  color: var(--ink-400, #a1a1aa);
+  flex: none;
+}
+.create-context .ctx-v {
+  font-weight: 500;
+  color: var(--ink-800, #27272a);
+}
+.create-context .ctx-divider {
+  width: 1px;
+  height: 11px;
+  background: var(--line, #e4e4e7);
+  margin: 0 4px;
+  flex: none;
+}
+.create-context .ctx-link {
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--primary, #2563eb);
+  font-size: 12px;
+  cursor: pointer;
+}
+.create-context .ctx-link:hover {
+  text-decoration: underline;
 }
 /* 未发布（draft）标识：中性灰、左上角 —— 避开右上角的拖拽悬停标签 */
 .draft-tag {
