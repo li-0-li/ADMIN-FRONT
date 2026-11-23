@@ -667,7 +667,13 @@ async function doDelete(row: Record<string, unknown>) {
     return;
   }
   const name = String(row.name ?? row.deptName ?? row.clazzName ?? row.code ?? id);
-  await ElMessageBox.confirm(`确定要删除「${name}」吗？`, '删除', { type: 'warning', confirmButtonText: '删除' });
+  // 学校是课程、开课记录、院系、班级、课次的归属根：软删后列表看不到，且唯一键与查重都不含 deleted，
+  // 同名同码再也建不回来（2026-11-23 远端就是被这么删掉的，导致整站无法建课）。确认文案必须说清后果。
+  const confirmText =
+    active.value === 'school'
+      ? `确定要删除学校「${name}」吗？学校是课程、院系、班级与课次的归属根，删除后建课将失去归属对象；若这是唯一启用中的学校，系统将无法再创建课程（后端会拦下）。`
+      : `确定要删除「${name}」吗？`;
+  await ElMessageBox.confirm(confirmText, '删除', { type: 'warning', confirmButtonText: '删除' });
   if (active.value === 'school') await deleteSchool(id);
   else if (active.value === 'dept') await deleteDept(id);
   else if (active.value === 'major') await deleteMajor(id);
@@ -964,6 +970,11 @@ async function exportCsv() {
                无条件 0 行才落到各 tab 的数据源说明 -->
           <template v-if="query.keyword || hasActiveFilters">没有匹配当前{{ query.keyword ? '关键词' : '筛选条件' }}的记录</template>
           <template v-else-if="active === 'teacher' || active === 'student'">暂无数据（数据源＝账号接口按角色过滤）</template>
+          <!-- 学校为空是最危险的空态：建课会直接 422，且没有学校就没有归属根 -->
+          <template v-else-if="active === 'school'">
+            还没有学校。学校是课程、院系、班级与课次的归属根，建课默认落到第一所启用学校；创建后勿删除，下线请改用停用。
+            <el-button v-if="canAdd" text type="primary" size="small" @click="openCreate">去新增</el-button>
+          </template>
           <template v-else>
             暂无数据
             <el-button v-if="canAdd" text type="primary" size="small" @click="openCreate">去新增</el-button>
