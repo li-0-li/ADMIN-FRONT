@@ -1471,18 +1471,18 @@ onMounted(async () => {
       <div>
         <div class="section-title">
           课程配置
-          <!-- 一门课只允许一条配置（业主 2026-11-16）：配过就不再给「追加」入口，
-               否则同一个学期/班级会多出重复配置，课程总览也分不清哪条是真的。
-               需要换学期/教师/班级时改现有配置（或删课重建）。 -->
+          <!-- 一门课可以有多条配置（2026-11-23 放宽，原 11-16 「只允许一条」）：
+               同一门课由不同教师分别带不同班级时，每条 = 一个教学班，独立节奏、独立排课。
+               所以配过之后仍保留「新增教学班」入口，只改文案。 -->
           <el-button
-            v-if="canOffer && !(detailData?.offerings ?? []).length"
+            v-if="canOffer"
             size="small"
             type="primary"
             plain
             style="margin-left: 8px"
             @click="openOfferFor({ courseId: detailCourse.courseId, courseName: detailCourse.courseName, hours: detailData?.hours ?? detailCourse.hours ?? null })"
           >
-            <ZkIcon name="plus" :size="13" style="margin-right: 3px" />新增配置
+            <ZkIcon name="plus" :size="13" style="margin-right: 3px" />{{ (detailData?.offerings ?? []).length ? '新增教学班' : '新增配置' }}
           </el-button>
           <span v-else-if="drawerConfigured" class="small muted" style="margin-left: 8px">已配置完成</span>
           <!-- 有配置但不完整：不能再说「已配置完成」（2026-11-16 业主：选完才能进已配置）。

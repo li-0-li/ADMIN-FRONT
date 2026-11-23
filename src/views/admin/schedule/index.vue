@@ -1114,6 +1114,16 @@ interface PoolEntry extends CourseBrief {
    */
   inSchedule: boolean;
   /**
+   * 本周课表里已有的活跃课次数（2026-11-23）。
+   *
+   * 与 `inSchedule` 的区别：`inSchedule` 是「整学期有课次」（放回签也可能为 true），
+   * 本字段只数**当前浏览这一周**的非软删课次。
+   * 用途：一门课整学期都排满时，它每周都有课次 ⇒ 原先连卡片都不出现（见 buildPoolEntries 的 else 分支），
+   * 待排池看起来像「这门课不存在」。带上节数后卡片仍列出，角标写「本周已排 N 节」，
+   * 排满的课不会凭空消失，也不必每次都翻右侧课表确认。
+   */
+  weekPlaced?: number;
+  /**
    * 排课节奏配置状态（2026-11-16 业主口径：待排池拆「已配置课程 / 未配置课程」两栏，
    * 自动排课只收已配置的课）。
    * - `ready`   全部开课记录都配过（总节次 / 每周节次 / 周范围）⇒ 才算「已配置课程」，可自动排课；
@@ -1153,6 +1163,12 @@ function buildPoolEntries(): PoolEntry[] {
       )
     : allCells.value;
   const used = new Set(inScope.map(c => String(c.courseId)));
+  /** courseId -> 本周活跃课次数（2026-11-23：排满的课要在池里留下，靠它写「本周已排 N 节」） */
+  const weekPlaced = new Map<string, number>();
+  for (const c of inScope) {
+    const k = String(c.courseId);
+    weekPlaced.set(k, (weekPlaced.get(k) ?? 0) + 1);
+  }
   // courseId -> 本周放回的课次列表
   const returned = new Map<string, ScheduleCell[]>();
   for (const r of returnedCells.value) {
@@ -1216,12 +1232,19 @@ function buildPoolEntries(): PoolEntry[] {
           fromWeekNo: r.weekNo
         });
       }
-    } else if (!used.has(String(c.courseId))) {
+    } else {
+      // ★ 2026-11-23 修：原先这里是 `else if (!used.has(courseId))`——本周课表上已有课次的课
+      //   **整条不进池**，于是「1~16 周每周都有课」的课在任何一周都看不到，像课程丢了。
+      //   还能在池里看到的课，靠的其实是历史上「放回」留下的软删残影签（有签才走上面的分支），
+      //   所以出现了「别的课都在、就这门没有」的错觉。
+      //   现在一律列出，已排的只做标记（weekPlaced）——池子既是待排来源，也是课程全量清单。
+      const seat = weekPlaced.get(String(c.courseId)) ?? 0;
       const v = verdict(c);
       out.push({
         ...c,
         key: `course-${c.courseId}`,
-        inSchedule: false,
+        inSchedule: seat > 0 || used.has(String(c.courseId)),
+        weekPlaced: seat,
         cfg: v.cfg,
         cfgGaps: v.gaps,
         missingRhythm: v.missingRhythm
@@ -1442,15 +1465,20 @@ async function placeInCurrentWeek(c: PoolChip) {
       weekCount: 1,
       termId: tid || undefined
     });
-    const r = rows?.[0];
-    const placed = r?.arranged ?? 0;
-    const sk = r?.skipped ?? [];
+    // ★ 2026-11-23：一门课可以有多条教学班配置（两个老师各带一个班），后端按 offering 逐条排，
+    //   返回的是多行结果。原先只读 rows[0]，第二个班排了什么、有没有排进去都看不到。
+    const list = rows ?? [];
+    const placed = list.reduce((n, r) => n + (r.arranged ?? 0), 0);
+    const skipped = list.flatMap(r => r.skipped ?? []);
     if (placed > 0) {
-      ElMessage.success(`「${c.courseName}」已排入第 ${w} 周 ${placed} 节`);
-    } else if (sk.some(s => /幂等跳过/.test(s.reason || ''))) {
+      const parts = list
+        .filter(r => (r.arranged ?? 0) > 0)
+        .map(r => `${r.courseName || c.courseName}：${r.arranged} 节`);
+      ElMessage.success(`「${c.courseName}」已排入第 ${w} 周 ${placed} 节${list.length > 1 ? `（${parts.join('，')}）` : ''}`);
+    } else if (skipped.some(s => /幂等跳过/.test(s.reason || ''))) {
       ElMessage.info(`「${c.courseName}」第 ${w} 周已排满，无需再排`);
     } else {
-      ElMessage.warning(`「${c.courseName}」第 ${w} 周未排入：${sk[0]?.reason ?? '偏好网格内教师与教室均无空闲'}`);
+      ElMessage.warning(`「${c.courseName}」第 ${w} 周未排入：${skipped[0]?.reason ?? '偏好网格内教师与教室均无空闲'}`);
     }
     // 只刷课表与池子（课次变了、开课配置没变，不必清 offerings 缓存）
     await load(true);
@@ -1565,8 +1593,9 @@ function poolChipTitle(e: PoolEntry) {
   const base = e.key.startsWith('lesson-') ? '拖动排回这 1 节' : '拖动新建 1 节课次';
   const cnt = (e as PoolChip).count ?? 0;
   const countTip = cnt > 1 ? `；该课共 ${cnt} 节待排，拖一次排回一节` : '';
+  const placedTip = e.weekPlaced ? `；本周课表已有 ${e.weekPlaced} 节` : '';
   const cfgTip = isCfgReady(e.cfg) ? '' : `；${cfgGapTip(e)}`;
-  return `${base}${countTip}，或点击打开新增表单：${e.courseName}${cfgTip}`;
+  return `${base}${countTip}${placedTip}，或点击打开新增表单：${e.courseName}${cfgTip}`;
 }
 
 /* ---------- 待排课程展开浮层（非模态可拖动；内含搜索与教师筛选） ---------- */
@@ -2961,6 +2990,16 @@ const saving = ref(false);
 /** termId（2026-11-09 A4）：排课归属学期，必选。放在 form 里而不是直接读页面筛选，
  *  是因为「排到哪个学期」与「现在看哪个学期」是两件事，用户必须能分别控制。 */
 const form = reactive({ termId: '', courseId: '', teacherId: '', classroomId: '', clazzName: '', weekday: 1, periodNo: 1 });
+/**
+ * 「课程配置」模式下的**多班级**（2026-11-23）。
+ *
+ * 与 `form.clazzName` 的分工（别混）：
+ * - 拖拽/点格子建课次 = 排一节具体的课，课次只能落在一个班上 ⇒ 仍用单值 `clazzName`；
+ * - 课程配置 = 定义这门课给哪些班开。业主 11-16 定案「一门课只允许一条配置」，
+ *   所以「三个班一起上」只能靠一条配置里多选班级（合班上课），原先这里只有单选下拉，
+ *   已配好的课没有任何入口把第二个班加进来。
+ */
+const formClazzNames = ref<string[]>([]);
 const createTitle = ref('新增课次');
 /** 打开弹窗时落点是否已定（从课表格子拖进来/点进来）：已定则节次沿用格子，不做自动分配（2026-11-17） */
 const createPresetCell = ref(false);
@@ -3066,12 +3105,18 @@ watch(
   }
 );
 
-/* ========== 「课程配置」模式（2026-11-17 业主终口径）==========
+/* ========== 「课程配置」模式（2026-11-17 业主终口径，2026-11-23 扩展为多教学班）==========
  * 手动打开（非拖拽）的弹窗 = 纯配置入口：只写 course_offering（教师/班级/周范围/每周节数/总课时），
  * **不创建任何课次**——「选了星期就自动进课表」被业主否掉，课表时间全部由
- * 「自动排课」（或把待排课程拖进格子）生成。已有配置的课只能更新节奏
- * （教师/班级后端暂无编辑接口，字段只读展示，见派单 20261116-开课记录编辑接口）。 */
+ * 「自动排课」（或把待排课程拖进格子）生成。
+ *
+ * ★ 2026-11-23 放宽「一门课只允许一条配置」：业主提出「三个班要上」「同一门课两个老师各带一个班」，
+ *   一条配置只有一个 teacher_id，撑不住这两类需求。改为**一门课可有多条教学班配置**：
+ *   每条 = 教师 + 班级（可多选，多选即合班）+ 独立节奏，各自独立排课。
+ *   池子/配置体检本来就是按多条 offering 遍历的，只有这个弹窗原先写死取 list[0]。 */
 const configOffering = ref<OfferingBrief | null>(null);
+/** 该课程全部教学班配置（弹窗顶部供切换/新增）；空数组 = 这门课还没配过 */
+const configOfferings = ref<OfferingBrief[]>([]);
 const configExisting = ref(false);
 /**
  * 已有配置的「教师/班级」初始快照（2026-11-19）。
@@ -3080,37 +3125,57 @@ const configExisting = ref(false);
  * 「传 []」解读为改成不绑班级，若每次保存都无脑带上现值，一旦回填没命中
  * （班级重名/未加载完）就会把班级误清空。
  */
-const configSnapshot = ref<{ teacherId: string; clazzName: string }>({ teacherId: '', clazzName: '' });
+const configSnapshot = ref<{ teacherId: string; clazzName: string; clazzNames: string[] }>({
+  teacherId: '',
+  clazzName: '',
+  clazzNames: []
+});
+/** 把一条教学班配置回填到表单（教师 / 班级 / 节奏）。切换教学班与首次加载共用一处，避免两套口径。 */
+async function applyOfferingToForm(o: OfferingBrief) {
+  // 教师/班级是多值回填：切班时必须覆盖，不能像以前那样「已有值就不动」，否则会带着上一条的教师
+  form.teacherId = o.teacherId ? String(o.teacherId) : '';
+  const tcs = (Array.isArray(o.targetClasses) ? o.targetClasses : [])
+    .map(x => String(x ?? '').trim())
+    .filter(x => !isNoClazzName(x));
+  formClazzNames.value = [...tcs];
+  form.clazzName = tcs[0] ?? '';
+  configSnapshot.value = {
+    teacherId: String(form.teacherId || ''),
+    clazzName: String(form.clazzName || ''),
+    clazzNames: [...tcs]
+  };
+  // 节奏回填：让用户看到现在存的是什么再改
+  // ★ 回填期间暂停「结束周按学时派生」（cfgBackfilling）：先把起始周/每周节数还原成
+  //   库里现值，结束周等暂停解除后统一对齐派生值——学时固定后结束周没有自由度，
+  //   库里可能存着旧口径（手填总课时时代）的宽窗口，展示的应是当下口径算出的窗口。
+  cfgBackfilling.value = true;
+  repeatForm.weekFrom = Number(o.weekFrom ?? 1);
+  repeatForm.weekly = Math.max(1, Number(o.lessonsPerWeek ?? 1));
+  repeatForm.weekTo = Math.min(createWeekMax.value, repeatForm.weekFrom + Number(o.weekCount ?? 1) - 1);
+  if (o.totalLessons) repeatForm.total = Number(o.totalLessons);
+  await nextTick();
+  cfgBackfilling.value = false;
+  // 学时固定 ⇒ 结束周 = 起始周 + ⌈⌈学时÷2⌉ ÷ 每周节数⌉ − 1（课程没填学时时保持回填值）
+  if (cfgHoursKnown.value) repeatForm.weekTo = cfgWeekTo.value;
+}
+
 async function loadConfigOffering() {
   configOffering.value = null;
   configExisting.value = false;
-  configSnapshot.value = { teacherId: '', clazzName: '' };
+  configOfferings.value = [];
+  configSnapshot.value = { teacherId: '', clazzName: '', clazzNames: [] };
+  formClazzNames.value = [];
   // 学时输入框以课程总览现值起算（换课后重置，不带上一门课的输入）
   cfgHoursInput.value = cfgOverviewHours.value || null;
   if (!form.courseId || createPresetCell.value) return;
   try {
-    const list = await listCourseOfferings(form.courseId);
+    const list = (await listCourseOfferings(form.courseId)) ?? [];
+    configOfferings.value = list;
     if (list.length) {
+      // 默认编辑第一条；其余教学班在弹窗顶部切换
       configOffering.value = list[0];
       configExisting.value = true;
-      // 已有配置 ⇒ 教师/班级回填现值（2026-11-19 起这两项可改，保存时一并提交）
-      if (list[0].teacherId) form.teacherId = String(list[0].teacherId);
-      const tc = list[0].targetClasses?.[0];
-      if (tc && !form.clazzName) form.clazzName = tc;
-      configSnapshot.value = { teacherId: String(form.teacherId || ''), clazzName: String(form.clazzName || '') };
-      // 节奏回填：让用户看到现在存的是什么再改
-      // ★ 回填期间暂停「结束周按学时派生」（cfgBackfilling）：先把起始周/每周节数还原成
-      //   库里现值，结束周等暂停解除后统一对齐派生值——学时固定后结束周没有自由度，
-      //   库里可能存着旧口径（手填总课时时代）的宽窗口，展示的应是当下口径算出的窗口。
-      cfgBackfilling.value = true;
-      repeatForm.weekFrom = Number(list[0].weekFrom ?? 1);
-      repeatForm.weekly = Math.max(1, Number(list[0].lessonsPerWeek ?? 1));
-      repeatForm.weekTo = Math.min(createWeekMax.value, repeatForm.weekFrom + Number(list[0].weekCount ?? 1) - 1);
-      if (list[0].totalLessons) repeatForm.total = Number(list[0].totalLessons);
-      await nextTick();
-      cfgBackfilling.value = false;
-      // 学时固定 ⇒ 结束周 = 起始周 + ⌈⌈学时÷2⌉ ÷ 每周节数⌉ − 1（课程没填学时时保持回填值）
-      if (cfgHoursKnown.value) repeatForm.weekTo = cfgWeekTo.value;
+      await applyOfferingToForm(list[0]);
     }
   } catch {
     /* 查询失败按无配置处理，保存时后端会把重复配置的 40902 拦出来 */
@@ -3118,6 +3183,24 @@ async function loadConfigOffering() {
     // 查询失败/回填中断也要解除暂停，否则整块联动就此失效
     cfgBackfilling.value = false;
   }
+}
+
+/** 切换到另一条教学班配置（同一门课的另一个教师/班级组合） */
+async function selectConfigOffering(o: OfferingBrief) {
+  if (String(o.offeringId) === String(configOffering.value?.offeringId)) return;
+  configOffering.value = o;
+  configExisting.value = true;
+  await applyOfferingToForm(o);
+}
+
+/** 新增教学班：清掉教师/班级与节奏快照，保存时走 createOffering 建第二条配置 */
+function startNewConfigOffering() {
+  configOffering.value = null;
+  configExisting.value = false;
+  configSnapshot.value = { teacherId: '', clazzName: '', clazzNames: [] };
+  formClazzNames.value = [];
+  form.clazzName = '';
+  form.teacherId = '';
 }
 
 /** 「课程配置」保存（2026-11-17 业主终口径）：只存配置不进课表。 */
@@ -3179,13 +3262,24 @@ async function submitConfigOnly() {
       if (row) row.hours = cfgCourseHours.value;
       hoursSynced = true;
     }
+    // 配置模式的班级是多选（合班上课）：一次解析成 id 列表。解析不到说明班级下拉还没加载完，
+    // 直接中止而不是「静默把没解析到的班丢掉」——那会让用户以为三个班都配上了。
+    const cfgClazzIds: string[] = [];
+    for (const n of formClazzNames.value) {
+      const cid = clazzIdByName.value[n];
+      if (!cid) {
+        ElMessage.warning(`班级「${n}」数据未加载完成，请刷新页面后重试`);
+        saving.value = false;
+        return;
+      }
+      cfgClazzIds.push(String(cid));
+    }
     let offeringId = configOffering.value?.offeringId;
     if (!offeringId) {
-      const clazzId = form.clazzName ? clazzIdByName.value[form.clazzName] : undefined;
       const res = await createOffering(form.courseId, {
         termId: form.termId,
         teacherId: form.teacherId,
-        clazzIds: clazzId ? [clazzId] : undefined,
+        clazzIds: cfgClazzIds.length ? cfgClazzIds : undefined,
         weekCount
       });
       offeringId = res.offeringId;
@@ -3211,26 +3305,29 @@ async function submitConfigOnly() {
       if (teacherNow && teacherNow !== configSnapshot.value.teacherId) {
         payload.teacherId = teacherNow;
       }
-      const classNow = String(form.clazzName || '');
-      if (classNow !== configSnapshot.value.clazzName) {
-        if (classNow) {
-          const cid = clazzIdByName.value[classNow];
-          if (!cid) {
-            ElMessage.warning('班级数据未加载完成，请刷新页面后重试');
-            saving.value = false;
-            return;
-          }
-          payload.clazzIds = [cid];
-        } else {
-          payload.clazzIds = []; // 明确的「改成不绑班级」
-        }
+      // 班级按**集合**比对：后端回填顺序是 clazz_id 升序，用户在末尾追加一个班时顺序不同但集合相同，
+      // 用串比较会误判成「改过」而多发一次同步课次的请求。
+      const snapClazz = configSnapshot.value.clazzNames ?? [];
+      const nowClazz = [...formClazzNames.value];
+      const sameClazz =
+        snapClazz.length === nowClazz.length &&
+        [...snapClazz].sort().join('\u0001') === [...nowClazz].sort().join('\u0001');
+      if (!sameClazz) {
+        payload.clazzIds = nowClazz.length ? cfgClazzIds : []; // [] = 明确的「改成不绑班级」
       }
     }
     await updateOfferingScheduleConfig(offeringId!, payload);
     // 这门课的配置变了 ⇒ 池子「已配置/缺教师/缺班级」判定要重算，直接写入最新值
     try {
-      const fresh = await listCourseOfferings(form.courseId);
-      offeringByCourse.value = { ...offeringByCourse.value, [String(form.courseId)]: fresh as OfferingBrief[] };
+      const fresh = (await listCourseOfferings(form.courseId)) as OfferingBrief[];
+      offeringByCourse.value = { ...offeringByCourse.value, [String(form.courseId)]: fresh };
+      // 教学班列表同步刷新：新增的那条要立刻出现在切换区，否则连续保存会以为没成功而重复建
+      configOfferings.value = fresh ?? [];
+      const keep = configOfferings.value.find(o => String(o.offeringId) === String(offeringId));
+      if (keep) {
+        configOffering.value = keep;
+        configExisting.value = true;
+      }
     } catch {
       /* 刷新失败不阻断，下次进池子会重拉 */
     }
@@ -5266,9 +5363,16 @@ watch(
                 <!-- 同名课程区分（2026-11-05）：course 表是开课记录粒度，一师一学期一条，
                      只显示课程名会让多教学班看起来像重复数据；这里补「学期 · 面向班级」。 -->
                 <span v-if="poolSubLabel(c)" class="chip-meta pool-sub" :title="poolSubLabel(c)">{{ poolSubLabel(c) }}</span>
+                <!-- 本周已排节数（2026-11-23）：排满的课不再从池里消失，用节数说明它就在课表上。
+                     与「已在课表」是两条不同的信息：这里是本周真课次，后者是放回留下的软删签。 -->
+                <span
+                  v-if="c.weekPlaced"
+                  class="badge badge-neutral chip-badge"
+                  :title="`本周课表里已有 ${c.weekPlaced} 节。要改时间请到右侧课表拖动或先放回待排；「排到本周」可继续补排剩余节次`"
+                >本周已排 {{ c.weekPlaced }} 节</span>
                 <!-- 重复排课入口的可视化（2026-10-30 P0-A）：这门课还在课表上，这张签是放回留下的软删记录 -->
                 <span
-                  v-if="c.inSchedule"
+                  v-else-if="c.inSchedule"
                   class="badge badge-warning chip-badge"
                   title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
                 >已在课表</span>
@@ -6017,6 +6121,30 @@ watch(
           想以后用「自动排课」省事，到「课程管理 → 课程详情 → 开课记录」补齐授课教师与面向班级（<b>选修课可不填班级</b>），并保存「排课设置」。
         </div>
       </el-form-item>
+      <!-- 教学班切换（2026-11-23）：同一门课可以有多个「教师 + 班级」组合（两个老师各带一个班），
+           也可以一条里多选班级（三个班合班）。每条独立节奏、独立排课，切换即编辑对应那条。 -->
+      <el-form-item v-if="!createPresetCell && configOfferings.length" label="教学班">
+        <div class="cfg-offer-list">
+          <button
+            v-for="o in configOfferings"
+            :key="o.offeringId"
+            type="button"
+            class="cfg-offer-chip"
+            :class="{ 'is-active': String(o.offeringId) === String(configOffering?.offeringId) }"
+            :title="`切换到这条配置：${o.teacherName || '教师未知'} · ${(o.targetClasses ?? []).join('、') || '未绑班级'}`"
+            @click="selectConfigOffering(o)"
+          >
+            <b>{{ o.teacherName || '教师未知' }}</b>
+            <span class="cfg-offer-cls">{{ (o.targetClasses ?? []).join('、') || '未绑班级' }}</span>
+          </button>
+          <button type="button" class="cfg-offer-add" @click="startNewConfigOffering">
+            <ZkIcon name="plus" :size="12" /> 新增教学班
+          </button>
+        </div>
+        <div class="small muted" style="width: 100%">
+          同一门课可以拆成多个教学班：换教师或换班级就点「新增教学班」，各条独立配置节奏、独立排课。
+        </div>
+      </el-form-item>
       <!-- 拖拽排课（2026-11-23 业主口径）：点格子的「+」只该选课程。教师、班级、周次都是排课上下文，
            页头筛过 / 课程的开课记录里已经定了，默认只在下面这一行汇总展示，不占一个输入框的版面。 -->
       <div v-if="createPresetCell" class="create-context">
@@ -6073,7 +6201,25 @@ watch(
           显示全部教师（含无该课程资格）
         </el-checkbox>
       </el-form-item>
-      <el-form-item v-if="!createPresetCell || advancedOpen" label="上课班级">
+      <!-- 课程配置模式（非拖拽）的班级是**多选**（2026-11-23）：业主 11-16 定案「一门课只允许一条配置」，
+           所以「三个班一起上」只能落在一条配置里多选班级；原先这里是单选，已配好的课没有入口把
+           第二个班加进来。拖拽建课次仍走下面那个单选——一节具体的课只能落在一个班上。 -->
+      <el-form-item v-if="!createPresetCell" label="上课班级">
+        <el-select
+          v-model="formClazzNames"
+          multiple
+          filterable
+          clearable
+          placeholder="可不选；选多个班 = 合班上课"
+          style="width: 100%"
+        >
+          <el-option v-for="n in classListOptions" :key="n" :label="n" :value="n" />
+        </el-select>
+        <div class="small muted" style="width: 100%">
+          选多个班表示这些班同一时段一起上课（合班）。三个班若要分开上、各自排时间，需为每个班单独建课。
+        </div>
+      </el-form-item>
+      <el-form-item v-else-if="advancedOpen" label="上课班级">
         <!-- 业主口径：班级可不选（选修课常不绑班），所以不挂 required。
              ★ 2026-11-19：已有配置也能改，改完同步到已排课次。 -->
         <el-select
@@ -7195,6 +7341,61 @@ watch(
 }
 /* 拖拽排课「只选课程」模式的上下文摘要（2026-11-23）：
    把教师/班级/时段/周次压成两行灰底文字，替掉原来四个输入框的版面 */
+/* 教学班切换（2026-11-23）：一门课多条「教师 + 班级」配置时的选择条。
+   用 chip 而不是下拉，是因为管理员要一眼看出这门课被拆成了几个班、分别谁教。 */
+.cfg-offer-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: 100%;
+}
+.cfg-offer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 10px;
+  border: 1px solid var(--line, #e4e4e7);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--ink-700, #3f3f46);
+  font-size: 12px;
+  cursor: pointer;
+}
+.cfg-offer-chip:hover {
+  border-color: var(--brand-400, #7ba7f5);
+}
+.cfg-offer-chip.is-active {
+  border-color: var(--brand-600, #1e5fd0);
+  background: var(--brand-50, #eef4ff);
+  color: var(--brand-700, #17489e);
+}
+.cfg-offer-cls {
+  color: var(--ink-500, #71717a);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cfg-offer-chip.is-active .cfg-offer-cls {
+  color: inherit;
+}
+.cfg-offer-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px dashed var(--line, #d4d4d8);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--brand-700, #17489e);
+  font-size: 12px;
+  cursor: pointer;
+}
+.cfg-offer-add:hover {
+  border-color: var(--brand-400, #7ba7f5);
+  background: var(--brand-50, #eef4ff);
+}
 .create-context {
   margin: 0 0 12px;
   padding: 10px 12px;
