@@ -3057,6 +3057,8 @@ watch(
     }
     // 选课变了就重圈候选教师（2026-11-12，见 loadCapabilityTeachers）
     void loadCapabilityTeachers(form.courseId);
+    // 换课 ⇒ 周次上限跟着该课开课记录走（2026-11-23，见 loadCourseWeekWindow）
+    void loadCourseWeekWindow(form.courseId);
     // 拖拽模式下换课：重新按该课的开课记录补教师与班级（点格子进来时课程是空的，选完才拿得到）
     void prefillTeachingForCell(form.courseId);
     // 「课程配置」模式：查该课是否已有配置（有 ⇒ 只能更新节奏，教师/班级只读展示）
@@ -3471,6 +3473,8 @@ async function openCreate(
   form.termId = String(filters.termId || currentTermId.value || '');
   // 拖拽排课默认收起高级设置（2026-11-23）；学期没定下来时不收起——否则保存被拦在看不见的字段上
   advancedOpen.value = false;
+  // 上一门课的开课周窗口不能带进这次弹窗：默认结束周会按它收窄，看着像「怎么只排到 16 周」
+  courseWeekWindow.value = null;
   // 周次区间默认整学期：起点第 1 周、结束周 = 该学期真实周数（#11 上限跟学期走）
   repeatForm.weekFrom = 1;
   repeatForm.weekTo = defaultWeekTo.value;
@@ -3510,6 +3514,8 @@ async function openCreate(
   createVisible.value = true;
   // 拖拽模式：教师、班级先按上下文填好，弹窗里就只剩「选课程」一件事
   void prefillTeachingForCell(form.courseId);
+  // 该课开课记录的教学周窗口（收窄周次上限；预设了课程时不会触发 watch，这里要主动取一次）
+  void loadCourseWeekWindow(form.courseId);
   // 学期没定、或周次窗口本身非法时不收起高级设置——被拦在看不见的字段上等于没提示
   if (createPresetCell.value && (!form.termId || createWeekRangeError.value)) advancedOpen.value = true;
   // 班级是唯一推不出来的必填项（课程接口不带班级）⇒ 展开高级设置时把焦点放上去，省一次"找框"的点击。
@@ -3687,7 +3693,12 @@ async function submitCreate() {
         `已排入 ${ids.length} 节（${REPEAT_TEXT[repeatForm.mode]}${repeatForm.weekly > 1 ? ` · 每周 ${repeatForm.weekly} 节` : ''}${createPresetCell.value ? '' : ' · 节次为系统自动分配，可在课表拖动调整'}，翻周即可查看）`
       );
       if (failed.length) {
-        ElMessageBox.alert(`以下时段因冲突未排入：${failed.join('；')}`, '部分课次未排入', { type: 'warning' }).catch(() => {});
+        // 标题不再是「因冲突」：失败可能是周次越界/缺教学班等非冲突原因，逐行带着后端原文
+        ElMessageBox.alert(
+          `以下时段未排入（原因见每行）：${failed.join('；')}`,
+          '部分课次未排入',
+          { type: 'warning' }
+        ).catch(() => {});
       }
     } else if (failed.length) {
       ElMessage.warning(`未保存：${failed[0]}`);
@@ -3779,6 +3790,55 @@ const termAnchorMonday = computed<Date | null>(() => termAnchorOf(currentTermInf
  * 默认值仍取当前浏览学期，省一次点击；但用户必须看得见、可改。 */
 const createTermInfo = computed(() => termInfoOf(form.termId));
 const createTermAnchorMonday = computed<Date | null>(() => termAnchorOf(createTermInfo.value));
+
+/* ---------- 该课开课记录的教学周窗口（2026-11-23）----------
+ * 后端判周次越界的上界 = min(教学周设置, 开课记录窗口)：开课记录只能把窗口**收窄**。
+ * 弹窗原来只按「学期周数 ∩ 教学周设置」算上限（本地 18 周），而现网开课记录都是
+ * week_from=1 / week_count=16 ⇒ 默认铺 1~18 周时，第 17、18 周必然被后端拒掉，
+ * 前端又把这个异常统一显示成「保存失败」，用户看不出是周次越界还是网络问题。
+ * 这里同口径取一次窗口，用它收窄输入上限并说明原因。 */
+const courseWeekWindow = ref<{ from: number; to: number } | null>(null);
+/** 起始周下限 / 结束周上限（无开课记录时不额外收窄） */
+const courseWeekFrom = computed(() => courseWeekWindow.value?.from ?? 1);
+
+/**
+ * 取该课的开课周窗口，并把已填的周次拉回窗口内。
+ * 口径对齐后端 `resolveWeekWindow` 的第 ② 级：取 week_count 非空、offering_id 最小的那条。
+ */
+async function loadCourseWeekWindow(courseId: string) {
+  const key = String(courseId || '');
+  if (!key) {
+    courseWeekWindow.value = null;
+    return;
+  }
+  let offs = offeringByCourse.value[key];
+  if (!offs) {
+    try {
+      offs = ((await listCourseOfferings(key)) ?? []) as OfferingBrief[];
+      offeringByCourse.value = { ...offeringByCourse.value, [key]: offs };
+    } catch {
+      offs = []; // 旧包/缺权限：不阻断弹窗，上限退回学期口径
+    }
+  }
+  // 异步回来时课程可能已改选/弹窗已关 ⇒ 只在课程未变时写回
+  if (String(form.courseId || '') !== key) return;
+  const hit = (offs ?? [])
+    .filter(o => Number(o?.weekCount) > 0)
+    .sort((a, b) => Number(a.offeringId ?? 0) - Number(b.offeringId ?? 0))[0];
+  if (!hit) {
+    courseWeekWindow.value = null;
+    return;
+  }
+  const from = Math.max(1, Math.round(Number(hit.weekFrom) || 1));
+  courseWeekWindow.value = { from, to: from + Math.round(Number(hit.weekCount)) - 1 };
+  // 已填的周次拉到窗口内：留着越界值只会在保存时整批失败（见文件头的成因说明）
+  if (repeatForm.mode !== 'once') {
+    if (Math.round(repeatForm.weekFrom) < from) repeatForm.weekFrom = from;
+    if (Math.round(repeatForm.weekTo) > courseWeekWindow.value.to) repeatForm.weekTo = courseWeekWindow.value.to;
+    syncRepeatTotal();
+  }
+}
+
 /** 弹窗所选学期的真实周数；0 = 该学期未配起止日期（结束周上限退化为 25 并给橙色提示） */
 const createTermWeeks = computed(() => termWeeksOf(createTermInfo.value));
 /** 结束周上限：学期周数已知取真实周数，未知退 25（与历史 times 上限一致）。
@@ -3787,14 +3847,20 @@ const createTermWeeks = computed(() => termWeeksOf(createTermInfo.value));
 const createWeekMax = computed(() => {
   const termWeeks = createTermWeeks.value > 0 ? createTermWeeks.value : 25;
   const tw = teachingWeekCount.value;
-  return tw ? Math.min(termWeeks, tw) : termWeeks;
+  const base = tw ? Math.min(termWeeks, tw) : termWeeks;
+  // 再被该课开课记录收窄（2026-11-23）：后端对越界周的拒收口径就是 min(教学周设置, 开课记录)
+  const ow = courseWeekWindow.value;
+  return ow ? Math.min(base, ow.to) : base;
 });
 /** 结束周的默认值：学期周数已知 ⇒ 铺满整学期（「排一次 = 整学期都有课」的既有语义）；
- *  学期未配日期 ⇒ 退回 18（历史默认值），不要拿 25 当默认——那等于默认多排 7 周。同样与教学周设置取小。 */
+ *  学期未配日期 ⇒ 退回 18（历史默认值），不要拿 25 当默认——那等于默认多排 7 周。同样与教学周设置取小，
+ *  并再被该课开课记录收窄（默认值越过开课记录 ⇒ 一保存就有两条注定失败的周次）。 */
 const defaultWeekTo = computed(() => {
   const termWeeks = createTermWeeks.value > 0 ? createTermWeeks.value : 18;
   const tw = teachingWeekCount.value;
-  return tw ? Math.min(termWeeks, tw) : termWeeks;
+  const base = tw ? Math.min(termWeeks, tw) : termWeeks;
+  const ow = courseWeekWindow.value;
+  return ow ? Math.min(base, ow.to) : base;
 });
 
 /** 当前浏览的学期（顶部筛选优先，其次是页面认定的当前学期）。
@@ -3803,10 +3869,11 @@ const viewTermId = computed(() => String(filters.termId || currentTermId.value |
 /** 弹窗所选学期与当前浏览学期是否不一致（不一致 ⇒ 保存后当前课表看不到新排的课次） */
 const creatingOtherTerm = computed(() => !!form.termId && form.termId !== viewTermId.value);
 
-/** 弹窗表单的周次区间（已按学期上限收敛；weekTo 不会小于 weekFrom） */
+/** 弹窗表单的周次区间（已按学期上限与开课记录窗口收敛；weekTo 不会小于 weekFrom） */
 function weekRange(): { wf: number; wt: number } {
   const maxW = createWeekMax.value;
-  const wf = Math.max(1, Math.min(maxW, Math.round(repeatForm.weekFrom || 1)));
+  const minW = Math.min(courseWeekFrom.value, maxW);
+  const wf = Math.max(minW, Math.min(maxW, Math.round(repeatForm.weekFrom || minW)));
   const wt = Math.max(wf, Math.min(maxW, Math.round(repeatForm.weekTo || wf)));
   return { wf, wt };
 }
@@ -3885,6 +3952,11 @@ const createWeekRangeError = computed(() => {
   const wt = Math.round(repeatForm.weekTo || 0);
   if (!Number.isFinite(wf) || wf < 1) return '起始周不能小于 1';
   if (!Number.isFinite(wt) || wt < wf) return '结束周不能早于起始周';
+  // 开课记录的窗口比学期/教学周都窄时，越界周保存必然被后端整条拒收（2026-11-23）
+  const ow = courseWeekWindow.value;
+  if (ow && (wf < ow.from || wt > ow.to)) {
+    return `该课开课记录的教学周是第 ${ow.from}~${ow.to} 周，周次不能超出这个范围（要排更长请先在课程详情改开课记录）`;
+  }
   if (createTermWeeks.value > 0 && wt > createTermWeeks.value) {
     return `结束周不能超过该学期周数（${createTermWeeks.value} 周）`;
   }
@@ -3930,7 +4002,7 @@ watch(
   () => form.termId,
   () => {
     if (!form.termId) return;
-    repeatForm.weekFrom = 1;
+    repeatForm.weekFrom = courseWeekFrom.value;
     repeatForm.weekTo = defaultWeekTo.value;
     syncRepeatTotal();
   }
@@ -3967,7 +4039,8 @@ const repeatHint = computed(() => {
   const { wf, wt } = weekRange();
   const n = effectiveRepeatTimes.value;
   const span = wf === wt ? `第 ${wf} 周` : `第 ${wf}~${wt} 周`;
-  if (repeatForm.mode === 'all') return `${span}每周同一时间上课，共 ${n} 次`;
+  // 「每周同一时间」会被读成「每周一」，加个「的」断开（2026-11-23，截图里就误读成周一）
+  if (repeatForm.mode === 'all') return `${span}每周的同一时段上课，共 ${n} 次`;
   const first = alignParityWeek(repeatForm.mode, wf);
   const which = repeatForm.mode === 'odd' ? '单周' : '双周';
   return `${span}内的${which}（第 ${first}、${first + 2}…周）上课，共 ${n} 次`;
@@ -4103,13 +4176,17 @@ async function createBatch(
       return;
     }
     try {
-      const res = await createSchedule({
-        ...base,
-        weekday: pl.weekday,
-        periodNo: pl.periodNo,
-        classTime: `${pl.date} ${period.start}:00`,
-        durationMin: period.duration
-      });
+      const res = await createSchedule(
+        {
+          ...base,
+          weekday: pl.weekday,
+          periodNo: pl.periodNo,
+          classTime: `${pl.date} ${period.start}:00`,
+          durationMin: period.duration
+        },
+        // 失败原因由本函数汇总成一条报告，逐条 toast 会把报告盖掉
+        { silent: true }
+      );
       if (res?.conflict) {
         results[i] = {
           fail: `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：${res.conflictMsg || '该时段教师、教室或班级已被占用'}`
@@ -4119,8 +4196,13 @@ async function createBatch(
       } else {
         results[i] = { fail: `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：保存失败（响应无课次 id）` };
       }
-    } catch {
-      results[i] = { fail: `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：保存失败` };
+    } catch (e) {
+      // 后端非冲突类失败（周次越界、缺教学班、落库 0 行……）带着可读原因返回，原先统一写成
+      // 「保存失败」把它丢了 —— 用户分不清是网络问题还是这条课本来就不该存在（2026-11-23）。
+      const raw = (e as Error)?.message?.trim() ?? '';
+      results[i] = {
+        fail: `${pl.date.slice(5)}（周${CN[pl.weekday - 1]} ${period.label}）：${raw || '保存失败'}`
+      };
     }
     onProgress?.(++doneCount, final.length);
   };
@@ -6013,12 +6095,15 @@ watch(
           {{ createCapacityWarn }}
         </div>
       </el-form-item>
-      <!-- 星期/教室：仅拖拽模式（落点已定）可改；「课程配置」模式不选时间——
-           2026-11-17 业主终口径：上课时间是自动排课排出来的，配置页不选 -->
-      <el-form-item v-if="createPresetCell && advancedOpen" label="星期">
-        <el-select v-model="form.weekday" style="width: 100%">
-          <el-option v-for="d in WEEKDAYS" :key="d.v" :label="d.label" :value="d.v" />
-        </el-select>
+      <!-- 上课时间（2026-11-23 业主口径）：拖拽模式的时段由「拖到哪个格子」决定，弹窗里
+           不再让人重选一遍星期——展开高级设置是为了改教师/班级/教室，不是为了再选一次时间。
+           要换时间直接把课拖到别的格子。每周节数 > 1 时，第 2 节起的节位仍需选星期
+           （那是「多出来的那几节排哪天」），见下方 extraSlotList。 -->
+      <el-form-item v-if="createPresetCell && advancedOpen" label="上课时间">
+        <div class="slot-fixed">
+          <b>{{ createSlotLabel }}</b>
+          <span class="small muted">来自课表格子，要换时间请拖到别的格子</span>
+        </div>
       </el-form-item>
       <!-- 每周节数（2026-10-20）：一周多节的课一次排完
            2026-11-17 业主终口径：课程配置不选「星期」——上课时间（星期几 + 第几节 + 时段）
@@ -6067,7 +6152,7 @@ watch(
           <span class="small muted">第</span>
           <el-input-number
             v-model="repeatForm.weekFrom"
-            :min="1"
+            :min="courseWeekFrom"
             :max="createWeekMax"
             :step="1"
             step-strictly
@@ -6087,6 +6172,12 @@ watch(
           />
           <span class="small muted">周（自动算出）</span>
           <span class="small muted" style="margin-left: 8px">上限 {{ createWeekMax }} 周</span>
+        </div>
+        <!-- 上限是谁定的要说清（2026-11-23）：现网开课记录的教学周（16 周）比教学周设置（18 周）短，
+             默认按 18 周铺课时，第 17、18 周会被后端按「超出教学周」拒收，前端只显示「保存失败」。 -->
+        <div v-if="courseWeekWindow" class="small muted" style="width: 100%">
+          该课开课记录排到第 {{ courseWeekWindow.from }}~{{ courseWeekWindow.to }} 周，周次上限按它收窄（教学周设置允许
+          {{ teachingWeekCount || createTermWeeks }} 周）；要排更长请先在课程详情里改开课记录的教学周。
         </div>
         <!-- 拖拽模式的重复方式说明（功能性提示，保留）：配置模式的说明显然删掉了 -->
         <div v-if="createPresetCell && repeatForm.mode !== 'once'" class="small muted" style="width: 100%">
@@ -7145,6 +7236,19 @@ watch(
 }
 .create-context .ctx-link:hover {
   text-decoration: underline;
+}
+/* 高级设置里的「上课时间」只读行：与左侧输入框同高，视觉上是一块信息而不是待填的框 */
+.slot-fixed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  width: 100%;
+  flex-wrap: wrap;
+}
+.slot-fixed b {
+  font-weight: 600;
+  color: var(--ink-800, #27272a);
 }
 /* 未发布（draft）标识：中性灰、左上角 —— 避开右上角的拖拽悬停标签 */
 .draft-tag {

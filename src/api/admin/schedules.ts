@@ -86,9 +86,16 @@ export async function listSchedules(query: ScheduleQuery) {
   return request<PageResult<ScheduleCell>>({ url: SCHEDULE_BASE, method: 'get', params: query });
 }
 
-/** C-17 新建课次（带冲突检查）。★ 命中冲突时后端**不落库**，返回 conflict=true */
-export async function createSchedule(body: ScheduleCreateBody) {
-  return request<ScheduleCreateResult>({ url: SCHEDULE_BASE, method: 'post', data: body });
+/** C-17 新建课次（带冲突检查）。★ 命中冲突时后端**不落库**，返回 conflict=true
+ *  @param opts.silent 批量建课次时传 true：失败原因由调用方汇总后一次性展示，
+ *         不需要一条一个 toast（一次排 18 周、两条越界就弹两条，把汇总盖掉）。 */
+export async function createSchedule(body: ScheduleCreateBody, opts?: { silent?: boolean }) {
+  return request<ScheduleCreateResult>({
+    url: SCHEDULE_BASE,
+    method: 'post',
+    data: body,
+    silent: opts?.silent === true
+  });
 }
 
 /**
