@@ -1574,7 +1574,7 @@ onMounted(async () => {
             <span v-if="!(detailData?.offerings ?? []).length" class="badge badge-neutral">未配置</span>
             <span v-else-if="drawerConfigured" class="badge badge-success">已配置</span>
             <!-- 有配置但不完整（缺教师/节奏/必修缺班级）：仍按未配置引导补全（2026-11-16 业主口径） -->
-            <el-tooltip v-else-if="canOffer" content="配置不完整（缺教师/节奏或必修缺班级），点下方「编辑教学班」补全" placement="top">
+            <el-tooltip v-else-if="canOffer" content="配置不完整（缺教师/节奏或必修缺班级），点该条配置下方的「编辑教学班」补全" placement="top">
               <button type="button" class="badge badge-neutral badge-action" @click.stop="openOfferFor({ courseId: detailCourse.courseId, courseName: detailCourse.courseName, hours: detailData?.hours ?? detailCourse.hours ?? null })">
                 未配置<ZkIcon name="chevron-right" :size="11" />
               </button>
@@ -1618,10 +1618,16 @@ onMounted(async () => {
           <span v-else class="small" style="margin-left: 8px; color: var(--el-color-warning)">配置未完成：缺教师 / 节奏{{ isElectiveType(detailCourse?.courseType) ? '' : ' / 必修缺班级' }}</span>
         </div>
         <div v-loading="detailOfferLoading">
+          <!-- 多教学班说明（2026-11-23）：一门课两位老师各带一个班时，这里是两条配置。
+               必须写明「排课时各排一套」，否则管理员会以为一门课只会排一份课次。 -->
+          <div v-if="(detailData?.offerings ?? []).length > 1" class="small muted" style="margin-bottom: 8px">
+            本条课程有 {{ (detailData?.offerings ?? []).length }} 个教学班（每条 = 一位教师 + 一组班级，节奏各自独立）：
+            排课时按教学班各排一套课次。
+          </div>
           <div v-if="(detailData?.offerings ?? []).length" class="stack" style="gap: 8px">
             <div v-for="o in detailData?.offerings" :key="o.offeringId" class="material-row offering-row">
               <ZkIcon name="calendar" :size="15" />
-              <div style="min-width: 0">
+              <div class="offering-main">
                 <div style="font-weight: 600">
                   {{ o.termCode || '—' }}
                   <span class="badge" :class="o.status === 'active' ? 'badge-success' : 'badge-neutral'" style="margin-left: 6px">
@@ -1637,17 +1643,11 @@ onMounted(async () => {
                   加课码 <b>{{ o.joinCode }}</b> · 课次 {{ o.scheduleCount ?? 0 }} 节
                   <template v-if="o.weekCount"> · {{ o.weekCount }} 教学周</template>
                 </div>
-                <!-- 批次7 排课配置（录音：排课前先选好 总课时/一周几节/第几周到第几周） -->
+                <!-- 批次7 排课配置（录音：排课前先选好 总课时/一周几节/第几周到第几周）
+                     2026-11-23 业主：原来「编辑教学班」是这行文字末尾的小链接，藏在两行灰字之间
+                     根本看不见。入口改到行底独立操作条（见下方 offering-actions），这里只留只读汇总。 -->
                 <div class="small muted" style="margin-top: 2px">
                   排课设置：<span style="color: var(--text, #344054)">{{ schedCfgLabel(o) }}</span>
-                  <el-button
-                    v-if="canOffer && o.status === 'active'"
-                    link
-                    size="small"
-                    type="primary"
-                    style="margin-left: 6px"
-                    @click="schedCfgId === o.offeringId ? (schedCfgId = '') : openSchedCfg(o)"
-                  >{{ schedCfgId === o.offeringId ? '收起' : '编辑教学班' }}</el-button>
                 </div>
                 <div v-if="schedCfgId === o.offeringId" class="cfg-block">
                   <!-- 抽屉只有 ~240px 可用宽，改成单列「定宽标签 + 数字框」网格：
@@ -1746,18 +1746,31 @@ onMounted(async () => {
                   </div>
                 </div>
               </div>
-              <!-- B-7 重新排课：对进行中的开课记录一键重跑 auto-arrange
-                   （会议 A3"新增的课重新排一次"——除了建课向导，已开的课也随时可重排） -->
-              <el-button
-                v-if="canOffer && o.status === 'active'"
-                size="small"
-                text
-                :loading="rearrangingId === o.offeringId"
-                style="margin-left: auto"
-                @click="onRearrange(o)"
-              >
-                <ZkIcon name="refresh-cw" :size="13" style="margin-right: 3px" />重新排课
-              </el-button>
+              <!-- 行底操作条（2026-11-23 业主：编辑入口太隐蔽，重新放）：
+                   「编辑教学班」是这个抽屉里最常点的操作（教师/班级/节奏都在里面改），
+                   原来缩在「排课设置：xxx」这行灰色小字尾部，等于没有入口。
+                   现在按整行宽度独立成条，主按钮带描边+图标，和「重新排课」并排；
+                   flex-basis:100% 让它换到内容下方，不跟课程名抢宽度（抽屉只有 460px）。 -->
+              <div v-if="canOffer && o.status === 'active'" class="offering-actions">
+                <el-button
+                  :type="schedCfgId === o.offeringId ? 'default' : 'primary'"
+                  :plain="schedCfgId !== o.offeringId"
+                  size="small"
+                  @click="schedCfgId === o.offeringId ? (schedCfgId = '') : openSchedCfg(o)"
+                >
+                  <ZkIcon :name="schedCfgId === o.offeringId ? 'chevron-up' : 'settings'" :size="13" style="margin-right: 4px" />
+                  {{ schedCfgId === o.offeringId ? '收起教学班设置' : '编辑教学班' }}
+                </el-button>
+                <!-- B-7 重新排课：对进行中的开课记录一键重跑 auto-arrange
+                     （会议 A3"新增的课重新排一次"——除了建课向导，已开的课也随时可重排） -->
+                <el-button
+                  size="small"
+                  :loading="rearrangingId === o.offeringId"
+                  @click="onRearrange(o)"
+                >
+                  <ZkIcon name="refresh-cw" :size="13" style="margin-right: 4px" />重新排课
+                </el-button>
+              </div>
             </div>
           </div>
           <div v-else-if="!detailOfferLoading" class="small muted">
@@ -2199,6 +2212,30 @@ onMounted(async () => {
 }
 .cert-hint {
   color: var(--warn-700, #8a6116);
+}
+
+/* 开课记录行（2026-11-23）：内容 + 行底操作条。
+   material-row 默认 nowrap，操作条用 flex-basis:100% 强制换到下一行，
+   padding-left 对齐到日历图标右侧，读起来是「这条配置自己的操作」而不是整块的。
+   两个按钮之间的间距统一走 gap，并清掉 Element 的 .el-button + .el-button 左外边距，
+   否则会叠成 20px（8 + 12），在 460px 抽屉里显得松散。 */
+.offering-row {
+  flex-wrap: wrap;
+}
+.offering-main {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.offering-actions {
+  flex: 0 0 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-left: 23px;
+  margin-top: 4px;
+}
+.offering-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
 }
 
 /* 抽屉内「修改配置」的排课节奏：单列定宽网格。
