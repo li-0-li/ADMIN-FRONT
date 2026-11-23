@@ -1036,25 +1036,14 @@ interface CfgVerdict {
 
 function cfgVerdictOf(c: PoolCourse): CfgVerdict {
   const total = Number(c.offeringCount ?? 0);
-  // 班级这一项按课程性质区别对待（2026-11-16 业主口径）：选修课可以没有面向班级
-  const needClazz = !isElectiveCourse(c.courseType);
   const offs = offeringByCourse.value[String(c.courseId)];
   if (offs?.length) {
     const gaps = new Set<CfgGap>();
     let missingRhythm = 0;
     for (const o of offs) {
-      // 节奏：字段缺失（旧包）按已配，只有明确为 0 才算缺
-      if (o.scheduleConfigured !== undefined && o.scheduleConfigured !== null && Number(o.scheduleConfigured) === 0) {
-        missingRhythm += 1;
-        gaps.add('rhythm');
-      }
-      if (!o.teacherId) gaps.add('teacher');
-      // 占位值（`未分班` 等）不算班级：它正是「没登记班级」的历史写法（见 isNoClazzName）
-      const clazzes = (Array.isArray(o.targetClasses) ? o.targetClasses : [])
-        .map(x => String(x ?? '').trim())
-        .filter(x => !isNoClazzName(x));
-      const key = String(o.classKey ?? '').trim();
-      if (needClazz && !clazzes.length && isNoClazzName(key)) gaps.add('clazz');
+      const one = verdictOneOffering(c, o);
+      one.gaps.forEach(g => gaps.add(g));
+      missingRhythm += one.missingRhythm;
     }
     const list = [...gaps];
     // 只缺节奏且只缺一部分 ⇒ partial（角标仍写「未配 1/2」，两栏都不进已配置）
@@ -1068,6 +1057,59 @@ function cfgVerdictOf(c: PoolCourse): CfgVerdict {
   return un > 0
     ? { cfg: 'partial', gaps: ['rhythm'], missingRhythm: un }
     : { cfg: 'ready', gaps: [], missingRhythm: 0 };
+}
+
+/**
+ * 单条开课记录（= 一个教学班）的三项体检（2026-11-23）。
+ * 从 `cfgVerdictOf` 里抽出来，是因为池子拆成「一卡一教学班」后要**逐条**判，
+ * 不能再把整门课的缺口合在一起算——否则 A 班缺教师会把 B 班也拖进未配置栏。
+ */
+function verdictOneOffering(c: PoolCourse, o: OfferingBrief): { gaps: CfgGap[]; missingRhythm: number } {
+  // 班级这一项按课程性质区别对待（2026-11-16 业主口径）：选修课可以没有面向班级
+  const needClazz = !isElectiveCourse(c.courseType);
+  const gaps: CfgGap[] = [];
+  let missingRhythm = 0;
+  // 节奏：字段缺失（旧包）按已配，只有明确为 0 才算缺
+  if (o.scheduleConfigured !== undefined && o.scheduleConfigured !== null && Number(o.scheduleConfigured) === 0) {
+    missingRhythm = 1;
+    gaps.push('rhythm');
+  }
+  if (!o.teacherId) gaps.push('teacher');
+  // 占位值（`未分班` 等）不算班级：它正是「没登记班级」的历史写法（见 isNoClazzName）
+  const clazzes = (Array.isArray(o.targetClasses) ? o.targetClasses : [])
+    .map(x => String(x ?? '').trim())
+    .filter(x => !isNoClazzName(x));
+  const key = String(o.classKey ?? '').trim();
+  if (needClazz && !clazzes.length && isNoClazzName(key)) gaps.push('clazz');
+  return { gaps, missingRhythm };
+}
+
+/** 单个教学班的配置状态（多卡模式：一卡只判自己那一条） */
+function cfgVerdictOfOne(c: PoolCourse, o: OfferingBrief): CfgVerdict {
+  const { gaps, missingRhythm } = verdictOneOffering(c, o);
+  const cfg: PoolEntry['cfg'] = gaps.length === 0 ? 'ready' : gaps.length === 1 && gaps[0] === 'rhythm' ? 'partial' : 'none';
+  return { cfg, gaps, missingRhythm };
+}
+
+/**
+ * 某节课次属于哪条开课记录（2026-11-23，池子拆教学班卡片后要用）。
+ *
+ * 判据只有两样现成的：`schedule.teacher_id` 与 `schedule.target_class`
+ * （课次 VO **没有下发 offering_id**，所以只能按这两个字段反推）。
+ *   · 教师不同 ⇒ 肯定不是这条（这是最主要的分辨依据，库里教师必填）；
+ *   · 这条配置登记了班级 ⇒ 课次的班级要落在其中（合班时多个班都算）；
+ *   · 这条没登记班级（选修课常见）⇒ 只能按教师判，匹配即算。
+ * 判不出来时返回 true（宁可两卡都算上，也不要让「本周已排」凭空少一节）。
+ */
+function cellBelongsToOffering(cell: ScheduleCell, off: OfferingBrief): boolean {
+  const tid = String(off.teacherId ?? '').trim();
+  const cellTid = String(cell.teacherId ?? '').trim();
+  if (tid && cellTid && tid !== cellTid) return false;
+  const clazzes = (Array.isArray(off.targetClasses) ? off.targetClasses : [])
+    .map(x => String(x ?? '').trim())
+    .filter(x => !isNoClazzName(x));
+  if (!clazzes.length) return true;
+  return clazzes.includes(String(cell.clazzName ?? '').trim());
 }
 
 /** 本周被「放回待排」的课次（软删行全集）：每条 = 待排池里的一张签 */
@@ -1124,6 +1166,20 @@ interface PoolEntry extends CourseBrief {
    */
   weekPlaced?: number;
   /**
+   * 所属开课记录（教学班），2026-11-23 业主口径：**教师或班级不一样的，池子里要拆成多张卡**。
+   *
+   * 一门课有几条 `course_offering` 就是几个教学班，各有各的教师/班级/节奏；
+   * 合成一张卡时只能写「张老师 / 杨超」这种聚合名，看不出哪个班该排几节。
+   * 拆开后：每张卡 = 一个教学班，`offeringId` 用来把「排到本周 / 自动排课 / 拖拽排课」
+   * 精确打在这条配置上（后端 auto-arrange 支持 offeringId），不会再一操作就两个班一起动。
+   *
+   * 缺失（undefined）= 该课只有一条配置、或明细还没拉到 ⇒ 保持旧的按课程行为。
+   */
+  offeringId?: string;
+  /** 第几个教学班（1 起）与总数，仅用于卡片角标「教学班 1/2」 */
+  offeringIdx?: number;
+  offeringTotal?: number;
+  /**
    * 排课节奏配置状态（2026-11-16 业主口径：待排池拆「已配置课程 / 未配置课程」两栏，
    * 自动排课只收已配置的课）。
    * - `ready`   全部开课记录都配过（总节次 / 每周节次 / 周范围）⇒ 才算「已配置课程」，可自动排课；
@@ -1163,11 +1219,14 @@ function buildPoolEntries(): PoolEntry[] {
       )
     : allCells.value;
   const used = new Set(inScope.map(c => String(c.courseId)));
-  /** courseId -> 本周活跃课次数（2026-11-23：排满的课要在池里留下，靠它写「本周已排 N 节」） */
-  const weekPlaced = new Map<string, number>();
+  /** courseId -> 本周活跃课次（2026-11-23：排满的课要在池里留下，靠它写「本周已排 N 节」；
+   *  拆成教学班卡片后还要按 offering 再分一遍，所以留的是明细不是计数） */
+  const placedByCourse = new Map<string, ScheduleCell[]>();
   for (const c of inScope) {
     const k = String(c.courseId);
-    weekPlaced.set(k, (weekPlaced.get(k) ?? 0) + 1);
+    const arr = placedByCourse.get(k);
+    if (arr) arr.push(c);
+    else placedByCourse.set(k, [c]);
   }
   // courseId -> 本周放回的课次列表
   const returned = new Map<string, ScheduleCell[]>();
@@ -1190,8 +1249,70 @@ function buildPoolEntries(): PoolEntry[] {
     return v;
   };
   for (const c of poolCourses.value) {
-    const rows = returned.get(String(c.courseId));
-    if (rows?.length) {
+    const rows = returned.get(String(c.courseId)) ?? [];
+    // 该课的开课明细（异步补拉的）：>1 条 = 多个教学班，池子要拆成多张卡（2026-11-23 业主口径）
+    const offs = offeringByCourse.value[String(c.courseId)];
+    const multiOffs = Array.isArray(offs) && offs.length > 1;
+    const cells = placedByCourse.get(String(c.courseId)) ?? [];
+
+    if (multiOffs) {
+      // ★ 2026-11-23 业主口径：教师或班级不一样的，池子里就该是多张卡，只是显示的信息不同。
+      //   一门课几条开课记录就是几个教学班。这里**以教学班为单位**出卡：每个教学班要么出一张
+      //   属于它的放回签（拖回去排的就是那一节），要么出一张普通卡。
+      //   ★ 不能「有签就只出签」——首版就是这么写的，结果另一条没有签的配置整张漏掉，
+      //     池子里只剩 1 张卡、还标着「教学班 2/2」。
+      const offList = offs as OfferingBrief[];
+      // 已兑现的槽位：放回后又在同一「周+星期+节次」排回来了（键带周维度，2026-11-17）
+      const liveSlots = new Set(cells.map(x => `${x.weekNo ?? ''}-${x.weekday}-${x.periodNo}`));
+      /** 已被别的教学班用掉的槽位（同一槽位只出一张卡） */
+      const usedSignSlots = new Set<string>();
+      offList.forEach((o, i) => {
+        const v = cfgVerdictOfOne(c, o);
+        const seat = cells.filter(x => cellBelongsToOffering(x, o)).length;
+        const clazzes = (o.targetClasses ?? []).map(x => String(x ?? '').trim()).filter(x => !isNoClazzName(x));
+        const base = {
+          ...c,
+          offeringId: String(o.offeringId),
+          offeringIdx: i + 1,
+          offeringTotal: offList.length,
+          // 教师/班级/人数一律换成这条配置自己的，不再用课程行的聚合值
+          teacherId: o.teacherId ? String(o.teacherId) : undefined,
+          teacherName: (o.teacherName ?? '').trim() || undefined,
+          targetClasses: clazzes,
+          studentCount: Number(o.studentCount ?? 0),
+          // ★ 只能按本教学班自己的课次判（seat）：拆卡后再用「整门课有课次」兜底，
+          //   会让没排过的那个班也挂上「已在课表」，看起来像两个班都排好了。
+          inSchedule: seat > 0,
+          weekPlaced: seat,
+          cfg: v.cfg,
+          cfgGaps: v.gaps,
+          missingRhythm: v.missingRhythm
+        };
+        // 这个教学班自己的放回签：未兑现、且槽位没被别的教学班占
+        const own = rows
+          .filter(r => cellBelongsToOffering(r, o))
+          .sort((a, b) => Number(b.scheduleId) - Number(a.scheduleId))
+          .find(r => {
+            const k = `${r.weekNo ?? ''}-${r.weekday}-${r.periodNo}`;
+            return !liveSlots.has(k) && !usedSignSlots.has(k);
+          });
+        if (own) {
+          usedSignSlots.add(`${own.weekNo ?? ''}-${own.weekday}-${own.periodNo}`);
+          out.push({
+            ...base,
+            key: `lesson-${own.scheduleId}`,
+            fromWeekday: own.weekday,
+            fromPeriodNo: own.periodNo,
+            fromWeekNo: own.weekNo
+          });
+        } else {
+          out.push({ ...base, key: `course-${c.courseId}-off-${o.offeringId}` });
+        }
+      });
+      continue;
+    }
+
+    if (rows.length) {
       // ① 已兑现的签不再显示（2026-11-16 业主「×2 节只能有一节」的一半成因）：
       //    放回后又在同一「周+星期+节次」排回了新课次 ⇒ 这张签已经被兑现，再挂着只会让人
       //    以为主课有重复。差集键带周维度（2026-11-17）：同一门课每周复用同一「星期+节次」，
@@ -1218,6 +1339,8 @@ function buildPoolEntries(): PoolEntry[] {
         break; // 一门课只出 1 张签
       }
       for (const r of kept) {
+        // 单教学班的课：放回签只代表「这一节要重排」，没有班可归属，按课程级判定即可
+        //（多教学班的放回签在上面的 multiOffs 分支里已经各自归位）
         const v = verdict(c);
         out.push({
           ...c,
@@ -1238,7 +1361,7 @@ function buildPoolEntries(): PoolEntry[] {
       //   还能在池里看到的课，靠的其实是历史上「放回」留下的软删残影签（有签才走上面的分支），
       //   所以出现了「别的课都在、就这门没有」的错觉。
       //   现在一律列出，已排的只做标记（weekPlaced）——池子既是待排来源，也是课程全量清单。
-      const seat = weekPlaced.get(String(c.courseId)) ?? 0;
+      const seat = cells.length;
       const v = verdict(c);
       out.push({
         ...c,
@@ -1350,19 +1473,23 @@ const poolConfigured = computed(() => poolEntries.value.filter(e => isCfgReady(e
 const poolUnconfigured = computed(() => poolEntries.value.filter(e => !isCfgReady(e.cfg)));
 
 /**
- * 池子里的「一张卡」= 一门课（2026-11-16 业主反馈：待排池里同一门课出现多张同名卡，像重复数据）。
+ * 池子里的「一张卡」= 一个**教学班**（2026-11-16 业主要求同名课不要裂成多张；
+ * 2026-11-23 追加：教师或班级不一样时**必须**裂开，只是每组信息不同）。
  *
  * ★ 成因：池子条目的粒度是「1 节 = 1 签」，一门课整周 5 节被「放回」就会留下 5 张同名签。
  *   以前靠 `poolSubLabel` 写「原 周一 1-2 节」区分，但两列布局后卡片变窄，多张同名卡挤在一栏里
- *   看起来就是重复课程。现在按 courseId 聚合：一张卡 = 一门课，卡角标写「×N 节」，
- *   拖拽/点击仍按「排一节」执行（点击后可在表单里选具体时间），N=1 时角标不显示。
+ *   看起来就是重复课程。所以按「课程 + 教学班」聚合：同一门课同一教学班只有一张卡，
+ *   卡角标写「×N 节」，拖拽/点击仍按「排一节」执行，N=1 时角标不显示。
+ *   `course_offering` 有多条时按 offeringId 分组 ⇒ 一个教学班一张卡，各显示自己的教师/班级。
  */
 type PoolChip = PoolEntry & { count: number; sigKeys: string[] };
 
 function groupChips(list: PoolEntry[]): PoolChip[] {
   const byCourse = new Map<string, PoolEntry[]>();
   for (const e of list) {
-    const k = String(e.courseId);
+    // ★ 2026-11-23：分组键带上 offeringId —— 一门课多个教学班时，每个教学班各自一张卡；
+    //   同一教学班的多张放回签仍合成一张卡（`count` = 签数，角标「×N 节」）。
+    const k = `${e.courseId}|${e.offeringId ?? ''}`;
     const arr = byCourse.get(k);
     if (arr) arr.push(e);
     else byCourse.set(k, [e]);
@@ -1438,6 +1565,9 @@ const placingKey = ref('');
  * 「排到本周」（2026-11-16 业主）：不用挑具体格子，后端在本周内自动找空位
  * （避开教师/教室/班级冲突与偏好网格）。走 auto-arrange 的 weekFrom/weekCount 覆盖，
  * 与开课配置的周范围取交集——配置外的周后端会明确拒绝，不会把课排到窗口外。
+ *
+ * ★ 2026-11-23：卡片按教学班拆分后，带 `offeringId` 的卡只排自己这一条配置；
+ *   否则（单配置的课）仍按整门课下发，行为与之前一致。
  */
 async function placeInCurrentWeek(c: PoolChip) {
   if (placingKey.value) return;
@@ -1457,28 +1587,30 @@ async function placeInCurrentWeek(c: PoolChip) {
     ElMessage.warning(`今天还在学期开始（${t?.startDate ?? '未知'}）之前，没有可排的「本周」`);
     return;
   }
+  /** 卡片上带着哪个教学班（多人多班时提示里要写清是哪个班，否则两张同名卡分不出结果） */
+  const who = teachingClassLabel(c);
   placingKey.value = c.key;
   try {
     const rows = await autoArrange({
-      courseId: String(c.courseId),
+      ...(c.offeringId ? { offeringId: c.offeringId } : { courseId: String(c.courseId) }),
       weekFrom: w,
       weekCount: 1,
       termId: tid || undefined
     });
-    // ★ 2026-11-23：一门课可以有多条教学班配置（两个老师各带一个班），后端按 offering 逐条排，
-    //   返回的是多行结果。原先只读 rows[0]，第二个班排了什么、有没有排进去都看不到。
+    // ★ 2026-11-23：按整门课下发时后端会对每条 offering 各排一遍，返回多行；只读 rows[0] 会漏报
     const list = rows ?? [];
     const placed = list.reduce((n, r) => n + (r.arranged ?? 0), 0);
     const skipped = list.flatMap(r => r.skipped ?? []);
+    const name = who ? `「${c.courseName}」${who}` : `「${c.courseName}」`;
     if (placed > 0) {
       const parts = list
         .filter(r => (r.arranged ?? 0) > 0)
         .map(r => `${r.courseName || c.courseName}：${r.arranged} 节`);
-      ElMessage.success(`「${c.courseName}」已排入第 ${w} 周 ${placed} 节${list.length > 1 ? `（${parts.join('，')}）` : ''}`);
+      ElMessage.success(`${name}已排入第 ${w} 周 ${placed} 节${list.length > 1 ? `（${parts.join('，')}）` : ''}`);
     } else if (skipped.some(s => /幂等跳过/.test(s.reason || ''))) {
-      ElMessage.info(`「${c.courseName}」第 ${w} 周已排满，无需再排`);
+      ElMessage.info(`${name}第 ${w} 周已排满，无需再排`);
     } else {
-      ElMessage.warning(`「${c.courseName}」第 ${w} 周未排入：${skipped[0]?.reason ?? '偏好网格内教师与教室均无空闲'}`);
+      ElMessage.warning(`${name}第 ${w} 周未排入：${skipped[0]?.reason ?? '偏好网格内教师与教室均无空闲'}`);
     }
     // 只刷课表与池子（课次变了、开课配置没变，不必清 offerings 缓存）
     await load(true);
@@ -1512,16 +1644,17 @@ const poolGapSummary = computed(() => {
     if (g.includes('rhythm')) rhythm += 1;
   }
   const parts: string[] = [];
-  if (clazz) parts.push(`缺班级（必修课）${clazz} 门`);
-  if (teacher) parts.push(`缺教师 ${teacher} 门`);
-  if (rhythm) parts.push(`缺排课设置 ${rhythm} 门`);
-  if (noOffering) parts.push(`无开课记录 ${noOffering} 门`);
+  // 单位用「条」不用「门」：一门课多个教学班时，右栏里可能是同一门课的几条配置各缺一项
+  if (clazz) parts.push(`缺班级（必修课）${clazz} 条`);
+  if (teacher) parts.push(`缺教师 ${teacher} 条`);
+  if (rhythm) parts.push(`缺排课设置 ${rhythm} 条`);
+  if (noOffering) parts.push(`无开课记录 ${noOffering} 条`);
   // 各项会重叠（一门课可能同时缺班级与排课设置），不注明的话 16+13 > 19 会让人以为数错了
-  const overlap = parts.length > 1 ? '（同一门可能同时缺多项）' : '';
-  return `右栏 ${chips.length} 门未配置：${parts.join(' · ')}${overlap}——补齐后自动进「已配置课程」`;
+  const overlap = parts.length > 1 ? '（同一条可能同时缺多项）' : '';
+  return `右栏 ${chips.length} 条未配置：${parts.join(' · ')}${overlap}——补齐后自动进「已配置课程」`;
 });
 
-/** 两栏各多少门（池子 head 上一句话报清；按门不按节，与「共 N 门课」同一量纲） */
+/** 两栏各多少张卡（池子 head 上一句话报清；拆教学班后一卡 = 一个教学班，与「共 N 个教学班」同一量纲） */
 const poolCfgCounts = computed(() => ({
   ready: groupChips(poolConfigured.value).length,
   unready: groupChips(poolUnconfigured.value).length
@@ -1595,7 +1728,9 @@ function poolChipTitle(e: PoolEntry) {
   const countTip = cnt > 1 ? `；该课共 ${cnt} 节待排，拖一次排回一节` : '';
   const placedTip = e.weekPlaced ? `；本周课表已有 ${e.weekPlaced} 节` : '';
   const cfgTip = isCfgReady(e.cfg) ? '' : `；${cfgGapTip(e)}`;
-  return `${base}${countTip}${placedTip}，或点击打开新增表单：${e.courseName}${cfgTip}`;
+  // 多教学班：说清这张卡是哪个班（两张同名卡只看课程名分不清）
+  const classTip = multiOffering(e) ? `；教学班 ${e.offeringIdx}/${e.offeringTotal ?? e.offeringCount}${teachingClassLabel(e)}` : '';
+  return `${base}${countTip}${placedTip}，或点击打开新增表单：${e.courseName}${classTip}${cfgTip}`;
 }
 
 /* ---------- 待排课程展开浮层（非模态可拖动；内含搜索与教师筛选） ---------- */
@@ -1628,7 +1763,7 @@ async function openPoolPanel() {
   await loadPickers();
 }
 
-const draggingCourse = ref<CourseBrief | null>(null);
+const draggingCourse = ref<CourseBrief | PoolEntry | null>(null);
 /** 正在拖动的**已有课次**（表内移动 C-19 / 互换 C-20） */
 const draggingCell = ref<ScheduleCell | null>(null);
 const dragOverKey = ref('');
@@ -1945,7 +2080,7 @@ const weekStats = computed(() => {
   return { total: filtered.value.length, teachers: teachers.size, rooms: rooms.size, conflicts };
 });
 
-function onDragStart(c: CourseBrief, e: DragEvent) {
+function onDragStart(c: CourseBrief | PoolEntry, e: DragEvent) {
   draggingCell.value = null;
   draggingCourse.value = c;
   dragOverKey.value = '';
@@ -2271,7 +2406,9 @@ async function handleDrop(weekday: number, periodNo: number, targetCardId: strin
   //    该格已有别的课也照常放行：同节次不同教师/不同教室是合法排课，
   //    是否冲突交给后端判定（冲突时会在提交后明确提示原因）。
   if (newCourse) {
-    await openCreate(weekday, periodNo, { courseId: String(newCourse.courseId) });
+    // 从某张教学班卡片拖进来 ⇒ 带上 offeringId，教师/班级按那一条配置预填（2026-11-23）
+    const offId = 'offeringId' in newCourse ? newCourse.offeringId : undefined;
+    await openCreate(weekday, periodNo, { courseId: String(newCourse.courseId), offeringId: offId });
   }
 }
 
@@ -3022,6 +3159,12 @@ const selectedCourseName = computed(
 const teacherList = ref<{ value: string; label: string }[]>([]);
 /** 拖动/点击课程卡进来时，记录来源课程，用于自动预选授课教师 */
 const presetCourseId = ref('');
+/**
+ * 从池子里某个**教学班卡片**点进来时记录它的 offeringId（2026-11-23）。
+ * 一门课多个教学班时，卡片上点谁就该编辑谁：课程配置弹窗默认选中这条，
+ * 拖拽排课模式则按它的教师/班级预填，而不是永远取第一条。
+ */
+const presetOfferingId = ref('');
 
 /**
  * 新增弹窗的课程选项（2026-11-11 放开认证前置 · 录音 A3）。
@@ -3107,8 +3250,12 @@ watch(
     void loadCapabilityTeachers(form.courseId);
     // 换课 ⇒ 周次上限跟着该课开课记录走（2026-11-23，见 loadCourseWeekWindow）
     void loadCourseWeekWindow(form.courseId);
-    // 拖拽模式下换课：重新按该课的开课记录补教师与班级（点格子进来时课程是空的，选完才拿得到）
-    void prefillTeachingForCell(form.courseId);
+    // 拖拽模式下换课：重新按该课的开课记录补教师与班级（点格子进来时课程是空的，选完才拿得到）。
+    // 仍是「从某张教学班卡片进来」的那门课 ⇒ 按那张卡的配置预填；用户改选了别的课就不带 offering。
+    void prefillTeachingForCell(
+      form.courseId,
+      String(form.courseId) === String(presetCourseId.value) ? presetOfferingId.value : ''
+    );
     // 「课程配置」模式：查该课是否已有配置（有 ⇒ 只能更新节奏，教师/班级只读展示）
     void loadConfigOffering();
   }
@@ -3181,10 +3328,15 @@ async function loadConfigOffering() {
     const list = (await listCourseOfferings(form.courseId)) ?? [];
     configOfferings.value = list;
     if (list.length) {
-      // 默认编辑第一条；其余教学班在弹窗顶部切换
-      configOffering.value = list[0];
+      // 默认编辑第一条；从某个教学班卡片点进来的（presetOfferingId）则直接选中那一条，
+      // 其余教学班仍可在弹窗顶部切换（2026-11-23）
+      const prefer = presetOfferingId.value
+        ? list.find(o => String(o.offeringId) === String(presetOfferingId.value))
+        : undefined;
+      const pick = prefer ?? list[0];
+      configOffering.value = pick;
       configExisting.value = true;
-      await applyOfferingToForm(list[0]);
+      await applyOfferingToForm(pick);
     }
   } catch {
     /* 查询失败按无配置处理，保存时后端会把重复配置的 40902 拦出来 */
@@ -3521,7 +3673,7 @@ let prefilledClazz = '';
  *   ③ 兜底交给 `watch(form.courseId)` 按课程带出的默认教师。
  * 三步都取不到（课程没登记、页头也没筛）就留空，保存时再展开高级设置让人补，不在这里瞎猜。
  */
-async function prefillTeachingForCell(courseId: string) {
+async function prefillTeachingForCell(courseId: string, offeringId = '') {
   if (!createPresetCell.value) return;
   if (filters.teacherId && !form.teacherId) form.teacherId = filters.teacherId;
   if (filters.clazzName && !form.clazzName.trim()) form.clazzName = filters.clazzName;
@@ -3538,6 +3690,14 @@ async function prefillTeachingForCell(courseId: string) {
   }
   // 异步回来时用户可能已经改选课程/已关闭弹窗 ⇒ 只在课程未变时写回
   if (String(form.courseId || '') !== key) return;
+  // 指定了教学班（从某张卡点/拖进来）⇒ 用它自己的教师与班级，而不是永远第一条
+  const picked = offeringId ? offs?.find(o => String(o.offeringId) === String(offeringId)) : undefined;
+  if (picked) {
+    if (picked.teacherId) form.teacherId = String(picked.teacherId);
+    const own = picked.targetClasses?.[0];
+    if (own) form.clazzName = prefilledClazz = own;
+    return;
+  }
   const first = offs?.[0];
   if (!form.teacherId && first?.teacherId) form.teacherId = String(first.teacherId);
   const tc = first?.targetClasses?.[0];
@@ -3547,12 +3707,12 @@ async function prefillTeachingForCell(courseId: string) {
 /**
  * 打开新增课次弹窗。
  * @param weekday / periodNo 拖放或点空白格时有值（预填）；从课程卡点击进入时为 null（弹窗内自选）
- * @param preset  预选字段（拖动排课会带上 courseId）
+ * @param preset  预选字段（拖动排课会带上 courseId；从某个教学班卡片进入时带 offeringId）
  */
 async function openCreate(
   weekday: number | null,
   periodNo: number | null,
-  preset: { courseId?: string; classroomId?: string } = {}
+  preset: { courseId?: string; classroomId?: string; offeringId?: string } = {}
 ) {
   // 权限闸：点空白格、待排池「+」、拖入新课程都会走到这里，统一在此拦（2026-11-15）
   if (!canCreate.value) {
@@ -3590,6 +3750,8 @@ async function openCreate(
     s.periodNo = form.periodNo;
   }
   presetCourseId.value = preset.courseId ?? '';
+  // 从某个教学班卡片进来：记住是哪条配置（弹窗默认选中它、拖拽模式按它的教师/班级预填）
+  presetOfferingId.value = preset.offeringId ?? '';
   form.courseId = preset.courseId ?? '';
   // 每次开窗重置「显示全部教师」：上一门课勾过的宽集不该带进下一门课
   showAllTeachers.value = false;
@@ -3619,7 +3781,7 @@ async function openCreate(
     : '课程配置';
   createVisible.value = true;
   // 拖拽模式：教师、班级先按上下文填好，弹窗里就只剩「选课程」一件事
-  void prefillTeachingForCell(form.courseId);
+  void prefillTeachingForCell(form.courseId, presetOfferingId.value);
   // 该课开课记录的教学周窗口（收窄周次上限；预设了课程时不会触发 watch，这里要主动取一次）
   void loadCourseWeekWindow(form.courseId);
   // 学期没定、或周次窗口本身非法时不收起高级设置——被拦在看不见的字段上等于没提示
@@ -4606,25 +4768,43 @@ function poolSubLabel(entry: PoolEntry): string {
 }
 
 /**
- * 这张签实际写入的班级，优先级：签上显式指定 > 放回签的原课次班级 > 弹窗的默认班级。
+ * 这张签实际写入的班级，优先级：签上显式指定 > 放回签的原课次班级 > 该教学班登记的班级 > 弹窗的默认班级。
  * 三处都要读到同一套口径（硬约束 clazzBusy、同班分天、写入的 targetClass），否则会出现
  * 「按 A 班排、写成 B 班」这种对不上的情况。
+ * ★ 2026-11-23：拆卡后每张卡已带上自己那条配置的班级（`targetClasses`），必须排在「弹窗默认班级」之前，
+ *   否则两张卡会被同一个默认班级覆盖。
  */
 function entryClass(entry: PoolEntry) {
   const explicit = (poolClazz[entry.key] ?? '').trim();
   if (explicit) return explicit;
   const own = sourceClazzOf(entry);
   if (own) return own;
+  const declared = (entry.targetClasses ?? []).map(x => String(x ?? '').trim()).filter(x => !isNoClazzName(x));
+  if (declared.length) return declared[0];
   return autoClass.value.trim();
 }
 
 /**
- * 这门课是否有多条开课记录（= 多个教学班，2026-11-23）。
- * 后端 auto-arrange 收 courseId 时会对**每条** offering 各排一遍，每条有自己的教师/班级/节奏。
- * 判据用后端下发的 `offeringCount`；旧包不下发时按 0 处理（退回单教学班行为，不误伤）。
+ * 这张卡是否属于「多个教学班」的课（2026-11-23）。
+ * 池子已按教学班拆卡，本函数只用于卡片上写「教学班 1/2」这类角标；
+ * 判据优先用拆卡时算好的 `offeringTotal`，回落到后端下发的 `offeringCount`。
  */
-function multiOffering(e: Pick<PoolEntry, 'offeringCount'>): boolean {
-  return Number(e.offeringCount ?? 0) > 1;
+function multiOffering(e: Pick<PoolEntry, 'offeringCount' | 'offeringTotal'>): boolean {
+  return Number(e.offeringTotal ?? e.offeringCount ?? 0) > 1;
+}
+
+/**
+ * 卡片对应的教学班标识（2026-11-23）：`（张老师 · 计算机2302）`。
+ * 用于「排到本周」的结果提示——两张同名卡排完，只说课程名分不出是哪个班。
+ * 没有 `offeringId`（单配置课）返回空串，提示保持原样。
+ */
+function teachingClassLabel(e: Pick<PoolEntry, 'offeringId' | 'teacherName' | 'targetClasses'>): string {
+  if (!e.offeringId) return '';
+  const parts: string[] = [];
+  if (e.teacherName) parts.push(e.teacherName);
+  const clazzes = (e.targetClasses ?? []).map(x => String(x ?? '').trim()).filter(x => !isNoClazzName(x));
+  if (clazzes.length) parts.push(clazzes.join('、'));
+  return parts.length ? `（${parts.join(' · ')}）` : '';
 }
 
 /* ---------- 自动排课落位规则（2026-10-22：贪心取首个空位 → 全候选打分择优） ----------
@@ -4724,11 +4904,11 @@ async function runAuto() {
       autoProgress.value = `正在排「${e.courseName}」（${i + 1}/${entries.length}）`;
       try {
         const rows = await autoArrange({
-          courseId: e.courseId,
-          // ★ 多教学班（2026-11-23）：一门课两条开课记录时（两位老师各带一个班），后端按 offering
-          //   逐条排，班级取各自的 target_classes。这里若还把「卡片班级 / 弹窗默认班级」传下去，
-          //   后端会用同一个 targetClass 覆盖**每一条**，两个老师会被排进同一个班。
-          //   所以多条配置时不传，让每条用的是自己的班级；要改班级请到课程详情「编辑教学班」。
+          // ★ 2026-11-23：卡片 = 教学班。带 offeringId 的卡只排这一条配置（教师/班级/节奏都是它的）；
+          //   单配置的课不带 offeringId，仍按整门课下发，行为与之前一致。
+          ...(e.offeringId ? { offeringId: e.offeringId } : { courseId: e.courseId }),
+          // 多个教学班时不能传 targetClass：后端会用它覆盖**每一条** offering 自己的班级，
+          // 两个老师会被排进同一个班。要改班级请到课程详情「编辑教学班」。
           targetClass: multiOffering(e) ? undefined : entryClass(e).trim() || autoClass.value || undefined,
           preferredClassroomId: autoLockRoomId.value || undefined,
           // 逐节单双周（2026-11-19）：按「参与排课」里逐课设置传；全每周也要传，
@@ -5283,10 +5463,12 @@ watch(
     <div class="pool-head">
       <span class="card-title"><ZkIcon name="list-checks" :size="16" />待排课程</span>
       <span class="small muted">
-        共 {{ poolChipCount }} 门课 / {{ poolEntries.length }} 节待排（已配置 {{ poolCfgCounts.ready }} 门 · 未配置
-        {{ poolCfgCounts.unready }} 门）
+        <!-- 计数单位是「教学班」而不是「门课」：2026-11-23 起一门课多个教学班（教师/班级不同）
+             会拆成多张卡，写「N 门课」与实际卡数对不上 -->
+        共 {{ poolChipCount }} 个教学班 / {{ poolEntries.length }} 节待排（已配置 {{ poolCfgCounts.ready }} · 未配置
+        {{ poolCfgCounts.unready }}）
         <template v-if="poolFilterExcluded">· 另有 {{ poolFilterExcluded }} 节被筛选排除</template>
-        <template v-if="poolColumnFiltered">· 栏内筛选再挡掉 {{ poolColumnFiltered }} 门</template>
+        <template v-if="poolColumnFiltered">· 栏内筛选再挡掉 {{ poolColumnFiltered }} 张</template>
         —— 拖到下方课表格子完成排课
       </span>
       <span class="spacer" style="flex: 1"></span>
@@ -5354,7 +5536,7 @@ watch(
             :title="poolChipTitle(c)"
             @dragstart="onDragStart(c, $event)"
             @dragend="onDragEnd"
-            @click="openCreate(null, null, { courseId: String(c.courseId) })"
+            @click="openCreate(null, null, { courseId: String(c.courseId), offeringId: c.offeringId })"
           >
             <ZkIcon name="grip-vertical" :size="13" class="grip" />
             <!-- 两列布局（2026-11-16 业主口径：每行显示两门课）：卡片变窄后，课程名与元信息
@@ -5385,14 +5567,14 @@ watch(
                 <!-- 同名课程区分（2026-11-05）：course 表是开课记录粒度，一师一学期一条，
                      只显示课程名会让多教学班看起来像重复数据；这里补「学期 · 面向班级」。 -->
                 <span v-if="poolSubLabel(c)" class="chip-meta pool-sub" :title="poolSubLabel(c)">{{ poolSubLabel(c) }}</span>
-                <!-- 多教学班（2026-11-23 业主：两个老师各带一个班，排课这边会不会显示要排两节课）：
-                     池子按课程聚合、一门课仍然只有一张卡，但卡片必须说清它有 N 条配置——
-                     自动排课时后端会对每条配置各排一套（两个班各自的时间段都要排上）。 -->
+                <!-- 多教学班（2026-11-23 业主：教师或班级不一样，池子里就该是多张卡）：
+                     池子已按教学班拆卡，这张卡只代表一条开课记录，角标写清是第几个。
+                     「排到本周」「自动排课」「拖拽排课」都只作用于这一条配置。 -->
                 <span
                   v-if="multiOffering(c)"
                   class="badge badge-neutral chip-badge"
-                  :title="`这门课有 ${c.offeringCount} 条开课记录（多个教学班，各有教师/班级/节奏）：自动排课会对每个教学班各排一套课次，「排到本周」也会每个教学班各排 1 节`"
-                >{{ c.offeringCount }} 个教学班</span>
+                  :title="`这门课共 ${c.offeringTotal ?? c.offeringCount} 个教学班（各有教师/班级/节奏），本卡是第 ${c.offeringIdx} 个：「排到本周」「自动排课」只排这一个班`"
+                >教学班 {{ c.offeringIdx }}/{{ c.offeringTotal ?? c.offeringCount }}</span>
                 <!-- 本周已排节数（2026-11-23）：排满的课不再从池里消失，用节数说明它就在课表上。
                      与「已在课表」是两条不同的信息：这里是本周真课次，后者是放回留下的软删签。 -->
                 <span
@@ -6090,6 +6272,11 @@ watch(
           title="该课程在课表上已有课次，这张签是「放回」留下的记录。自动排课默认跳过它（否则会把整门课重排一遍）；要整门重排请先把该课全部节次放回"
         >已在课表</span>
         <span
+          v-if="multiOffering(c)"
+          class="badge badge-neutral"
+          :title="`这门课共 ${c.offeringTotal ?? c.offeringCount} 个教学班，本卡是第 ${c.offeringIdx} 个`"
+        >教学班 {{ c.offeringIdx }}/{{ c.offeringTotal ?? c.offeringCount }}</span>
+        <span
           v-if="!isCfgReady(c.cfg)"
           class="badge badge-warning"
           :title="cfgGapTip(c)"
@@ -6098,7 +6285,7 @@ watch(
         <button
           v-if="canCreate"
           class="btn btn-outline btn-sm"
-          @click="openCreate(null, null, { courseId: String(c.courseId) }); poolPanelVisible = false"
+          @click="openCreate(null, null, { courseId: String(c.courseId), offeringId: c.offeringId }); poolPanelVisible = false"
         >排课</button>
       </div>
       <div v-if="!panelEntries.length" class="pool-empty">
