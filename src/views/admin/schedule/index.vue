@@ -3056,6 +3056,15 @@ const createTeacherLabel = computed(() => {
   if (!v) return '未指定';
   return teacherOptions.value.find(o => String(o.value) === v)?.label || `教师 #${v}`;
 });
+
+/** 该课排课设置里的「每周节数」（2026-11-23 业主反馈「设置 32 课时这里却对不上」）：
+ *  拖一次格子只排 1 节/周，若课程配置是每周 2 节，总节次自然只有配置的一半。
+ *  用它把差距直接说出来，别让人自己算。取不到（旧数据/未配置）返回 0，不提示。 */
+const createCfgWeekLessons = computed(() => {
+  const offs = offeringByCourse.value[String(form.courseId || '')];
+  const v = Number(offs?.[0]?.lessonsPerWeek ?? 0);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+});
 /** 摘要行的落点：周几 + 第几节（落点来自格子，用户点完就不该再需要确认一次） */
 const createSlotLabel = computed(() => {
   const p = PERIODS.find(x => x.seq === form.periodNo);
@@ -6266,6 +6275,18 @@ watch(
           />
           <span v-if="createPresetCell" class="small muted">大于 1 时可为每节分别选星期</span>
         </div>
+        <!-- 排课设置 vs 本次只排节的差距（2026-11-23）：拖一次只落 1 节/周，课程配置是 2 节时
+             总节次只有一半，不说清就会被当成"课时对不上"。 -->
+        <div
+          v-if="createPresetCell && createCfgWeekLessons > repeatForm.weekly"
+          class="small"
+          style="color: var(--warning, #b45309); width: 100%"
+        >
+          该课排课设置是<b>每周 {{ createCfgWeekLessons }} 节</b>；当前每周只排 {{ repeatForm.weekly }} 节，
+          总节次只有配置的
+          {{ Math.round((repeatForm.weekly / createCfgWeekLessons) * 100) }}%。要排满请把这里改成
+          {{ createCfgWeekLessons }}（第 2 节起需指定星期），或分多次拖到别的格子。
+        </div>
       </el-form-item>
       <el-form-item
         v-for="(s, i) in extraSlotList"
@@ -6372,8 +6393,11 @@ watch(
           <span v-else class="small muted">未填写</span>
         </div>
       </el-form-item>
-      <!-- 总课时：仅拖拽排课模式保留输入（课时可小于窗口满额，前满后少） -->
-      <el-form-item v-if="createPresetCell && advancedOpen && repeatForm.mode !== 'once'" label="总课时">
+      <!-- 总节次（2026-11-23 业主反馈「设置 32 课时但这里最大 18」）：
+           业主口径「1 节次 = 2 学时」，原来标签写「总课时」容易被当成学时——
+           32 学时的课这里显示 16，看着就像「对不上」。所以标签与提示统一说「节次」，
+           并直接把学时换算写出来（16 节次 = 32 学时），一眼能对上课程总览。 -->
+      <el-form-item v-if="createPresetCell && advancedOpen && repeatForm.mode !== 'once'" label="总节次">
         <div style="display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap">
           <el-input-number
             v-model="repeatForm.total"
@@ -6382,9 +6406,11 @@ watch(
             style="width: 130px"
           />
           <span v-if="repeatForm.total < repeatForm.weekly * effectiveRepeatTimes" class="small" style="color: var(--warning, #b45309)">
-            不足满额 {{ repeatForm.weekly * effectiveRepeatTimes }} 课时：从最后一周往前少排（前满后少）
+            不足满额 {{ repeatForm.weekly * effectiveRepeatTimes }} 节次（{{ repeatForm.weekly * effectiveRepeatTimes * 2 }} 学时）：从最后一周往前少排（前满后少）
           </span>
-          <span v-else class="small muted">共 {{ repeatForm.weekly * effectiveRepeatTimes }} 课时（每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 周）</span>
+          <span v-else class="small muted">
+            共 {{ repeatForm.weekly * effectiveRepeatTimes }} 节次 = {{ repeatForm.weekly * effectiveRepeatTimes * 2 }} 学时（每周 {{ repeatForm.weekly }} 节 × {{ effectiveRepeatTimes }} 周）
+          </span>
         </div>
       </el-form-item>
     </el-form>
