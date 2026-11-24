@@ -49,6 +49,10 @@ export const ADMIN_MENUS: AdminMenuItem[] = [
   { path: '/admin/schedule', title: '智能排课', icon: 'calendar-days', group: '教学资源' },
 
   { path: '/admin/analytics', title: '全校学情', icon: 'bar-chart-3', group: '学情与巡查' },
+  // ★ 2026-11-24：成绩导出独立成页（业主口径：成绩导出是后台核心重点，要覆盖
+  //   「某学生某门课某次实验 / 某次实验未提交名单 / 某门课所有老师」等维度）。
+  //   放「全校学情」之后：两者都读成绩，但学情是看板（聚合指标），本页是取数（可导出明细）。
+  { path: '/admin/grades', title: '成绩导出', icon: 'download', group: '学情与巡查' },
   { path: '/admin/patrol', title: '课堂巡查', icon: 'list-checks', group: '学情与巡查' },
 
   { path: '/admin/basicdata', title: '基础数据', icon: 'database', group: '系统' },
