@@ -4598,9 +4598,24 @@ function resetPoolPick() {
 type WeekPattern = 'all' | 'odd' | 'even';
 const autoPatterns = reactive<Record<string, WeekPattern[]>>({});
 
+/**
+ * 该签真正的开课记录（教学班）。
+ * ★ 2026-11-24：原先一律取 `[0]`，多教学班下第 2 张卡会读到**第 1 条**配置的
+ *   lessonsPerWeek / weekPatterns ⇒ 每周节次不同的两个班，单双周行数与非空方案全错
+ *   （还会被后端按 lessonsPerWeek 补齐成「每周」）。按 offeringId 精确取，取不到再回落第一条。
+ */
+function offeringOf(e: PoolEntry): OfferingBrief | undefined {
+  const list = offeringByCourse.value[String(e.courseId)] ?? [];
+  if (e.offeringId) {
+    const hit = list.find((o) => String(o.offeringId) === String(e.offeringId));
+    if (hit) return hit;
+  }
+  return list[0];
+}
+
 /** 该签对应的「每周几节」——自动排课按它铺课，所以单双周也按它给几行 */
 function slotsOf(e: PoolEntry): number {
-  const off = offeringByCourse.value[String(e.courseId)]?.[0];
+  const off = offeringOf(e);
   return Math.min(7, Math.max(1, Number(off?.lessonsPerWeek ?? 1)));
 }
 
@@ -4608,7 +4623,7 @@ function slotsOf(e: PoolEntry): number {
 function resetAutoPatterns() {
   for (const e of autoEntries.value) {
     const n = slotsOf(e);
-    const off = offeringByCourse.value[String(e.courseId)]?.[0];
+    const off = offeringOf(e);
     const stored = String(off?.weekPatterns ?? '')
       .split(',')
       .map((s) => s.trim().toLowerCase())
