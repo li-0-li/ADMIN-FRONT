@@ -1563,6 +1563,9 @@ onMounted(async () => {
         <div class="pf-row"><span class="k">面向专业</span><span>{{ detailCourse.major || '—' }}</span></div>
         <div class="pf-row"><span class="k">学分</span><span>{{ detailCourse.credit ?? '—' }}</span></div>
         <div class="pf-row"><span class="k">学时</span><span>{{ detailCourse.hours ?? '—' }}</span></div>
+        <!-- 学生人数：后端按 course_enrollment（status='enrolled'、未删）去重统计，
+             与学生端可见性、成绩导出同一口径；不拿教学班 student_count 相加（会漏也会重）。 -->
+        <div class="pf-row"><span class="k">学生人数</span><span>{{ detailData?.studentCount ?? '—' }}</span></div>
         <div class="pf-row"><span class="k">课程类型</span><span>{{ courseTypeLabel(detailCourse.courseType) }}</span></div>
         <div class="pf-row">
           <span class="k">状态</span>

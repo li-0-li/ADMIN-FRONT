@@ -683,6 +683,8 @@ export interface AdminCourseDetailVo {
   offeringCount: number;
   /** 未配置排课节奏的开课数（>0 ⇒ 自动排课跳过该课对应开课，2026-11-13） */
   offeringUnconfigured?: number;
+  /** 课程总人数：status='enrolled' 且未删除的选课学生数（按 student_id 去重，后端算） */
+  studentCount?: number;
   /** 配置不完整的开课数：缺教师/缺节奏/（非选修缺班级）任一即计（2026-11-16，选完才能进已配置） */
   offeringIncomplete?: number;
   certPassed?: boolean;
