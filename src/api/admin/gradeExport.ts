@@ -71,6 +71,11 @@ export interface GradeExportQuery {
   keyword?: string;
   pageNum?: number;
   pageSize?: number;
+  /**
+   * 导出列（只对 download 生效）。
+   * 不传 = 按数据集默认列全导；传了就按后端列顺序取交集，只裁列不裁行。
+   */
+  columns?: string[];
 }
 
 export interface GradeExportColumn {

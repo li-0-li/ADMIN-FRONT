@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
 import { useUserStore } from '@/store/user';
 import {
@@ -59,12 +59,64 @@ const result = ref<GradeExportResult | null>(null);
 const page = ref(1);
 const pageSize = ref(20);
 
+/* 导出弹窗：字段自选 + 条件摘要（对标学习通/主流 B 端的「导出设置」） */
+const exportVisible = ref(false);
+const exportColumns = ref<string[]>([]);
+
 const currentDataset = computed(() => datasets.value.find(d => d.code === query.dataset) ?? null);
 const courseName = computed(() => {
   const c = courses.value.find(x => str(x.courseId) === query.courseId);
   return c ? str(c.courseName) : '';
 });
 const canQuery = computed(() => !!query.courseId);
+
+/** 状态枚举的中文名：下拉、条件摘要、空态提示共用一份，避免三处文案打架 */
+const STATUS_TEXT: Record<string, string> = {
+  all: '',
+  unsubmitted: '未提交 / 未参与',
+  pending: '待批改',
+  graded: '已批改',
+  late: '迟交'
+};
+
+/**
+ * 导出弹窗的条件摘要：只列真正生效的条件。
+ * 导出文件会和这份摘要一致（后端把同一份条件写进「导出条件」sheet），
+ * 用户拿文件回去核对时不用再回忆当时筛了什么。
+ */
+const filterSummary = computed(() => {
+  const rows: Array<{ label: string; value: string }> = [];
+  const add = (label: string, value: string) => {
+    if (value) rows.push({ label, value });
+  };
+  const offering = offerings.value.find(o => str(o.offeringId) === query.offeringId);
+  const task = tasks.value.find(t => str(t.taskId) === query.taskId);
+  const clazz = classes.value.find(c => str(c.clazzId) === query.classId);
+  add('数据集', currentDataset.value?.label ?? '');
+  add('课程', courseName.value);
+  add('教学班', offering ? `${offering.teacherName || '未指定教师'} · ${offering.classText}` : '');
+  add('任务类型', query.taskType === 'all' ? '' : query.taskType === 'homework' ? '仅作业' : '仅实验');
+  add('任务', task?.label ?? '');
+  add('状态', STATUS_TEXT[query.status] ?? '');
+  add('班级', clazz ? str(clazz.clazzName) : '');
+  add('学生', query.keyword.trim());
+  add('截止日期', query.dateRange?.length === 2 ? `${query.dateRange[0]} ~ ${query.dateRange[1]}` : '');
+  return rows;
+});
+
+const allColumnsSelected = computed(
+  () => !!result.value && exportColumns.value.length === result.value.columns.length
+);
+
+function selectAllColumns() {
+  exportColumns.value = result.value ? result.value.columns.map(c => c.key) : [];
+}
+
+function invertColumns() {
+  if (!result.value) return;
+  const picked = new Set(exportColumns.value);
+  exportColumns.value = result.value.columns.filter(c => !picked.has(c.key)).map(c => c.key);
+}
 
 /**
  * 页面权限：后端四个端点都挂了 `admin:grade:export`。
@@ -291,10 +343,36 @@ function stamp(): string {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
 }
 
-async function onExport() {
+/** 打开导出设置：先有预览结果才知道有哪些列可选 */
+function openExport() {
   if (!canQuery.value) {
     ElMessage.warning('请先选择课程');
     return;
+  }
+  if (!result.value || !result.value.columns.length) {
+    ElMessage.warning('等预览出来再导出：要先知道这张表有哪些列');
+    return;
+  }
+  exportColumns.value = result.value.columns.map(c => c.key);
+  exportVisible.value = true;
+}
+
+async function doExport() {
+  if (!exportColumns.value.length) {
+    ElMessage.warning('请至少保留一列');
+    return;
+  }
+  const total = result.value?.total ?? 0;
+  if (total > 2000) {
+    try {
+      await ElMessageBox.confirm(
+        `本次将导出 ${total} 行 × ${exportColumns.value.length} 列。行数较多时生成需要几秒到十几秒，请勿关闭页面。`,
+        '确认导出',
+        { confirmButtonText: '继续导出', cancelButtonText: '取消', type: 'warning' }
+      );
+    } catch {
+      return;
+    }
   }
   exporting.value = true;
   try {
@@ -309,16 +387,15 @@ async function onExport() {
       status: query.status,
       keyword: query.keyword.trim() || undefined,
       startDate: query.dateRange?.[0] || undefined,
-      endDate: query.dateRange?.[1] || undefined
+      endDate: query.dateRange?.[1] || undefined,
+      // 全选时不传，交给后端按数据集默认列出；少选时只传勾中的
+      columns: allColumnsSelected.value ? undefined : exportColumns.value
     });
     const label = currentDataset.value?.label ?? '成绩';
     const safeCourse = (courseName.value || '课程').replace(/[\\/:*?"<>|]/g, '').slice(0, 24);
     saveBlob(blob, `成绩导出_${label}_${safeCourse}_${stamp()}.xlsx`);
-    ElMessage.success(
-      result.value
-        ? `已导出全量 ${result.value.total} 行（预览只显示一页，文件是全部）`
-        : '已导出'
-    );
+    ElMessage.success(`已导出全量 ${total} 行（预览只显示一页，文件是全部）`);
+    exportVisible.value = false;
   } catch {
     /* requestBlob 内部已弹具体原因（无权限 / 导出失败） */
   } finally {
@@ -342,6 +419,11 @@ function colMinWidth(key: string): number {
   return 100;
 }
 
+/** 学号/姓名钉在左侧：列一多就得横向滚，滚走了就不知道这行是谁 */
+function colFixed(key: string): 'left' | undefined {
+  return key === 'studentNo' || key === 'studentName' ? 'left' : undefined;
+}
+
 function cellText(row: GradeExportRow, key: string): string {
   const v = row[key];
   return v === undefined || v === null ? '' : String(v);
@@ -355,7 +437,12 @@ onMounted(loadOptions);
     <h1>成绩导出</h1>
     <div class="actions">
       <button class="btn btn-outline" :disabled="loading" @click="onReset">重置条件</button>
-      <button class="btn btn-primary" :disabled="!canQuery || exporting || !canExportPerm" @click="onExport">
+      <button
+        class="btn btn-primary"
+        :disabled="!canQuery || !result || exporting || !canExportPerm"
+        :title="!result ? '先查询出结果，再选择要导出的列' : ''"
+        @click="openExport"
+      >
         <ZkIcon name="download" :size="16" style="margin-right: 4px" />
         {{ exporting ? '正在导出…' : '导出 Excel' }}
       </button>
@@ -555,14 +642,32 @@ onMounted(loadOptions);
           :prop="col.key"
           :label="col.label"
           :min-width="colMinWidth(col.key)"
+          :fixed="colFixed(col.key)"
           show-overflow-tooltip
         >
           <template #default="{ row }">{{ cellText(row, col.key) }}</template>
         </el-table-column>
       </el-table>
 
-      <div v-else-if="result" class="empty-state small muted" style="padding: 28px 0">
-        当前条件下没有数据。可以换一个任务、放宽状态，或确认这门课的学生是否已选课、任务是否已发布。
+      <div v-else-if="result" class="empty-state" style="padding: 28px 0">
+        <div class="small muted">
+          当前条件下没有数据。可以换一个任务、放宽状态，或确认这门课的学生是否已选课、任务是否已发布。
+        </div>
+        <div
+          v-if="query.status !== 'all' || query.taskId || query.classId || query.keyword || query.dateRange.length"
+          class="empty-actions"
+        >
+          <span class="small muted">一键放宽：</span>
+          <button v-if="query.status !== 'all'" class="btn btn-outline btn-sm" @click="query.status = 'all'">
+            清空状态（{{ STATUS_TEXT[query.status] }}）
+          </button>
+          <button v-if="query.taskId" class="btn btn-outline btn-sm" @click="query.taskId = ''">清空任务筛选</button>
+          <button v-if="query.classId" class="btn btn-outline btn-sm" @click="query.classId = ''">清空班级筛选</button>
+          <button v-if="query.keyword" class="btn btn-outline btn-sm" @click="query.keyword = ''">清空学生筛选</button>
+          <button v-if="query.dateRange.length" class="btn btn-outline btn-sm" @click="query.dateRange = []">
+            清空日期范围
+          </button>
+        </div>
       </div>
 
       <div v-if="result && result.total > 0" class="pager">
@@ -578,6 +683,47 @@ onMounted(loadOptions);
       </div>
     </div>
   </div>
+
+  <!-- 导出设置：把「导的是哪批数据、哪几列」在落盘前说清楚。
+       条件摘要与后端「导出条件」sheet 同源，字段勾选只裁列不裁行。 -->
+  <el-dialog v-model="exportVisible" title="导出 Excel" width="580px">
+    <div class="dlg-block">
+      <div class="dlg-title">这批数据是什么</div>
+      <div class="summary-grid">
+        <div v-for="f in filterSummary" :key="f.label" class="summary-item">
+          <span class="summary-label">{{ f.label }}</span>
+          <span class="summary-value">{{ f.value }}</span>
+        </div>
+      </div>
+      <div class="small muted" style="margin-top: 8px">
+        共 <b>{{ result?.total ?? 0 }}</b> 行；文件含「数据」「导出条件」两个 sheet，条件页会记录本次筛选与导出人。
+      </div>
+    </div>
+
+    <div class="dlg-block">
+      <div class="dlg-title">
+        导出列
+        <span class="small muted" style="font-weight: 400; margin-left: 8px">不勾只是不写进文件，行数不变</span>
+        <span class="col-ops">
+          <button class="btn btn-outline btn-sm" @click="selectAllColumns">全选</button>
+          <button class="btn btn-outline btn-sm" @click="invertColumns">反选</button>
+        </span>
+      </div>
+      <el-checkbox-group v-model="exportColumns" class="col-group">
+        <el-checkbox v-for="c in result?.columns ?? []" :key="c.key" :value="c.key">{{ c.label }}</el-checkbox>
+      </el-checkbox-group>
+      <div v-if="!exportColumns.length" class="small" style="color: var(--warn-600, #b45309)">
+        至少保留一列，否则文件里只剩条件页。
+      </div>
+    </div>
+
+    <template #footer>
+      <button class="btn btn-outline" @click="exportVisible = false">取消</button>
+      <button class="btn btn-primary" :disabled="exporting || !exportColumns.length" @click="doExport">
+        {{ exporting ? '正在导出…' : `确认导出 ${result?.total ?? 0} 行` }}
+      </button>
+    </template>
+  </el-dialog>
 </template>
 
 <style scoped>
@@ -745,5 +891,65 @@ onMounted(loadOptions);
   gap: 12px;
   margin-top: 12px;
   flex-wrap: wrap;
+}
+
+/* ---- 导出设置弹窗 ---- */
+.dlg-block + .dlg-block {
+  margin-top: 16px;
+}
+.dlg-title {
+  display: flex;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink-900);
+  margin-bottom: 8px;
+}
+.col-ops {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 6px;
+}
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 6px 16px;
+  padding: 10px 12px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+.summary-item {
+  display: flex;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.7;
+  min-width: 0;
+}
+.summary-label {
+  flex: 0 0 62px;
+  color: var(--ink-500);
+}
+.summary-value {
+  color: var(--ink-900);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.col-group {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 4px 8px;
+}
+.col-group :deep(.el-checkbox) {
+  margin-right: 0;
+}
+.empty-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
 }
 </style>
