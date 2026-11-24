@@ -157,13 +157,6 @@ function str(v: unknown): string {
   return v === undefined || v === null ? '' : String(v);
 }
 
-function findTerm(id: string) {
-  return terms.value.find(t => str(t.termId) === id);
-}
-function termLabel(t: Record<string, unknown>) {
-  const name = str(t.termName) || str(t.termCode);
-  return t.isCurrent ? `${name}（当前）` : name;
-}
 function courseLabel(c: Record<string, unknown>) {
   const no = str(c.courseCode);
   return no ? `${str(c.courseName)}（${no}）` : str(c.courseName);
@@ -454,14 +447,9 @@ onMounted(loadOptions);
       <ZkIcon name="alert-triangle" :size="14" style="vertical-align: -2px; margin-right: 6px" />
       当前账号没有「成绩导出」权限（admin:grade:export），页面可浏览但无法查询与导出；请联系管理员在角色里授权。
     </div>
-    <!-- 导出类型：决定「一行是什么」 -->
+    <!-- 导出类型：只列类型名，一行是什么放在结果区标题下（选中后就看得见，不必先读六行小字） -->
     <div class="card card-pad">
-      <div class="card-title">
-        导出类型
-        <span class="small muted" style="font-weight: 400; margin-left: 8px">
-          类型决定「一行是什么」，下方筛选条件六类通用
-        </span>
-      </div>
+      <div class="card-title">导出类型</div>
       <div v-if="loadingOptions && !datasets.length" class="small muted">正在加载…</div>
       <div v-else class="ds-grid">
         <button
@@ -470,10 +458,10 @@ onMounted(loadOptions);
           type="button"
           class="ds-card"
           :class="{ active: query.dataset === d.code }"
+          :title="d.rowMeaning"
           @click="onDatasetChange(d.code)"
         >
           <span class="ds-label">{{ d.label }}</span>
-          <span class="ds-desc">{{ d.rowMeaning }}</span>
         </button>
       </div>
     </div>
@@ -577,18 +565,12 @@ onMounted(loadOptions);
           </button>
         </div>
       </div>
-
-      <div class="small muted filter-hint">
-        学期参考：{{ query.termId ? (findTerm(query.termId)?.termName ?? '') : (terms.find(t => t.isCurrent) ? termLabel(terms.find(t => t.isCurrent)!) : '全部学期') }}；
-        学生范围按「已选课（enrolled）」口径，仅绑定班级但没有选课记录的学生不会出现在结果里。
-      </div>
     </div>
 
     <!-- 未选课程 -->
     <div v-if="!canQuery" class="card card-pad empty-state">
       <ZkIcon name="table" :size="28" />
       <div class="empty-title">先选择一门课程</div>
-      <div class="small muted">成绩导出以课程为根：六类数据集、学生名单、作业与实验任务都按课程取。</div>
     </div>
 
     <!-- 结果 -->
@@ -735,16 +717,17 @@ onMounted(loadOptions);
 
 .ds-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
   gap: 10px;
   margin-top: 4px;
 }
+/* 只有类型名，卡片按单行标签收窄，六类两行排满不占高度 */
 .ds-card {
-  text-align: left;
+  text-align: center;
   display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 12px 14px;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 12px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
@@ -768,12 +751,6 @@ onMounted(loadOptions);
 .ds-card.active .ds-label {
   color: var(--brand-700);
 }
-.ds-desc {
-  font-size: 12px;
-  color: var(--ink-500);
-  line-height: 1.45;
-}
-
 .filter-bar {
   display: flex;
   flex-wrap: wrap;
@@ -803,10 +780,6 @@ onMounted(loadOptions);
 }
 .f-date {
   width: 240px;
-}
-.filter-hint {
-  margin-top: 10px;
-  line-height: 1.6;
 }
 
 .empty-state {

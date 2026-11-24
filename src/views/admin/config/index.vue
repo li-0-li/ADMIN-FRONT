@@ -448,7 +448,7 @@ onUnmounted(() => {
   <div class="cfg-toolbar">
     <el-input v-model="configSearch" clearable placeholder="搜索配置键或说明（如 ai. / 配额）" style="width: 300px" />
     <span v-if="configSearch.trim()" class="small muted">命中 {{ searchHitCount }} 项配置（跨键名与说明匹配）</span>
-    <span v-else class="small muted">共 {{ visibleItemCount }} 项配置 · {{ groups.length }} 组 · 改动后点右上「保存全部」一次提交<span class="muted">（教学周的 2 项在上方卡片里维护，不重复列在下方）</span></span>
+    <span v-else class="small muted">共 {{ visibleItemCount }} 项配置 · {{ groups.length }} 组 · 改动后点右上「保存全部」一次提交</span>
   </div>
 
   <!-- 教学周全局设置（G8/R-2 · 录音 A1）：独立端点，不属于 biz_config 分组，单列一块 -->
