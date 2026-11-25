@@ -1098,6 +1098,19 @@ const detailNote = ref('');
 const detailData = ref<AdminCourseDetailVo | null>(null);
 const detailOfferLoading = ref(false);
 
+/**
+ * 教学班口径提示（2026-11-25 业主）：详情里的「学生人数」是课程级去重人数，
+ * 必修课按自然班拆成多条教学班后它仍然等于「班级数 × 40」，容易被误读成"一个班 160 人"。
+ * 这里把「几个教学班 · 每班多少人」直接摆出来；人数不齐（选修按报名人数）就不写每班。
+ */
+const detailClassHint = computed(() => {
+  const list = detailData.value?.offerings ?? [];
+  if (!list.length) return '';
+  const counts = list.map((o) => Number(o.studentCount ?? 0));
+  const same = counts.every((c) => c === counts[0]);
+  return same ? `${list.length} 个教学班 · 每班 ${counts[0]} 人` : `${list.length} 个教学班（各教学班人数见下方）`;
+});
+
 const COURSE_TYPE_LABEL: Record<string, string> = {
   required: '必修',
   elective: '选修',
@@ -1632,8 +1645,16 @@ onMounted(async () => {
         <div class="pf-row"><span class="k">学分</span><span>{{ detailCourse.credit ?? '—' }}</span></div>
         <div class="pf-row"><span class="k">学时</span><span>{{ detailCourse.hours ?? '—' }}</span></div>
         <!-- 学生人数：后端按 course_enrollment（status='enrolled'、未删）去重统计，
-             与学生端可见性、成绩导出同一口径；不拿教学班 student_count 相加（会漏也会重）。 -->
-        <div class="pf-row"><span class="k">学生人数</span><span>{{ detailData?.studentCount ?? '—' }}</span></div>
+             与学生端可见性、成绩导出同一口径；不拿教学班 student_count 相加（会漏也会重）。
+             2026-11-25：必修课按自然班拆成多条教学班后，这个总数 = 班数 × 40，
+             必须补一行「几个教学班 · 每班多少人」，否则会被当成单班人数。 -->
+        <div class="pf-row">
+          <span class="k">学生人数</span>
+          <span>
+            {{ detailData?.studentCount ?? '—' }}
+            <span v-if="detailClassHint" class="small muted" style="margin-left: 6px">（{{ detailClassHint }}）</span>
+          </span>
+        </div>
         <div class="pf-row"><span class="k">课程类型</span><span>{{ courseTypeLabel(detailCourse.courseType) }}</span></div>
         <div class="pf-row">
           <span class="k">状态</span>
@@ -1711,7 +1732,7 @@ onMounted(async () => {
                   <template v-else-if="o.classKey"> · {{ o.classKey }}</template>
                 </div>
                 <div class="small muted">
-                  加课码 <b>{{ o.joinCode }}</b> · 课次 {{ o.scheduleCount ?? 0 }} 节
+                  加课码 <b>{{ o.joinCode }}</b> · 学生 {{ o.studentCount ?? 0 }} 人 · 课次 {{ o.scheduleCount ?? 0 }} 节
                   <template v-if="o.weekCount"> · {{ o.weekCount }} 教学周</template>
                 </div>
                 <!-- 批次7 排课配置（录音：排课前先选好 总课时/一周几节/第几周到第几周）
