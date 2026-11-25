@@ -57,7 +57,10 @@ export interface GradeExportTask {
 
 export interface GradeExportQuery {
   dataset: string;
-  termId?: string | number;
+  /**
+   * ★ 已移除 termId：课程本身已绑学期，后端 `GradeExportQueryBo` 也删了该字段。
+   *   课程下拉的按学期过滤走 /options 的 termId 参数（那个是真在用）。
+   */
   courseId?: string | number;
   offeringId?: string | number;
   teacherId?: string | number;
