@@ -177,6 +177,12 @@ export function updateOfferingScheduleConfig(
     weekCount: number;
     lessonsPerWeek: number;
     totalLessons?: number | null;
+    /**
+     * 逐节单双周（2026-11-25）：第 i 项 = 每周第 i 节，all/odd/even。
+     * 长度按 lessonsPerWeek 归一化；不传 = 不改（保留库里已有方案）。
+     * 例：48 学时 / 每周 2 节 / ["all","odd"] ⇒ 第 1 节每周、第 2 节只在单周，共 16 教学周。
+     */
+    weekPatterns?: Array<'all' | 'odd' | 'even'>;
     /** 2026-11-19：改授课教师（不传 = 不改，传了会同步已排课次） */
     teacherId?: string;
     /** 2026-11-19：改面向班级（不传 = 不改，[] = 改成不绑班级，传了会同步已排课次） */

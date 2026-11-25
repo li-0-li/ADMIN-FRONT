@@ -10,7 +10,6 @@ import { getCertDetail } from '@/api/admin/certifications';
 import { autoArrange, listSchedules } from '@/api/admin/schedules';
 import { listClasses, listTerms } from '@/api/admin/basicdata';
 import { getTeachingWeek } from '@/api/admin/config';
-import { listUsers } from '@/api/admin/users';
 import { useUserStore } from '@/store/user';
 import type { AdminCourseDetailVo, AdminOfferingVo, CertDetail, CertMaterial } from '@/types/admin';
 import CreateCourseDialog from './CreateCourseDialog.vue';
@@ -124,16 +123,17 @@ const schedCfgForm = reactive({
   /** 总学时（可编辑；默认取该配置已有节次×2，否则取课程学时） */
   hours: null as number | null,
   /**
-   * 授课教师（2026-11-23）：教学班 = 教师 + 班级 + 节奏，三项都要能在这里改。
-   * 后端 schedule-config 的 teacherId 不传 = 不改，所以下面用快照做「只在动过时提交」。
+   * 逐节单双周（2026-11-25）：第 i 项 = 每周第 i 节，取值 all/odd/even。
+   * ★ 它参与周数换算（这是「48 学时、每周 2 节、第 2 节只上单周」能配出 16 周的关键）：
+   *   每周有效节次 = all 记 1、odd/even 记「该周是否轮到」，逐周累加到总节次为止，
+   *   所以同一份学时在不同单双周方案下算出的周数不同，不能再按 节次 ÷ 每周节次 简单除。
    */
-  teacherId: '',
+  weekPatterns: ['all'] as Array<'all' | 'odd' | 'even'>,
   /** 面向班级（clazzId 字符串数组）：[] = 改成不绑班级（选修课） */
   clazzIds: [] as string[]
 });
 
-/* ---------- 教学班编辑用的教师 / 班级下拉（惰性加载，只在本页展开编辑时才拉） ---------- */
-const teacherPicker = ref<Array<{ value: string; label: string }>>([]);
+/* ---------- 教学班编辑用的班级下拉（惰性加载，只在本页展开编辑时才拉） ---------- */
 const clazzPicker = ref<Array<{ value: string; label: string }>>([]);
 const pickersLoading = ref(false);
 let pickersLoaded = false;
@@ -159,48 +159,99 @@ async function ensureTermWeekMax() {
   }
 }
 
-/** 拉教师与班级全量选项；失败不阻塞节奏编辑（教师/班级两栏退化成只读文本） */
+/** 拉班级全量选项（授课教师不在这里选：教学班行头已经显示教师，编辑区不重复选） */
 async function ensurePickers() {
   if (pickersLoaded || pickersLoading.value) return;
   pickersLoading.value = true;
   try {
-    const [ts, cs] = await Promise.all([
-      listUsers({ roleKey: 'teacher', page: 1, pageSize: 200 }),
-      listClasses({ page: 1, pageSize: 300 })
-    ]);
-    teacherPicker.value = (ts?.list ?? [])
-      .filter(u => u.userId !== undefined && u.userId !== null)
-      .map(u => ({ value: String(u.userId), label: u.nickName || u.username || String(u.userId) }));
+    const cs = await listClasses({ page: 1, pageSize: 300 });
     clazzPicker.value = (cs?.list ?? [])
       .filter(c => c.clazzId)
       .map(c => ({ value: String(c.clazzId), label: String(c.clazzName ?? c.clazzId) }));
-    pickersLoaded = teacherPicker.value.length > 0;
+    pickersLoaded = clazzPicker.value.length > 0;
   } catch {
-    /* 请求层已提示；两个下拉留空，保存时不提交教师/班级字段 */
+    /* 请求层已提示；班级下拉留空，保存时不提交班级字段 */
   } finally {
     pickersLoading.value = false;
   }
 }
 
-/** 打开编辑时的教师 / 班级快照：保存时做差集，没动过就不提交（避免无意义覆盖已排课次） */
-const schedCfgTeacherSnapshot = ref('');
+/** 打开编辑时的班级快照：保存时做差集，没动过就不提交（避免无意义覆盖已排课次） */
 const schedCfgClassSnapshot = ref<string[]>([]);
 /** 库里存的班级名有对不上 id 的（历史占位值 / 班级已删）⇒ 班级改动不可靠，本次不允许改班级 */
 const schedCfgClassUnresolved = ref(false);
 
-/** 表单内实时换算：总学时 → 节次 → 结束周（全部是派生值，不落库） */
+/**
+ * 某一周该上几节 —— 与后端 `AdminAutoArrangeServiceImpl.countActiveSlots` 同一口径：
+ * odd = 学期第 1、3、5… 周（按学期起点锚定的**绝对周号**奇偶，不是区间内的相对序号）。
+ */
+function activeSlotsOf(patterns: ReadonlyArray<'all' | 'odd' | 'even'>, weekNo: number): number {
+  const oddWeek = weekNo % 2 === 1;
+  let n = 0;
+  for (const p of patterns) {
+    if (p === 'all' || (p === 'odd' && oddWeek) || (p === 'even' && !oddWeek)) n += 1;
+  }
+  return n;
+}
+
+/** 「每周节次」变动时把单双周数组对齐到该长度（已有选择保留，新增的那节默认「每周」） */
+function syncPatternLen() {
+  const len = Math.max(1, Math.min(7, Math.floor(Number(schedCfgForm.lessonsPerWeek) || 1)));
+  const cur = [...schedCfgForm.weekPatterns];
+  schedCfgForm.weekPatterns = Array.from({ length: len }, (_, i) => cur[i] ?? 'all');
+}
+
+/** 单双周方案按「每周节次」归一化：缺的补 all、多的截掉（与后端 normalizeWeekPatterns 一致） */
+const schedCfgPatterns = computed<Array<'all' | 'odd' | 'even'>>(() => {
+  const perWeek = Math.max(1, Math.min(7, Math.floor(Number(schedCfgForm.lessonsPerWeek) || 1)));
+  const out: Array<'all' | 'odd' | 'even'> = [];
+  for (let i = 0; i < perWeek; i++) {
+    const v = schedCfgForm.weekPatterns[i];
+    out.push(v === 'odd' || v === 'even' ? v : 'all');
+  }
+  return out;
+});
+
+/**
+ * 表单内实时换算：总学时 → 节次 → 结束周（全部是派生值，不落库）。
+ *
+ * ★ 2026-11-25 改口径：周数**逐周累加**该周实际节数，不再用 `节次 ÷ 每周节次`。
+ *   业主给的例子：48 学时（24 节次）、每周 2 节、第 2 节只上单周
+ *   ⇒ 每周轮流上 3 节 / 2 节 ⇒ 24 节次正好铺满 16 周（16 节 + 8 节）。
+ *   老的除法会算成 12 周，把那 8 个单周的第 2 节直接挤掉。
+ */
 const schedCfgPreview = computed(() => {
   const perWeek = Math.max(1, Math.floor(Number(schedCfgForm.lessonsPerWeek) || 1));
   const from = Math.max(1, Math.floor(Number(schedCfgForm.weekFrom) || 1));
+  const patterns = schedCfgPatterns.value;
   const h = Number(schedCfgForm.hours);
   const hours = Number.isFinite(h) && h > 0 ? h : null;
   const periods = hours === null ? null : Math.ceil(hours / HOURS_PER_PERIOD);
-  const weeks = periods === null ? null : Math.ceil(periods / perWeek);
-  const rawTo = weeks === null ? null : from + weeks - 1;
-  const weekTo = rawTo === null ? null : Math.min(rawTo, termWeekMax.value);
-  /** 窗口内最多能排的节次 = 周跨度 × 每周节次；小于总节次 ⇒ 这学期排不完 */
-  const capacity = weekTo === null ? null : (weekTo - from + 1) * perWeek;
+
+  /** 单周 / 双周各上几节（纯展示：让「第 2 节单周」这种方案一眼看清） */
+  const oddSlots = activeSlotsOf(patterns, 1);
+  const evenSlots = activeSlotsOf(patterns, 2);
+  const hasParity = patterns.some(p => p !== 'all');
+
+  const maxWeek = termWeekMax.value;
+  let weeks: number | null = null;
+  let acc = 0;
+  let weekTo: number | null = null;
+  if (periods === null) {
+    // 没填学时 ⇒ 按整学期自然铺满（与「留空 = 每周节次铺满窗口」的旧行为一致）
+    weekTo = Math.max(from, maxWeek);
+  } else {
+    for (let w = from; w <= maxWeek; w++) {
+      acc += activeSlotsOf(patterns, w);
+      weeks = w - from + 1;
+      weekTo = w;
+      if (acc >= periods) break;
+    }
+  }
+
+  const capacity = periods === null ? null : acc;
   const shortfall = periods === null || capacity === null ? 0 : Math.max(0, periods - capacity);
+  const spanWeeks = weekTo === null ? null : weekTo - from + 1;
   return {
     hours,
     perWeek,
@@ -208,11 +259,20 @@ const schedCfgPreview = computed(() => {
     weeks,
     from,
     weekTo,
-    spanWeeks: weekTo === null ? null : weekTo - from + 1,
+    spanWeeks,
     capacity,
     shortfall,
-    /** 算出来的结束周超出本学期教学周边界（会被截断 ⇒ 后段节次排不进去） */
-    overflow: rawTo !== null && rawTo > termWeekMax.value
+    oddSlots,
+    evenSlots,
+    hasParity,
+    /** 铺满学时后仍撞到学期上界（后面几节排不进这个学期） */
+    overflow: shortfall > 0 && weekTo !== null && weekTo >= maxWeek,
+    /** 一句话方案，给「排课设置」那行汇总用 */
+    patternLabel: hasParity
+      ? patterns
+          .map((p, i) => `第 ${i + 1} 节${p === 'all' ? '每周' : p === 'odd' ? '单周' : '双周'}`)
+          .join('、')
+      : ''
   };
 });
 
@@ -255,6 +315,16 @@ const drawerConfigured = computed(() => {
   return offs.length > 0 && offs.every(o => offeringComplete(o, detailData.value?.courseType ?? detailCourse.value?.courseType));
 });
 
+/** 逐节单双周的一句话摘要：「第 2 节单周、第 3 节双周」；全每周返回空串 */
+function patternSummary(raw?: string | null): string {
+  return String(raw ?? '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .map((p, i) => (p === 'odd' ? `第 ${i + 1} 节单周` : p === 'even' ? `第 ${i + 1} 节双周` : ''))
+    .filter(Boolean)
+    .join('、');
+}
+
 function schedCfgLabel(o: AdminOfferingVo) {
   const from = o.weekFrom ?? 1;
   const weeks = o.weekCount ?? 0;
@@ -263,7 +333,8 @@ function schedCfgLabel(o: AdminOfferingVo) {
   // 2026-11-13 业主反馈：未配置排课节奏的课不可参与自动排课，需在此显式提示
   if (o.scheduleConfigured === 0) return '未配置（不可自动排课）——请保存一次排课设置';
   if (!weeks) return '未设置（缺省整学期 · 每周 1 节）';
-  return `第 ${from}~${from + weeks - 1} 周 · 每周 ${perWeek} 节 · 共 ${total} 节次（= ${total * HOURS_PER_PERIOD} 学时）`;
+  const pat = patternSummary(o.weekPatterns);
+  return `第 ${from}~${from + weeks - 1} 周 · 每周 ${perWeek} 节${pat ? `（${pat}）` : ''} · 共 ${total} 节次（= ${total * HOURS_PER_PERIOD} 学时）`;
 }
 
 async function openSchedCfg(o: AdminOfferingVo) {
@@ -274,21 +345,20 @@ async function openSchedCfg(o: AdminOfferingVo) {
   // 课程没填学时才用已存配置反推（周跨度 × 每周节次 × 2）。
   schedCfgForm.hours = detailData.value?.hours ?? (o.weekCount ? o.weekCount * (o.lessonsPerWeek ?? 1) * HOURS_PER_PERIOD : null);
 
-  // 教学班 = 教师 + 班级 + 节奏（2026-11-23）：教师与班级也在这里改，保存时一并提交
-  schedCfgForm.teacherId = o.teacherId ? String(o.teacherId) : '';
-  schedCfgTeacherSnapshot.value = schedCfgForm.teacherId;
+  // 授课教师只在「新增教学班」时选（教学班行里一直显示教师，编辑区不再重复选一次）
   schedCfgForm.clazzIds = [];
   schedCfgClassSnapshot.value = [];
   schedCfgClassUnresolved.value = false;
+  // 逐节单双周回填：库里存的是 "all,odd" 这种逗号串，按每周节次补齐（缺的按每周上）
+  const stored = String(o.weekPatterns ?? '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+  schedCfgForm.weekPatterns = Array.from({ length: Math.max(1, Number(o.lessonsPerWeek) || 1) }, (_, i) =>
+    stored[i] === 'odd' ? 'odd' : stored[i] === 'even' ? 'even' : 'all'
+  );
 
   await Promise.all([ensurePickers(), ensureTermWeekMax()]);
-  // 教师不在 roleKey=teacher 名单里（历史数据/已停用账号）⇒ 补一项，否则下拉显示裸 ID
-  if (schedCfgForm.teacherId && !teacherPicker.value.some(t => t.value === schedCfgForm.teacherId)) {
-    teacherPicker.value = [
-      { value: schedCfgForm.teacherId, label: o.teacherName || `教师 #${schedCfgForm.teacherId}` },
-      ...teacherPicker.value
-    ];
-  }
   // 库里存的是班级名数组，下拉要的是 clazzId ⇒ 按名字反查（历史占位值先剔掉）
   const names = (Array.isArray(o.targetClasses) ? o.targetClasses : [])
     .map(x => String(x ?? '').trim())
@@ -331,15 +401,15 @@ async function saveSchedCfg(o: AdminOfferingVo) {
   }
   schedCfgSaving.value = true;
   try {
-    // 教学班三项一起提交：节奏必传；教师/班级只在动过时传（后端不传 = 不改，避免无意义覆盖已排课次）
+    // 节奏 + 逐节单双周一起提交；班级只在动过时传（后端不传 = 不改，避免无意义覆盖已排课次）
     const payload: Parameters<typeof updateOfferingScheduleConfig>[1] = {
       weekFrom: schedCfgForm.weekFrom,
       weekCount: spanWeeks,
       lessonsPerWeek,
-      totalLessons: periods
+      totalLessons: periods,
+      // 全「每周」也要传：不传 = 保留库里旧方案，用户刚把单双周改回每周就会不生效
+      weekPatterns: [...schedCfgPatterns.value]
     };
-    const teacherNow = String(schedCfgForm.teacherId || '');
-    const teacherChanged = !!teacherNow && teacherNow !== schedCfgTeacherSnapshot.value;
     const classNow = [...schedCfgForm.clazzIds].sort();
     const classBefore = [...schedCfgClassSnapshot.value].sort();
     const classChanged = classNow.join(',') !== classBefore.join(',');
@@ -347,13 +417,11 @@ async function saveSchedCfg(o: AdminOfferingVo) {
       ElMessage.warning('这条配置的班级与班级名单对不上（班级可能已被删除或改名），本次未改班级；可到「智能排课」页的课程配置里重新绑定');
       return;
     }
-    if (teacherChanged) payload.teacherId = teacherNow;
     if (classChanged) payload.clazzIds = classNow;
-    const teachingChanged = teacherChanged || classChanged;
     await updateOfferingScheduleConfig(o.offeringId, payload);
     ElMessage.success(
-      teachingChanged
-        ? '教学班已保存：教师与班级已同步到已排课次，节奏按新设置执行'
+      classChanged
+        ? '教学班已保存：班级已同步到已排课次，节奏与单双周按新设置执行'
         : '排课配置已保存，自动排课将按新节奏执行'
     );
     schedCfgId.value = '';
@@ -1656,21 +1724,8 @@ onMounted(async () => {
                   <!-- 抽屉只有 ~240px 可用宽，改成单列「定宽标签 + 数字框」网格：
                        填三个值即可，结束周与节次数由总学时自动派生（不再有「按学时算」按钮）。 -->
                   <div class="cfg-grid">
-                    <!-- 教学班身份（2026-11-23 业主：教师/班级要在课程总览里就能改）：
-                         同一门课两个老师各带一个班 = 两条配置，各自改各自的教师与班级。 -->
-                    <div class="cfg-cell">
-                      <span class="cfg-lab">授课教师</span>
-                      <el-select
-                        v-model="schedCfgForm.teacherId"
-                        size="small"
-                        filterable
-                        class="cfg-num"
-                        :loading="pickersLoading"
-                        placeholder="选择授课教师"
-                      >
-                        <el-option v-for="t in teacherPicker" :key="t.value" :label="t.label" :value="t.value" />
-                      </el-select>
-                    </div>
+                    <!-- 授课教师（2026-11-25 业主）：教学班行头已经显示「哪位老师教这个班」，
+                         编辑区再放一个教师下拉是重复输入，去掉。换教师走「新增教学班」重建一条。 -->
                     <div class="cfg-cell">
                       <span class="cfg-lab">上课班级</span>
                       <el-select
@@ -1694,7 +1749,30 @@ onMounted(async () => {
                     </div>
                     <div class="cfg-cell">
                       <span class="cfg-lab">每周节次</span>
-                      <el-input-number v-model="schedCfgForm.lessonsPerWeek" class="cfg-num" :min="1" :max="7" size="small" controls-position="right" />
+                      <el-input-number
+                        v-model="schedCfgForm.lessonsPerWeek"
+                        class="cfg-num"
+                        :min="1"
+                        :max="7"
+                        size="small"
+                        controls-position="right"
+                        @change="syncPatternLen"
+                      />
+                    </div>
+                    <!-- 逐节单双周（2026-11-25 业主）：「第 1 节每周 + 第 2 节只在单周」
+                         这类排法在这里一次配好，周数按实际累计节次自动算出，不用手工改结束周。 -->
+                    <div class="cfg-cell cfg-cell-block">
+                      <span class="cfg-lab">单双周</span>
+                      <div class="pat-list">
+                        <div v-for="(_p, i) in schedCfgPatterns" :key="`pat-${i}`" class="pat-item">
+                          <span class="pat-idx">第 {{ i + 1 }} 节</span>
+                          <el-select v-model="schedCfgForm.weekPatterns[i]" size="small" class="cfg-num">
+                            <el-option label="每周" value="all" />
+                            <el-option label="单周" value="odd" />
+                            <el-option label="双周" value="even" />
+                          </el-select>
+                        </div>
+                      </div>
                     </div>
                     <div class="cfg-cell">
                       <span class="cfg-lab">总学时</span>
@@ -1732,20 +1810,23 @@ onMounted(async () => {
                     "
                   >
                     <template v-if="schedCfgPreview.periods !== null">
-                      {{ schedCfgPreview.hours }} 学时 = <b>{{ schedCfgPreview.periods }}</b> 节次（1 节次 08:00–09:50 = 2 学时：50 分钟 × 2 + 10 分钟课间）；每周
-                      {{ schedCfgPreview.perWeek }} 节 ⇒ 第 {{ schedCfgPreview.from }}~{{ schedCfgPreview.weekTo }} 周，共
-                      {{ schedCfgPreview.spanWeeks }} 教学周<template v-if="schedCfgPreview.overflow">（超出本学期第 {{ termWeekMax }} 周边界，已截到第 {{ termWeekMax }} 周）</template>。<template
+                      {{ schedCfgPreview.hours }} 学时 = <b>{{ schedCfgPreview.periods }}</b> 节次（1 节次 08:00–09:50 = 2 学时）；每周
+                      {{ schedCfgPreview.perWeek }} 节<template v-if="schedCfgPreview.hasParity"
+                        >（单周 {{ schedCfgPreview.oddSlots }} 节 / 双周 {{ schedCfgPreview.evenSlots }} 节）</template
+                      >
+                      ⇒ 第 {{ schedCfgPreview.from }}~{{ schedCfgPreview.weekTo }} 周，共 {{ schedCfgPreview.spanWeeks }} 教学周。<template
                         v-if="schedCfgPreview.shortfall > 0"
-                        >本学期这个窗口最多排 {{ schedCfgPreview.capacity }} 节次，还差 {{ schedCfgPreview.shortfall }} 节次：请提高每周节次。</template
+                        >排到本学期第 {{ termWeekMax }} 周只上得完 {{ schedCfgPreview.capacity }} 节次，还差
+                        {{ schedCfgPreview.shortfall }} 节次：请提高每周节次，或把某几节改成「每周」。</template
                       ><template
                         v-if="schedCfgStoredWeeks !== null && schedCfgStoredWeeks !== schedCfgPreview.spanWeeks"
-                        >（当前配置存的是 {{ schedCfgStoredWeeks }} 教学周，保存后按学时改为 {{ schedCfgPreview.spanWeeks }} 周）</template
-                      >。
+                        >（当前配置存的是 {{ schedCfgStoredWeeks }} 教学周，保存后改为 {{ schedCfgPreview.spanWeeks }} 周）</template
+                      >
                     </template>
                     <template v-else>请填写该配置的总学时，节次数与结束周会自动算出。</template>
                   </div>
                   <div class="small muted" style="margin-top: 4px">
-                    节次数 = 总学时 ÷ 2，结束周 = 起始周 + 节次数 ÷ 每周节次 − 1；保存后自动排课按此节奏执行（重复排课幂等补差额，已停课的节次不计入）。
+                    节次数 = 总学时 ÷ 2。结束周按每一节的实际上课周<b>逐周累加</b>算出：全「每周」时就是起始周 + 节次数 ÷ 每周节次 − 1；有单/双周时按真实上课周数算（例：48 学时、每周 2 节、第 2 节只上单周 ⇒ 24 节次铺满 16 周）。保存后自动排课按此节奏执行，重复排课幂等补差额。
                   </div>
                 </div>
               </div>
@@ -2274,6 +2355,31 @@ onMounted(async () => {
   flex: 1 1 auto;
   width: 100%;
   min-width: 0;
+}
+/* 单双周：标签列 + 纵向多行（每行「第 N 节 + 下拉」）。抽屉只有 240px，横向排不下 */
+.cfg-cell-block {
+  align-items: flex-start;
+}
+.cfg-cell-block .cfg-lab {
+  padding-top: 5px;
+}
+.pat-list {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.pat-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.pat-idx {
+  flex: 0 0 46px;
+  font-size: 12px;
+  color: var(--text-3, #667085);
 }
 /* 只读派生值（结束周）：做成和数字框同宽同高的「假输入框」，保持这一列对齐 */
 .cfg-auto {
