@@ -5040,6 +5040,51 @@ function poolFull(r: ClazzPoolItem) {
   return sc > 0 && r.weekCount != null && sc >= r.weekCount;
 }
 
+/**
+ * 选修课不进「按班池」的原因（2026-11-25 业主实测反馈：选「计算机2301」只回 2 门，选修课不见了）。
+ *
+ * 后端 `/schedules/clazz-pool` 的 SQL 是 `json_contains(target_classes, 当前班级)`，
+ * 而选修课的 target_classes 是**可报名范围**、通常为空（不绑班）⇒ 任何班都匹配不到它。
+ * 这不是漏查，是语义决定的：选修课不属于某个行政班，硬塞进「整建制必修」池会误导。
+ *
+ * 所以弹窗里单列一块「本学期选修课」，直接在这里排（不传 targetClass：课排一次全校共用）；
+ * 主待排池里同样能排，两条入口排的是同一条开课记录，幂等不重复。
+ */
+interface ElectivePoolRow {
+  key: string;
+  offeringId: string;
+  courseName: string;
+  teacherName: string;
+  weekFrom: number | null;
+  weekCount: number | null;
+  studentCount: number;
+  configured: boolean;
+}
+const poolElectives = computed<ElectivePoolRow[]>(() => {
+  const rows: ElectivePoolRow[] = [];
+  // 只看当前学期：/courses/{id}/offerings 会把这门课历次开课全带回来，
+  // 不筛就会把上学期的选修也列进「本学期选修课」
+  const term = String(filters.termId || currentTermId.value || '');
+  for (const c of poolCourses.value) {
+    if (!isElectiveCourse(c.courseType)) continue;
+    for (const o of offeringByCourse.value[String(c.courseId)] ?? []) {
+      if (term && String(o.termId ?? '') && String(o.termId) !== term) continue;
+      rows.push({
+        key: String(o.offeringId),
+        offeringId: String(o.offeringId),
+        courseName: c.courseName,
+        teacherName: (o.teacherName || '').trim() || '未定',
+        weekFrom: o.weekFrom ?? 1,
+        weekCount: o.weekCount ?? null,
+        studentCount: Number(o.studentCount ?? 0),
+        // 字段缺失（旧包）按已配置处理，只有明确 0 才算未配置 —— 与池子体检口径一致
+        configured: Number(o.scheduleConfigured ?? 1) !== 0
+      });
+    }
+  }
+  return rows;
+});
+
 async function openClazzPool() {
   if (!canClazzPool.value) {
     ElMessage.warning('当前账号没有按班排课的权限（admin:schedules:clazzPool）');
@@ -5090,6 +5135,31 @@ async function runPoolRow(row: ClazzPoolItem) {
     poolRunningKey.value = '';
   }
   await Promise.all([loadPool(), load(true)]);
+}
+
+/**
+ * 选修课排课：**不传 targetClass**。
+ * 选修课没有（也不需要）行政班归属，传班名会把它绑到某个班上，与「全校共用一套课表」矛盾。
+ */
+async function runElectiveRow(row: ElectivePoolRow) {
+  if (poolRunningKey.value) return;
+  poolRunningKey.value = row.key;
+  try {
+    const rows = await autoArrange({ offeringId: row.offeringId });
+    for (const r of rows ?? []) {
+      const name = r.courseName || row.courseName;
+      const placed = r.arranged ?? r.weeksPlaced?.length ?? 0;
+      const blocking = (r.skipped ?? []).find(x => x.week === 0);
+      if (blocking) poolResults.value.push(`「${name}」（选修）→ ${blocking.reason || '前置校验未通过，已跳过'}`);
+      else if (placed > 0) poolResults.value.push(`「${name}」（选修）→ 已排 ${placed}/${r.totalWeeks ?? '?'} 周`);
+      else poolResults.value.push(`「${name}」（选修）→ 本学期各周已有课次或无空档，未排新课次`);
+    }
+  } catch (err) {
+    poolResults.value.push(`「${row.courseName}」（选修）→ ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    poolRunningKey.value = '';
+  }
+  await load(true);
 }
 
 /* ---------- 批量放回待排（2026-10-30）：课程级批量入口 ----------
@@ -6904,6 +6974,10 @@ watch(
       选一个行政班，列出本学期面向该班的<b>必修课</b>（按开课记录的面向班级精确匹配）；逐门点「排课」会自动找空闲时段铺满教学周，
       已排过的周自动跳过（重复执行不产生重复课）。班级下拉来自班级主表，没登记的班先去「基础数据 → 班级」补档。
     </p>
+    <p class="small muted" style="margin: -4px 0 8px">
+      选修课不在这张表里：它的「面向班级」只是<b>可报名范围</b>，课本身不属于某个行政班，按班匹配永远拉不到。
+      本学期的选修开课都在下面单独一块，可以直接排。
+    </p>
     <div class="detail-row">
       <span class="detail-k">班级</span>
       <div style="flex: 1; min-width: 0">
@@ -6957,10 +7031,50 @@ watch(
       <p v-if="!poolLoading && !poolRows.length" class="small muted" style="margin: 8px 0 0">
         本学期没有面向「{{ poolClazzName || '该班' }}」的必修开课记录（先到课程管理给课程登记面向班级与开课）。
       </p>
-      <ul v-if="poolResults.length" class="small" style="padding-left: 18px; line-height: 2; margin: 10px 0 0">
-        <li v-for="(t, i) in poolResults" :key="'pr' + i">{{ t }}</li>
-      </ul>
     </template>
+
+    <!-- 选修课单列一块（2026-11-25）：不按行政班归属，因此不受上面选班影响 -->
+    <div class="pool-elective">
+      <div class="pool-elective-head">
+        <b>选修课（本学期 {{ poolElectives.length }} 门开课）</b>
+        <span class="small muted">不按班归属 · 排一次全校共用一套课表</span>
+      </div>
+      <el-table v-if="poolElectives.length" :data="poolElectives" height="200" size="small">
+        <el-table-column prop="courseName" label="课程" min-width="150" show-overflow-tooltip />
+        <el-table-column prop="teacherName" label="教师" width="110" />
+        <el-table-column label="教学周" width="130">
+          <template #default="{ row }">第 {{ row.weekFrom ?? 1 }} 周起 · {{ row.weekCount ?? '—' }} 周</template>
+        </el-table-column>
+        <el-table-column label="人数" width="70" align="center">
+          <template #default="{ row }">{{ row.studentCount ?? 0 }}</template>
+        </el-table-column>
+        <el-table-column label="排课节奏" width="100">
+          <template #default="{ row }">
+            <el-tag v-if="!row.configured" size="small" type="warning">未配置</el-tag>
+            <el-tag v-else size="small" type="success">已配置</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="96">
+          <template #default="{ row }">
+            <el-button
+              link
+              type="primary"
+              size="small"
+              :loading="poolRunningKey === row.key"
+              :disabled="!!poolRunningKey && poolRunningKey !== row.key"
+              @click="runElectiveRow(row)"
+            >排课</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <p v-else class="small muted" style="margin: 6px 0 0">
+        本学期没有选修开课（选修课需先在「课程管理」建课并开课；没配班级也能开课）。
+      </p>
+    </div>
+
+    <ul v-if="poolResults.length" class="small" style="padding-left: 18px; line-height: 2; margin: 10px 0 0">
+      <li v-for="(t, i) in poolResults" :key="'pr' + i">{{ t }}</li>
+    </ul>
     <template #footer>
       <el-button @click="poolVisible = false">关闭</el-button>
     </template>
@@ -8010,6 +8124,19 @@ watch(
 /* ---- 待排池两栏（2026-11-16） ----
  * 两栏等宽并排，窄屏（<1040px，含 IDE 内置预览）自动竖排——池子是拖动排课的入口，
  * 横排挤压到每栏 200px 宽时课名会全被截断，竖排反而更好用。 */
+/* 按班排课弹窗里的「选修课」块（2026-11-25）：与上面的必修表用一条分隔线隔开，
+   免得看起来像「同一个池子里混着必修和选修」 */
+.pool-elective {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--el-border-color);
+}
+.pool-elective-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
 .pool-cols {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
