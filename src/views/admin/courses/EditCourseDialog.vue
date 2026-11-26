@@ -208,7 +208,7 @@ async function submit() {
 </script>
 
 <template>
-  <el-dialog
+  <el-dialog draggable
     v-model="visible"
     title="编辑课程基础信息"
     width="560px"

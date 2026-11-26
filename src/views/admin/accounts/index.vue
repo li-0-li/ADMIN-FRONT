@@ -1256,7 +1256,7 @@ async function openFootprint(row: AdminUserVo) {
   </div>
 
   <!-- 新增 / 编辑 -->
-  <el-dialog v-model="formVisible" :title="formMode === 'create' ? '新增账号' : '编辑账号'" width="480px">
+  <el-dialog draggable v-model="formVisible" :title="formMode === 'create' ? '新增账号' : '编辑账号'" width="480px">
     <el-form ref="formRef" :model="form" :rules="formRules" label-width="86px" label-position="left">
       <!-- 必填在前（带红星），选填在后；错误内联红字显示。
            ★ 占位文案全部用自绘覆盖层（.fc-ph）：原生 ::placeholder 在部分浏览器可被选中复制 -->
@@ -1313,7 +1313,7 @@ async function openFootprint(row: AdminUserVo) {
   </el-dialog>
 
   <!-- 可授课程（管理员代设，会议 #10）：整组覆盖保存 -->
-  <el-dialog
+  <el-dialog draggable
     v-model="capVisible"
     :title="capTeacher ? `可授课程 · ${capTeacher.nickName}（${capTeacher.username}）` : '可授课程'"
     width="560px"
@@ -1348,7 +1348,7 @@ async function openFootprint(row: AdminUserVo) {
   </el-dialog>
 
   <!-- 重置密码结果 -->
-  <el-dialog v-model="pwdVisible" :title="pwdTitle" width="420px">
+  <el-dialog draggable v-model="pwdVisible" :title="pwdTitle" width="420px">
     <p class="muted small" style="margin-top: 0">{{ pwdLead }}</p>
     <div class="rowline" style="margin-top: 10px">
       <span class="mono" style="font-size: 16px; font-weight: 700">{{ pwdResult }}</span>
@@ -1362,7 +1362,7 @@ async function openFootprint(row: AdminUserVo) {
   </el-dialog>
 
   <!-- 查看详情 -->
-  <el-dialog v-model="detailVisible" title="账号详情" width="480px">
+  <el-dialog draggable v-model="detailVisible" title="账号详情" width="480px">
     <div v-if="detailRow" class="stack" style="gap: 10px">
       <div class="pf-row"><span class="k">登录账号</span><span>{{ detailRow.username }}</span></div>
       <div class="pf-row"><span class="k">姓名</span><span>{{ detailRow.nickName }}</span></div>
@@ -1382,7 +1382,7 @@ async function openFootprint(row: AdminUserVo) {
   </el-dialog>
 
   <!-- 批量导入（B-8） -->
-  <el-dialog v-model="importVisible" title="批量导入账号" width="520px">
+  <el-dialog draggable v-model="importVisible" title="批量导入账号" width="520px">
     <div class="stack" style="gap: 12px">
       <div class="small muted" style="line-height: 1.7">
         1. 先<span v-if="tplLoading" class="muted">模板生成中，请稍候…</span><span v-else><a href="javascript:void(0)" style="color: var(--brand-600)" @click="onDownloadTemplate">下载导入模板</a></span>，

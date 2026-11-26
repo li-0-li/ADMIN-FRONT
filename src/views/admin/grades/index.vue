@@ -875,7 +875,7 @@ onUnmounted(() => {
 
   <!-- 导出设置：把「导的是哪批数据、哪几列」在落盘前说清楚。
        条件摘要与后端「导出条件」sheet 同源，字段勾选只裁列不裁行。 -->
-  <el-dialog v-model="exportVisible" title="导出 Excel" width="580px">
+  <el-dialog draggable v-model="exportVisible" title="导出 Excel" width="580px">
     <div class="dlg-block">
       <div class="dlg-title">这批数据是什么</div>
       <div class="summary-grid">

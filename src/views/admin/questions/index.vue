@@ -578,7 +578,7 @@ onMounted(async () => {
   </div>
 
   <!-- 新增 / 编辑 -->
-  <el-dialog
+  <el-dialog draggable
     v-model="dialogVisible"
     :title="editingId ? '编辑题目' : '新增题目'"
     width="680px"
@@ -681,7 +681,7 @@ onMounted(async () => {
   </el-dialog>
 
   <!-- 详情 -->
-  <el-dialog v-model="detailVisible" title="题目详情" width="660px">
+  <el-dialog draggable v-model="detailVisible" title="题目详情" width="660px">
     <div v-loading="detailLoading" class="detail">
       <template v-if="detail">
         <!-- 一行元信息：题型徽标 + 难度刻度 + 分值 + 创建时间，替代原来「题型　·　难度 X　·　分值」的密集长句 -->

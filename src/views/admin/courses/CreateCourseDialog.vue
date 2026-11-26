@@ -565,7 +565,7 @@ function close() {
 </script>
 
 <template>
-  <el-dialog
+  <el-dialog draggable
     v-model="visible"
     :title="dialogTitle"
     width="560px"

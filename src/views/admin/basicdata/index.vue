@@ -1018,7 +1018,7 @@ async function exportCsv() {
     </div>
   </el-drawer>
 
-  <el-dialog v-model="formVisible" :title="formMode === 'create' ? '新增' : '编辑'" width="440px">
+  <el-dialog draggable v-model="formVisible" :title="formMode === 'create' ? '新增' : '编辑'" width="440px">
     <el-form label-width="88px" label-position="left">
       <el-form-item v-for="f in currentFields" :key="f.prop" :label="f.label">
         <el-select v-if="f.type === 'select'" v-model="form[f.prop]" style="width: 100%">

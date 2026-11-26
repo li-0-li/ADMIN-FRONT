@@ -907,7 +907,7 @@ onMounted(refreshAll);
   </div>
 
   <!-- ============ 新建 / 编辑计划 ============ -->
-  <el-dialog
+  <el-dialog draggable
     v-model="planDialogVisible"
     :title="editingPlan ? '编辑巡查计划' : '新建巡查计划'"
     width="520"

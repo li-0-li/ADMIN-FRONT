@@ -6059,7 +6059,7 @@ watch(
   </div>
 
   <!-- 批量放回待排（2026-10-30）：按课程聚合的批量入口，补「取消整门课要拖 21 次」的缺口 -->
-  <el-dialog v-model="returnVisible" title="批量放回待排" width="560px" :close-on-click-modal="!returnRunning">
+  <el-dialog draggable v-model="returnVisible" title="批量放回待排" width="560px" :close-on-click-modal="!returnRunning">
     <p class="small" style="margin-top: 0">
       把选中课程的课次退回待排池（<b>软删</b>，之后可用自动排课或拖拽重新排）。只影响所选范围内的课次。
     </p>
@@ -6115,7 +6115,7 @@ watch(
   </el-dialog>
 
   <!-- 课次详情 / 调整（C-19：教室与备注可改，时间坐标原样回传，不改上课时间） -->
-  <el-dialog v-model="detailVisible" :title="`调整课次 · ${detailCell?.courseName ?? ''}`" width="460px">
+  <el-dialog draggable v-model="detailVisible" :title="`调整课次 · ${detailCell?.courseName ?? ''}`" width="460px">
     <template v-if="detailCell">
       <div class="detail-row">
         <span class="detail-k">时间</span>
@@ -6283,7 +6283,7 @@ watch(
   </el-dialog>
 
   <!-- 「并入 或 互换」二选一：拖已有课次落到**不同教师**的课次卡片上时弹出 -->
-  <el-dialog v-model="choiceVisible" title="这两节课怎么处理？" width="500px">
+  <el-dialog draggable v-model="choiceVisible" title="这两节课怎么处理？" width="500px">
     <p class="choice-lead">
       你把「<b>{{ choiceFrom?.courseName || '该课次' }}</b>」（{{
         choiceFrom?.teacherName || '未填教师'
@@ -6384,7 +6384,7 @@ watch(
   </el-dialog>
 
   <!-- 新增课次（C-17 真接口，带冲突检查） -->
-  <el-dialog v-model="createVisible" :title="createTitle" width="460px" @opened="onCreateOpened">
+  <el-dialog draggable v-model="createVisible" :title="createTitle" width="460px" @opened="onCreateOpened">
     <el-form label-width="92px" label-position="right">
       <!-- 学期（2026-11-09 A4）：排课归属学期，必选、不接受手填。
            与页面顶部筛选的学期是两个概念——顶部决定「现在看哪一学期」，这里决定「这批课次写进哪一学期」。
@@ -6736,7 +6736,7 @@ watch(
   </el-dialog>
 
   <!-- 自动排课（批次2 统一口径）：逐门调后端 auto-arrange（幂等），结束出报告 -->
-  <el-dialog v-model="autoVisible" title="自动排课" width="560px" :close-on-click-modal="!autoRunning">
+  <el-dialog draggable v-model="autoVisible" title="自动排课" width="560px" :close-on-click-modal="!autoRunning">
     <template v-if="!autoReport">
       <p class="small" style="margin-top: 0">把「待排课程」排进空位；<b>课表上已有的课不动</b>。</p>
       <!-- 排课规则说明（2026-11-02，第六版）：历次反馈「模糊 → 罗嗦 → AI 味 → 长句 → 再精简」。
@@ -6969,7 +6969,7 @@ watch(
   </el-dialog>
 
   <!-- 按班成池（批次5 B-9）：选班 → 本学期必修课池 → 逐门自动排（复用 autoArrange 幂等） -->
-  <el-dialog v-model="poolVisible" title="按班排课（必修课整建制）" width="720px">
+  <el-dialog draggable v-model="poolVisible" title="按班排课（必修课整建制）" width="720px">
     <p class="small" style="margin-top: 0">
       选一个行政班，列出本学期面向该班的<b>必修课</b>（按开课记录的面向班级精确匹配）；逐门点「排课」会自动找空闲时段铺满教学周，
       已排过的周自动跳过（重复执行不产生重复课）。班级下拉来自班级主表，没登记的班先去「基础数据 → 班级」补档。
@@ -7081,7 +7081,7 @@ watch(
   </el-dialog>
 
   <!-- 全部教室：C-21 教室列表只读查看（数据与筛选下拉同源 loadPickers） -->
-  <el-dialog v-model="roomsVisible" title="所有教室" width="880px">
+  <el-dialog draggable v-model="roomsVisible" title="所有教室" width="880px">
     <div class="rooms-head">
       <el-input v-model="roomKeyword" placeholder="搜索名称 / 编码 / 位置 / 设备" clearable style="width: 260px" />
       <span class="small muted">共 {{ roomsFiltered.length }} 间教室（关键字即时过滤）</span>
@@ -7127,7 +7127,7 @@ watch(
   </el-dialog>
 
   <!-- 编辑教室（C-21 PUT）：从「所有教室」行内进入 -->
-  <el-dialog v-model="roomEditVisible" title="编辑教室" width="460px" append-to-body>
+  <el-dialog draggable v-model="roomEditVisible" title="编辑教室" width="460px" append-to-body>
     <el-form label-width="72px">
       <el-form-item label="名称" required>
         <el-input v-model="roomEditForm.name" placeholder="如：教A-301" maxlength="50" />

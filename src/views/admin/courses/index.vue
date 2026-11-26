@@ -1525,31 +1525,32 @@ onMounted(async () => {
             <!-- 已配置（2026-11-26 业主：已配置外面要能一眼看见）：
                  ① 视觉加重——实心绿底白字 + 勾选图标，跟旁边灰色的「未配置」形成明显对比；
                  ② 本身可点，直接进教学班设置。改前已配置是纯静态徽标，想改配置只能先去「查看」，
-                    等于配置完成后入口反而消失了。 -->
-            <el-tooltip
-              v-else-if="row.offeringCount > 0 && !row.offeringIncomplete"
-              :content="canOffer ? '已配置，点此修改教学班（教师 / 班级 / 周次 / 每周节次）' : '已配置'"
-              placement="top"
+                    等于配置完成后入口反而消失了。
+                 不加 tooltip：本页只有这两个徽标会弹气泡，悬停时比别人多出一层，反而扎眼。 -->
+            <button
+              v-else-if="row.offeringCount > 0 && !row.offeringIncomplete && canOffer"
+              type="button"
+              class="badge badge-config-done"
+              @click.stop="openConfigFor(row)"
             >
-              <button
-                v-if="canOffer"
-                type="button"
-                class="badge badge-config-done"
-                @click.stop="openConfigFor(row)"
-              >
-                <ZkIcon name="check" :size="11" />已配置
-              </button>
-              <span v-else class="badge badge-config-done is-static"><ZkIcon name="check" :size="11" />已配置</span>
-            </el-tooltip>
+              <ZkIcon name="check" :size="11" />已配置
+            </button>
+            <span
+              v-else-if="row.offeringCount > 0 && !row.offeringIncomplete"
+              class="badge badge-config-done is-static"
+            ><ZkIcon name="check" :size="11" />已配置</span>
             <!-- 2026-11-16 业主：「未配置」本身就要能点进去配。
                  改前只能「查看」→ 抽屉里再点「新增配置」，两步且入口不显眼；
                  现在点徽标直接进配置表单（向导第 2 步），抽屉那条路保持不动。
                  无 admin:offerings:add 权限时退化成静态徽标，不给死入口。 -->
-            <el-tooltip v-else-if="canOffer" :content="row.offeringIncomplete ? '配置不完整（缺教师/节奏或必修缺班级），点此补全' : '点此配置学期 / 授课教师 / 上课班级'" placement="top">
-              <button type="button" class="badge badge-neutral badge-action" @click.stop="openOfferFor(row)">
-                未配置<ZkIcon name="chevron-right" :size="11" />
-              </button>
-            </el-tooltip>
+            <button
+              v-else-if="canOffer"
+              type="button"
+              class="badge badge-neutral badge-action"
+              @click.stop="openOfferFor(row)"
+            >
+              未配置<ZkIcon name="chevron-right" :size="11" />
+            </button>
             <span v-else class="badge badge-neutral">未配置</span>
           </template>
         </el-table-column>
@@ -1595,16 +1596,11 @@ onMounted(async () => {
             <el-button v-if="canEdit" text size="small" @click="openEdit(row)">
               <ZkIcon name="pencil" :size="14" style="margin-right: 3px" />编辑
             </el-button>
-            <!-- 与「编辑」并列：基础信息归编辑，教师/班级/节奏归配置（2026-11-26 业主） -->
-            <el-tooltip
-              v-if="canOffer"
-              :content="Number(row.offeringCount) > 0 ? '配置教学班（教师 / 班级 / 周次 / 每周节次）' : '先配置学期 / 授课教师 / 上课班级'"
-              placement="top"
-            >
-              <el-button text size="small" @click="openConfigFor(row)">
-                <ZkIcon name="settings" :size="14" style="margin-right: 3px" />配置
-              </el-button>
-            </el-tooltip>
+            <!-- 与「编辑」并列：基础信息归编辑，教师/班级/节奏归配置（2026-11-26 业主）
+                 不加 tooltip：同一列其他按钮都没有悬停提示，单给「配置」一个气泡反而突兀 -->
+            <el-button v-if="canOffer" text size="small" @click="openConfigFor(row)">
+              <ZkIcon name="settings" :size="14" style="margin-right: 3px" />配置
+            </el-button>
             <el-button
               v-if="canDisable"
               text

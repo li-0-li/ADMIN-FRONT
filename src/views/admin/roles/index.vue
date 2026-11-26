@@ -150,7 +150,7 @@ onMounted(fetchList);
   </div>
 
   <!-- 配置权限 -->
-  <el-dialog
+  <el-dialog draggable
     v-model="permVisible"
     :title="`配置权限 · ${currentRole?.roleName ?? ''}`"
     width="520px"

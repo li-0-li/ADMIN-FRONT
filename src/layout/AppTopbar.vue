@@ -109,7 +109,7 @@ async function submitPwd() {
     </el-dropdown>
 
     <!-- 修改密码弹窗 -->
-    <el-dialog v-model="pwdVisible" title="修改密码" width="420px" :close-on-click-modal="false">
+    <el-dialog draggable v-model="pwdVisible" title="修改密码" width="420px" :close-on-click-modal="false">
       <el-form ref="pwdFormRef" :model="pwdForm" :rules="pwdRules" label-width="90px" @submit.prevent>
         <el-form-item label="原密码" prop="oldPassword">
           <el-input v-model="pwdForm.oldPassword" type="password" show-password placeholder="请输入当前密码" />

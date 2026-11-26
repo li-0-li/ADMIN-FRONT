@@ -638,7 +638,7 @@ onUnmounted(() => {
     </div>
   </div>
 
-  <el-dialog v-model="wordFormVisible" :title="wordFormMode === 'create' ? '新增敏感词' : '编辑敏感词'" width="460px">
+  <el-dialog draggable v-model="wordFormVisible" :title="wordFormMode === 'create' ? '新增敏感词' : '编辑敏感词'" width="460px">
     <el-form label-width="88px" label-position="left">
       <el-form-item label="命中词" required>
         <el-input v-model="wordForm.word" placeholder="将被检测的文本片段" />
