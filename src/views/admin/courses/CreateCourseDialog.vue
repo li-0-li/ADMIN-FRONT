@@ -605,7 +605,6 @@ function close() {
           <el-button :loading="noGenerating" @click="onGenerateNo">自动生成</el-button>
         </div>
         <div v-if="courseNoError" class="field-error">{{ courseNoError }}</div>
-        <div v-else class="field-tip">校内唯一，大小写不敏感；保存后统一转为大写</div>
       </el-form-item>
       <el-form-item label="课程名称" prop="courseName">
         <el-input v-model="baseForm.courseName" placeholder="1~100 字；同名课程允许（会提醒）" />
@@ -631,7 +630,6 @@ function close() {
       </el-form-item>
       <el-form-item label="学时" prop="hours">
         <el-input-number v-model="baseForm.hours" :min="1" :max="999" style="width: 140px" />
-        <div class="field-tip">必填；第 2 步的排课节奏按「学时 ÷ 2 = 节次」折算，不再重复填写</div>
       </el-form-item>
       <el-form-item label="课程类型">
         <el-select v-model="baseForm.courseType" placeholder="可空" clearable style="width: 200px">

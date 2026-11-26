@@ -191,11 +191,8 @@ async function submit() {
   >
     <el-form ref="formRef" :model="form" :rules="rules" label-width="92px" @submit.prevent>
       <el-form-item label="课程编号" prop="courseNo">
-        <el-input v-model="form.courseNo" placeholder="校内唯一，保存后统一转为大写" @blur="onNoBlur" />
+        <el-input v-model="form.courseNo" placeholder="如 KC000001" @blur="onNoBlur" />
         <div v-if="courseNoError" class="field-error">{{ courseNoError }}</div>
-        <div v-else class="field-tip">
-          改编号会二次确认；不影响已开课记录与课次
-        </div>
       </el-form-item>
       <el-form-item label="课程名称" prop="courseName">
         <el-input v-model="form.courseName" placeholder="1~100 字" />
