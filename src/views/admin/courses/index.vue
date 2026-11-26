@@ -1549,7 +1549,7 @@ onMounted(async () => {
               v-if="canRemove"
               text
               size="small"
-              style="color: var(--error)"
+              class="op-del"
               :loading="deleting === row.courseId"
               @click="doDelete(row)"
             >删除</el-button>
@@ -2063,9 +2063,34 @@ onMounted(async () => {
   background: var(--brand-50, #eff6ff);
 }
 /* 操作列两个文字按钮必须同排。列收窄后（1280 下要腾出排课列的位置）
-   默认 white-space:normal 会把「删除」挤到第二行，行高直接翻倍。 */
+   默认 white-space:normal 会把「删除」挤到第二行，行高直接翻倍。
+   2026-11-26 修：264px 里「查看 编辑 停用 删除」四个按钮（含 EP 相邻 12px 外边距）
+   串起来比可用宽度宽 14px，第 4 个「删除」被裁成一个「…」，看着像"更多"按钮却没有反应。
+   改成 flex + gap 排布、清掉相邻外边距、按钮内边距收到 7px，四个都完整显示；
+   同时给 hover 明确的浅底 + 品牌色反馈（原来 is-text 的默认 hover 底色几乎看不见）。 */
 :deep(.courses-op .cell) {
   white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+}
+:deep(.courses-op .cell .el-button) {
+  margin-left: 0;
+  padding: 4px 7px;
+  border-radius: 6px;
+  transition: background-color 0.16s ease, color 0.16s ease;
+}
+:deep(.courses-op .cell .el-button:hover) {
+  background: var(--brand-100, #dbeafe);
+  color: var(--brand-700, #1d4ed8);
+}
+:deep(.courses-op .cell .el-button.op-del) {
+  color: var(--error, #dc2626);
+}
+:deep(.courses-op .cell .el-button.op-del:hover) {
+  background: #fee2e2;
+  color: #b91c1c;
 }
 /* 主键列（课程名称）做成链接样式：蓝色 + 悬停下划线，表明"可以点进去"，
    不能只靠加粗——加粗在表格里更像"强调"而不是"可点击" */
