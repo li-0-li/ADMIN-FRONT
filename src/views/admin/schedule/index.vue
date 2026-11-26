@@ -152,7 +152,19 @@ const refreshing = ref(false);
 /** 读取失败标记：区分「接口挂了导致的空表」与「真的没课」。
  *  旧写法 catch 里只清数据，两种空在界面上长得一样，用户只能猜（2026-10-22 复盘缺陷 2）。 */
 const loadError = ref(false);
-const filters = reactive({ courseId: '', teacherId: '', clazzName: '', classroomId: '', major: '', termId: '', schoolId: '' });
+const filters = reactive({
+  courseId: '',
+  teacherId: '',
+  clazzName: '',
+  classroomId: '',
+  major: '',
+  termId: '',
+  schoolId: '',
+  /** 课程性质筛选（2026-11-26）：'' = 全部；'required' = 只看必修；'elective' = 只看选修。
+   *  值域与后端 `course.course_type` 归一后一致（选修类 elective/general 归「选修」，其余归「必修」，
+   *  与 `isElectiveCourse` 同一白名单，见其注释）。 */
+  courseNature: ''
+});
 /** 任一维度处于筛选中 ⇒ 工具栏出现「清空筛选」总入口 */
 const anyFilter = computed(() => Object.values(filters).some(v => v !== ''));
 
@@ -200,6 +212,7 @@ function clearFilters() {
   filters.major = '';
   filters.termId = '';
   filters.schoolId = '';
+  filters.courseNature = '';
   // 学期清空会经 watcher 再 load 一次；非空时这次 load 就是把服务端过滤撤掉的那一次
   void load();
 }
@@ -508,6 +521,19 @@ const majorOptions = computed(() => {
   return Array.from(m, ([value, label]) => ({ value, label }));
 });
 
+/**
+ * 课程性质归一（2026-11-26）：必修 / 选修，供工具栏「必修/选修」筛选使用。
+ *
+ * ★ 课次行（`ScheduleCell`）本身**不带** `course_type`，只能借课程池里的课程行反查
+ *   （`courseById` 由 `GET /admin/courses` 全量列表建立，含 `courseType`）。
+ * ★ 反查不到（课程已软删、旧包没下发该字段）时按**必修**归类 —— 与 `isElectiveCourse`
+ *   的严格口径同向：宁可把不明归属的课算进必修，也不让它借「选修」溜出必修筛选。
+ */
+function natureOfCourse(courseId?: string | null): 'required' | 'elective' {
+  const c = courseById.value.get(String(courseId ?? ''));
+  return isElectiveCourse(c?.courseType) ? 'elective' : 'required';
+}
+
 /* ---------- 筛选在前端做：一周课次量小，立刻生效且选项不会被自身筛空 ---------- */
 const filtered = computed(() =>
   allCells.value.filter(
@@ -516,7 +542,8 @@ const filtered = computed(() =>
       (!filters.teacherId || String(c.teacherId) === filters.teacherId) &&
       (!filters.clazzName || (c.clazzName ?? '') === filters.clazzName) &&
       (!filters.major || majorOf(c.clazzName) === filters.major) &&
-      (!filters.classroomId || String(c.classroomId) === filters.classroomId)
+      (!filters.classroomId || String(c.classroomId) === filters.classroomId) &&
+      (!filters.courseNature || natureOfCourse(c.courseId) === filters.courseNature)
   )
 );
 
@@ -1448,11 +1475,13 @@ function buildPoolEntries(): PoolEntry[] {
  */
 const poolEntries = computed<PoolEntry[]>(() => {
   const all = buildPoolEntries();
-  const { courseId, teacherId, major, clazzName } = filters;
-  if (!courseId && !teacherId && !major && !clazzName) return all;
+  const { courseId, teacherId, major, clazzName, courseNature } = filters;
+  if (!courseId && !teacherId && !major && !clazzName && !courseNature) return all;
   return all.filter(c => {
     if (courseId && String(c.courseId) !== courseId) return false;
     if (teacherId && String(c.teacherId) !== teacherId) return false;
+    // 课程性质（2026-11-26）：池条目自带 courseType，直接判，不用像课表那样反查 courseById
+    if (courseNature && (isElectiveCourse(c.courseType) ? 'elective' : 'required') !== courseNature) return false;
     // 专业为空的课程在「按专业筛」时按排除处理：宁可少排，不把不明归属的课塞进某个专业批次
     if (major && String(c.major ?? '') !== major) return false;
     // 班级：只有**明确登记了别的班**才排除；一条都没登记（未知）的留给 poolClazzUnknown 报数
@@ -4716,8 +4745,6 @@ interface AutoReport {
   skipCount: number;
 }
 const autoReport = ref<AutoReport | null>(null);
-/** 本次自动排课统一写入的班级（放回签优先用各自原课次的班级） */
-const autoClass = ref('');
 /**
  * 是否连「课程已在课表」的签也重排（默认关，2026-10-30 P0-A）。
  * 关 = 护栏生效：inSchedule 的签是放回留下的软删行，课程其实还在课表上，
@@ -4733,9 +4760,15 @@ const autoIncludeScheduled = ref(false);
  *   而它们排出来必然是 Skip(week=0)，只会把报告刷满「未配置」。
  *   ★ partial（只配了一部分）同样不收：业主口径是「只有全部配置完成才进已配置」，
  *     半配的课放进去排，只会排出一半课次再报一堆「跳过」，不如先补配置。
+ * ★ 2026-11-26 业主口径「优先排必修课」：这里按**必修在前、选修在后**排序。
+ *   后端是一门一门排的（runAuto 按本数组顺序逐条调 auto-arrange），而时段与教室先到先得
+ *   ⇒ 必修先排才拿得到白天好时段；选修后排，晚课只作兜底（必修硬禁晚课，见后端 isEveningPeriod）。
+ *   `Array.sort` 稳定，同性质内保持池子原有顺序。
  */
 const autoEntries = computed(() =>
-  poolEntries.value.filter(e => (autoIncludeScheduled.value || !e.inSchedule) && isCfgReady(e.cfg))
+  poolEntries.value
+    .filter(e => (autoIncludeScheduled.value || !e.inSchedule) && isCfgReady(e.cfg))
+    .sort((a, b) => (isElectiveCourse(a.courseType) ? 1 : 0) - (isElectiveCourse(b.courseType) ? 1 : 0))
 );
 /** 被护栏挡下的签数（设置视图上说明，不静默吞） */
 const autoSkippedInSchedule = computed(() =>
@@ -4855,9 +4888,8 @@ function openAuto() {
   }
   autoReport.value = null;
   autoProgress.value = '';
-  // 默认写入班级跟随外层「班级」筛选（2026-11-03）：班级筛选已经能精确筛掉"知道班级"的放回签，
-  // 但整门没排过的课筛不了，所以它同时还是「排给哪个班」的答案——筛了「计科2301」就默认排进这个班。
-  autoClass.value = filters.clazzName || '';
+  // 班级不再在弹窗里选（2026-11-26 业主需求）：池子已按教学班拆卡，每张卡自带自己的班级，
+  // 写入班级一律取卡片所属教学班的 target_classes（放回签优先沿用原课次班级）。
   autoVisible.value = true;
 }
 
@@ -4865,11 +4897,9 @@ function openAuto() {
  * 弹窗内一键清掉外层筛选（2026-11-03）。
  * ★ 为什么需要：外层筛了某门课/某位老师后，候选课可能只剩 1~2 条，用户在弹窗里看到的是
  *   「就这么点课」，不知道自己正漏排。给一个就地的出口，比让他关弹窗、找工具栏、再重开省事。
- * ★ 清五个：课程 / 教师 / 专业 / 班级（这三+班级 会筛掉候选）+ 教室（会锁死落点）。
+ * ★ 清六个：课程性质 / 课程 / 教师 / 专业 / 班级（这些都筛候选）+ 教室（会锁死落点）。
  *   学期不清——它决定「已排」判定范围，清掉等于换视界，与「把课放回来」不是一回事。
  *   清完池子变大，勾选态必须重置为全选。
- * ★ `autoClass`（默认班级）**故意不清**：它已经显示在界面上了，用户看得见也能自己改；
- *   跟着筛选一起消失反而会让人以为"排出来不用写班级了"。
  */
 function clearFiltersForAuto() {
   filters.courseId = '';
@@ -4877,14 +4907,9 @@ function clearFiltersForAuto() {
   filters.major = '';
   filters.clazzName = '';
   filters.classroomId = '';
+  filters.courseNature = '';
   resetPoolPick();
 }
-
-/**
- * 每条签单独指定的班级（2026-11-02）：一个老师常带多个班的课，同一批待排里往往混着不同班级，
- * 用弹窗的「默认班级」一刀切会把班级归属写错。会话级状态，key = PoolEntry.key（签刷新后仍在）。
- */
-const poolClazz = reactive<Record<string, string>>({});
 
 /**
  * 这张签**自带的**班级（= 它源自的那条放回课次的班级）。
@@ -4955,20 +4980,21 @@ function poolSubLabel(entry: PoolEntry): string {
 }
 
 /**
- * 这张签实际写入的班级，优先级：签上显式指定 > 放回签的原课次班级 > 该教学班登记的班级 > 弹窗的默认班级。
- * 三处都要读到同一套口径（硬约束 clazzBusy、同班分天、写入的 targetClass），否则会出现
- * 「按 A 班排、写成 B 班」这种对不上的情况。
- * ★ 2026-11-23：拆卡后每张卡已带上自己那条配置的班级（`targetClasses`），必须排在「弹窗默认班级」之前，
- *   否则两张卡会被同一个默认班级覆盖。
+ * 这张签实际写入的班级，优先级：放回签的原课次班级 > 该教学班登记的班级。
+ *
+ * ★ 2026-11-26 业主需求「自动排课里面选班级去掉」：弹窗里的「默认班级」下拉与逐条班级下拉已移除，
+ *   班级**只**来自数据本身 —— 池子已按教学班拆卡（2026-11-23），每张卡的 `targetClasses`
+ *   就是它自己那条 `course_offering` 的面向班级，不需要也不该再让人手选一遍。
+ * ★ 两处都要读到同一套口径（硬约束 clazzBusy、同班分天、写入的 targetClass），否则会出现
+ *   「按 A 班排、写成 B 班」这种对不上的情况。
+ * ★ 都取不到时返回空串（选修课可不配班级）⇒ 课次按「无班级」落库，与配置口径一致，
+ *   不再有「兜底默认班级」可以掩盖配置缺失。
  */
 function entryClass(entry: PoolEntry) {
-  const explicit = (poolClazz[entry.key] ?? '').trim();
-  if (explicit) return explicit;
   const own = sourceClazzOf(entry);
   if (own) return own;
   const declared = (entry.targetClasses ?? []).map(x => String(x ?? '').trim()).filter(x => !isNoClazzName(x));
-  if (declared.length) return declared[0];
-  return autoClass.value.trim();
+  return declared.length ? declared[0] : '';
 }
 
 /**
@@ -5037,20 +5063,6 @@ const autoLockRoom = computed(() =>
 );
 
 
-/**
- * 班级缺口预检（2026-11-02）：课程接口不出班级字段，放回签没原班级时也落空 ——
- * 这两类签在弹窗里不选「班级」就会排成空班级课次（班级视角恒显示「未填班级」，
- * 而且同学时段的班级冲突根本不会判，因为 clazzBusy 里没有这个班）。
- * 原来只在「写完之后」的逐条报告里写「未填班级」，等于排错了才知道；现在开跑前就报数。
- */
-const autoClassGap = computed(() => {
-  if (!autoVisible.value) return null;
-  const entries = autoSelected.value;
-  if (!entries.length) return null;
-  const miss = entries.filter(e => !entryClass(e).trim());
-  return miss.length ? { total: entries.length, miss } : null;
-});
-
 /** 本学期自动排课会写入的日期范围（设置视图明示，避免「排了但没覆盖整学期」这种事后才发现的问题） */
 const autoTermRangeLabel = computed(() => {
   const anchor = termAnchorMonday.value;
@@ -5066,8 +5078,8 @@ const autoTermRangeLabel = computed(() => {
  *   「课程混乱」的根因；且后端才握有教师资格闸门（capability）与学期锚点的唯一真值。
  * ★ 逐门调用 courseId 口径（后端幂等：已有课次的周自动跳过），因此「放回签」也走同一入口——
  *   后端只补缺失的周，不会重复排课。
- * ★ 班级：逐条指定的班级 > 放回签原班级 > 弹窗默认班级；教室锁定沿用外层「教室」筛选
- *   （后端 preferredClassroomId）。口径固定每周（不传 weekParity，接口层默认 'all'）。
+ * ★ 班级（2026-11-26 起弹窗不再提供选择）：只取卡片所属教学班的班级（放回签优先沿用原课次班级）；
+ *   教室锁定沿用外层「教室」筛选（后端 preferredClassroomId）。口径固定每周（不传 weekParity，接口层默认 'all'）。
  */
 async function runAuto() {
   if (autoRunning.value) return;
@@ -5096,7 +5108,7 @@ async function runAuto() {
           ...(e.offeringId ? { offeringId: e.offeringId } : { courseId: e.courseId }),
           // 多个教学班时不能传 targetClass：后端会用它覆盖**每一条** offering 自己的班级，
           // 两个老师会被排进同一个班。要改班级请到课程详情「编辑教学班」。
-          targetClass: multiOffering(e) ? undefined : entryClass(e).trim() || autoClass.value || undefined,
+          targetClass: multiOffering(e) ? undefined : entryClass(e).trim() || undefined,
           preferredClassroomId: autoLockRoomId.value || undefined,
           // 逐节单双周（2026-11-19）：按「参与排课」里逐课设置传；全每周也要传，
           // 这样把某门课从「隔周」改回「每周」后重排，后端才会覆盖掉上次存的方案。
@@ -5681,6 +5693,19 @@ watch(
       <!-- 筛选下拉：filterable = 输入关键字搜索选项；clearable = 一键清空该维度 -->
       <el-select v-model="filters.major" class="f-select" placeholder="全部专业" clearable filterable>
         <el-option v-for="o in majorOptions" :key="o.value" :label="o.label" :value="o.value" />
+      </el-select>
+      <!-- 课程性质（2026-11-26 业主需求：「课表增加筛选：必修与选修」）：只分两类，
+           选修类（elective / general）归「选修」，其余（required/core/public/practice/空值）归「必修」。
+           与其它维度一样同时作用于课表与待排池，保证「看得到的课」和「能排的课」是同一批。 -->
+      <el-select
+        v-model="filters.courseNature"
+        class="f-select"
+        placeholder="必修/选修"
+        clearable
+        title="只看必修课或只看选修课"
+      >
+        <el-option label="必修课" value="required" />
+        <el-option label="选修课" value="elective" />
       </el-select>
       <el-select v-model="filters.courseId" class="f-select" placeholder="全部课程" clearable filterable>
         <el-option v-for="o in courseOptions" :key="o.value" :label="o.label" :value="o.value" />
@@ -6943,6 +6968,11 @@ watch(
         逐门交给后端统一排课引擎铺满本学期：教师时间冲突、教室占用、授课资格都在后端校验；
         已有课次的周自动跳过（重复执行不产生重复课）。排不上的周会在结果里列出原因。
       </p>
+      <!-- 时段偏好（2026-11-26 业主口径）：必修禁晚课是硬约束、其余是尽量，必须写在开跑之前 -->
+      <p class="small muted" style="margin: 0 0 2px; line-height: 1.75">
+        <b>必修课先排、且不排晚课（9-10 节）</b>；选修课尽量排白天，白天占满时才用晚课兜底。
+        同一门课尽量不排到连续两天的同一节（只是尽量，排不下时会让步）。
+      </p>
       <!-- 外层筛选对候选课的作用（2026-11-03 业主需求：被筛选排除的课不参与自动排课）。
            必须显式报数：筛了某门课/某位老师后候选只剩 1~2 条，不提示会以为要排的课本来就这么少，
            排完就当排完了。这里同时给一个就地清筛选的出口。
@@ -7011,26 +7041,8 @@ watch(
           再保存节奏（总学时 / 每周节次 / 起始周）。
         </div>
       </div>
-      <!-- 班级缺口（2026-11-02）：课程不带班级、放回签也没原班级时，不选班级就会排成空班级课次 -->
-      <div v-if="autoClassGap" class="detail-row">
-        <span class="detail-k">预警</span>
-        <div class="small" style="flex: 1; min-width: 0; color: var(--warning, #b45309)">
-          这 {{ autoClassGap.total }} 条里 <b>{{ autoClassGap.miss.length }}</b> 条没带班级（课程本身不带班级，放回签也可能没有）。
-          在下面选一个默认班级，或逐条指定；都没填的会排成空班级——课表按班级查不到，同学时段的班级冲突也不会判。
-        </div>
-      </div>
-      <!-- 班级（2026-10-22 丙）：课程接口不出班级字段，不选就排成"未填班级"的课次（按班级筛选看不到） -->
-      <div class="detail-row">
-        <span class="detail-k">默认班级</span>
-        <div style="flex: 1; min-width: 0">
-          <el-select v-model="autoClass" placeholder="未逐条指定时用这个班（放回签仍沿用原班级）" clearable filterable style="width: 100%">
-            <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
-          </el-select>
-        </div>
-      </div>
-      <!-- 逐条参与 + 班级（2026-11-02）：勾选框决定这轮排不排这门课（业主需求），右侧下拉逐条指定班级
-           （一位老师常带多个班，用「默认班级」一刀切会把班级归属写错）。取消勾选的行置灰但保留班级值，
-           重新勾上即恢复，不用再填一遍。 -->
+      <!-- 逐条参与（2026-11-02）：勾选框决定这轮排不排这门课（业主需求）。
+           2026-11-26 起班级不再在这里选：每张卡就是一条教学班，班级跟着它自己的配置走。 -->
       <div v-if="autoEntries.length" class="detail-row pick-row">
         <span class="detail-k">参与排课</span>
         <div style="flex: 1; min-width: 0">
@@ -7094,17 +7106,6 @@ watch(
                 </div>
                 <div class="pat-tip">单周 = 第 1/3/5… 周，双周 = 第 2/4/6… 周（按学期起点算）</div>
               </el-popover>
-              <el-select
-                v-model="poolClazz[e.key]"
-                size="small"
-                clearable
-                filterable
-                placeholder="未指定"
-                :disabled="poolPick[e.key] === false"
-                style="width: 128px; flex: none"
-              >
-                <el-option v-for="n in clazzNameList" :key="n" :label="n" :value="n" />
-              </el-select>
             </div>
           </div>
         </div>
