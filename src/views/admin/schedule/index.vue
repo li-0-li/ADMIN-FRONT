@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import ZkIcon from '@/components/ZkIcon.vue';
@@ -2113,6 +2113,71 @@ function onDragEnd() {
   draggingCell.value = null;
   dragOverKey.value = '';
   poolDragOver.value = false;
+  stopDragAutoScroll();
+}
+
+/* ---------- 拖到视野边缘自动滚动（2026-11-26 业主反馈） ----------
+ * 现象：把待排课往下拖到窗口底部，页面不跟着走，下面几节看不见也放不进去，
+ *       只能先松手、滚页、再重新拖一次。
+ * 原因：Chrome 对 HTML5 `draggable` 的拖拽**不会**自动滚动文档（那是拖动选中文字的行为）。
+ * 做法：自己开一个 rAF 循环，读最后一次 dragover 的指针位置，靠近窗口上下边缘就滚；
+ *       指针底下如果是个内部可滚容器（展开的待排池、按班排课弹窗里的列表）就滚它，
+ *       否则滚窗口。只在拖拽进行中跑，松手/放下立即停。
+ * 速度：越贴边越快，最贴边每帧 18px（60fps 下约 1k px/秒）——实测 24px 会一下冲过要放的那一行。
+ */
+const DRAG_SCROLL_EDGE = 120;
+const DRAG_SCROLL_MAX_STEP = 18;
+let dragScrollRAF = 0;
+let dragPointerX = 0;
+let dragPointerY = 0;
+
+/** 指针下方最近的可滚动祖先；没有（页面整体滚动）就返回 null */
+function scrollableUnderPointer(x: number, y: number): HTMLElement | null {
+  let el = document.elementFromPoint(x, y) as HTMLElement | null;
+  while (el && el !== document.body && el !== document.documentElement) {
+    const oy = getComputedStyle(el).overflowY;
+    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight - el.clientHeight > 2) return el;
+    el = el.parentElement;
+  }
+  return null;
+}
+
+function dragAutoScrollStep() {
+  dragScrollRAF = 0;
+  if (!draggingCourse.value && !draggingCell.value) return;
+  const h = window.innerHeight;
+  const y = dragPointerY;
+  let dy = 0;
+  if (y < DRAG_SCROLL_EDGE) dy = -Math.ceil(((DRAG_SCROLL_EDGE - y) / DRAG_SCROLL_EDGE) * DRAG_SCROLL_MAX_STEP);
+  else if (y > h - DRAG_SCROLL_EDGE) dy = Math.ceil(((y - (h - DRAG_SCROLL_EDGE)) / DRAG_SCROLL_EDGE) * DRAG_SCROLL_MAX_STEP);
+  if (dy) {
+    const box = scrollableUnderPointer(dragPointerX, y);
+    if (box) box.scrollTop += dy;
+    else window.scrollBy(0, dy);
+  }
+  // 即使这一帧没滚也继续排：指针停在边缘不动时 HTML5 拖拽不再持续发 dragover，
+  // 靠 dragover 唤醒会让滚动「滚一下就停」。
+  dragScrollRAF = requestAnimationFrame(dragAutoScrollStep);
+}
+
+function stopDragAutoScroll() {
+  if (dragScrollRAF) cancelAnimationFrame(dragScrollRAF);
+  dragScrollRAF = 0;
+}
+
+/**
+ * 捕获阶段监听 document 的 dragover：模板里课次卡片上有 `@dragover.stop`
+ * （防冒泡到格子），冒泡阶段会漏掉这些位置，捕获阶段才能一直拿到指针坐标。
+ */
+function onDocDragOver(e: DragEvent) {
+  if (!draggingCourse.value && !draggingCell.value) return;
+  dragPointerX = e.clientX;
+  dragPointerY = e.clientY;
+  if (!dragScrollRAF) dragScrollRAF = requestAnimationFrame(dragAutoScrollStep);
+}
+
+function onDocDragFinish() {
+  stopDragAutoScroll();
 }
 /* ---------- 拖回待排池（C-22 的拖拽入口）：把已有课次拖到「待排课程」卡片上松手 ---------- */
 const poolDragOver = ref(false);
@@ -3522,9 +3587,12 @@ async function submitConfigOnly() {
 const capTeacherIds = ref<Set<string> | null>(null);
 const capTeacherLoading = ref(false);
 const showAllTeachers = ref(false);
+/** 由「该课程唯一有资格教师」自动带出的那个 id（仅用于在下拉下方说明来由，不参与保存逻辑） */
+const capAutoTeacherId = ref('');
 let capTeacherSeq = 0;
 async function loadCapabilityTeachers(courseId: string) {
   const my = ++capTeacherSeq;
+  capAutoTeacherId.value = '';
   if (!courseId) {
     capTeacherIds.value = null;
     return;
@@ -3535,6 +3603,18 @@ async function loadCapabilityTeachers(courseId: string) {
     if (my !== capTeacherSeq) return;
     const list = rows ?? [];
     capTeacherIds.value = list.length ? new Set(list.map(r => String(r.teacherId))) : null;
+    // 唯一有资格的教师 ⇒ 直接带出（2026-11-26 业主反馈「未配置的课点进去怎么还要选教师」）。
+    // 这门课只有一个人能上，再让用户点开下拉、从一行里挑同一个人，纯属多一次操作；
+    // 有多位候选时仍然留空——那才是真的需要人来定。
+    // 只填「下拉里确实存在的人」：教师列表还没拉到、或该 id 不是 teacher 角色时不要填，
+    // 否则 el-select 会把裸 ID 显示出来（见 addMissingOfferingTeachers 的注释）。
+    if (capTeacherIds.value?.size === 1 && !form.teacherId) {
+      const only = [...capTeacherIds.value][0];
+      if (teacherList.value.some(t => String(t.value) === only)) {
+        form.teacherId = only;
+        capAutoTeacherId.value = only;
+      }
+    }
   } catch {
     if (my !== capTeacherSeq) return;
     capTeacherIds.value = null;
@@ -5383,12 +5463,23 @@ function exportCsv(mode: 'week' | 'teacher' | 'classroom' = 'week') {
 }
 
 onMounted(async () => {
+  // 拖拽自动滚动只挂一次全局监听（捕获阶段，见 onDocDragOver）
+  document.addEventListener('dragover', onDocDragOver, true);
+  document.addEventListener('drop', onDocDragFinish, true);
+  document.addEventListener('dragend', onDocDragFinish, true);
   // 节次配置不进 await 链：兜底初值已让表格行结构成立，接口晚到只晚一帧重渲染，
   // 没必要让它拖慢课表与下拉的首屏
   void loadPeriods();
   await Promise.all([load(), loadPickers()]);
   // 撤销栈恢复放在数据加载之后：判定「同一学期」依赖 currentTermId 已就绪（2026-10-30 E 项）
   restoreUndo();
+});
+
+onUnmounted(() => {
+  stopDragAutoScroll();
+  document.removeEventListener('dragover', onDocDragOver, true);
+  document.removeEventListener('drop', onDocDragFinish, true);
+  document.removeEventListener('dragend', onDocDragFinish, true);
 });
 
 /** 学期切换（服务端过滤）⇒ 重查本周课次 */
@@ -6488,7 +6579,10 @@ watch(
           <el-option v-for="t in createTeacherOptions" :key="t.value" :label="t.label" :value="t.value" />
         </el-select>
         <div class="small muted" style="width: 100%">
-          <template v-if="form.courseId && autoTeacherId && form.teacherId === autoTeacherId">
+          <template v-if="capAutoTeacherId && form.teacherId === capAutoTeacherId">
+            该课程只有 1 位有授课资格的教师，已自动带出；如需更换请勾选下方「显示全部教师」
+          </template>
+          <template v-else-if="form.courseId && autoTeacherId && form.teacherId === autoTeacherId">
             已按课程带出授课教师，可改选其他教师
           </template>
           <template v-else-if="!teacherList.length">
