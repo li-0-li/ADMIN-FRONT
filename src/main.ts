@@ -14,12 +14,18 @@ import '@/styles/ep-bridge.scss';
 
 import App from './App.vue';
 import router from './router';
+import ZkDialog from '@/components/ZkDialog';
 
 const app = createApp(App);
 
 app.use(createPinia());
 app.use(router);
 app.use(ElementPlus, { locale: zhCn });
+
+// 覆盖 EP 全局注册的 ElDialog，补「关闭后拖拽复位」。
+// ★ 必须放在 app.use(ElementPlus) 之后，否则会被 install 时注册的原组件盖掉。
+//   模板里的 <el-dialog> 会解析到全局 ElDialog，因此全站弹窗自动生效，新增弹窗无需再加任何属性。
+app.component('ElDialog', ZkDialog);
 
 for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
   app.component(key, component as never);

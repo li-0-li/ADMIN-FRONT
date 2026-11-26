@@ -92,6 +92,54 @@
   border-bottom: 1px solid var(--border);
 }
 
+/* ------------------------------------------------------------------
+   弹窗拖拽热区：固定为「顶部整条标题栏」（2026-11-26）
+
+   问题：EP 的 .el-dialog 自己带 20px 内边距，而拖拽只认 .el-dialog__header。
+   于是弹窗最上面那 20px、以及最右 20px 是死区 —— 鼠标放上去没反应，
+   用户在弹窗顶部随便一按，感觉「有时能拖、有时拖不动」，热区飘忽。
+
+   做法：header 用负 margin 向上/左右各吃掉 20px 内边距，再自己补回来，
+   标题位置与 body 起始位置都不变，但热区变成「从弹窗顶边到分隔线、左右到边」。
+   分隔线原来是 header 的 border-bottom（只在内边距里侧），改用伪元素画回原来的
+   缩进长度，视觉零变化。
+   ------------------------------------------------------------------ */
+.el-dialog.is-draggable .el-dialog__header {
+  position: relative;
+  margin: calc(-1 * var(--el-dialog-padding-primary, 20px))
+    calc(-1 * var(--el-dialog-padding-primary, 20px)) 0;
+  padding: var(--el-dialog-padding-primary, 20px) var(--el-dialog-padding-primary, 20px) 16px;
+  border-bottom: 0;
+  cursor: move;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.el-dialog.is-draggable .el-dialog__header::after {
+  content: '';
+  position: absolute;
+  left: var(--el-dialog-padding-primary, 20px);
+  right: var(--el-dialog-padding-primary, 20px);
+  bottom: 0;
+  height: 1px;
+  background: var(--border);
+}
+
+/* 给右上关闭按钮让位：按钮 48×48，标题最多用到 padding+36 处 */
+.el-dialog.is-draggable .el-dialog__header.show-close {
+  padding-right: calc(var(--el-dialog-padding-primary, 20px) + 36px);
+}
+
+.el-dialog.is-draggable .el-dialog__header:active {
+  cursor: grabbing;
+}
+
+/* 关闭按钮仍是「可点」：手型光标；mousedown 已在 ZkDialog 里拦掉，不会连带拖动 */
+.el-dialog.is-draggable .el-dialog__headerbtn,
+.el-dialog.is-draggable .el-dialog__headerbtn * {
+  cursor: pointer;
+}
+
 .el-dialog__title {
   font-size: 16px;
   font-weight: 700;
