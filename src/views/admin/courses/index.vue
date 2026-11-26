@@ -1136,6 +1136,10 @@ const detailClassHint = computed(() => {
   const list = detailData.value?.offerings ?? [];
   if (!list.length) return '';
   const counts = list.map((o) => Number(o.studentCount ?? 0));
+  // ★ 2026-11-26：offering.student_count 是冗余列，靠建课/改班级/加退课时回写。
+  //   回写没发生（旧包，见 AdminOfferingServiceImpl 的 syncOfferingStudentCounts）时它是 0，
+  //   直接拼成「每班 0 人」会与上面的课程级人数（如 85）当场矛盾。此时只报条数，不编数字。
+  if (counts.every((c) => c <= 0)) return `${list.length} 个教学班（各教学班人数未同步）`;
   const same = counts.every((c) => c === counts[0]);
   return same ? `${list.length} 个教学班 · 每班 ${counts[0]} 人` : `${list.length} 个教学班（各教学班人数见下方）`;
 });
@@ -1795,7 +1799,10 @@ onMounted(async () => {
                   <template v-else-if="o.classKey"> · {{ o.classKey }}</template>
                 </div>
                 <div class="small muted">
-                  加课码 <b>{{ o.joinCode }}</b> · 学生 {{ o.studentCount ?? 0 }} 人 · 课次 {{ o.scheduleCount ?? 0 }} 节
+                  加课码 <b>{{ o.joinCode }}</b> ·
+                  <!-- 0 不等于「没人」：冗余列未回写时一律写「未同步」，别让它看起来像空课堂 -->
+                  {{ Number(o.studentCount ?? 0) > 0 ? `学生 ${o.studentCount} 人` : '学生数未同步' }} ·
+                  课次 {{ o.scheduleCount ?? 0 }} 节
                   <template v-if="o.weekCount"> · {{ o.weekCount }} 教学周</template>
                 </div>
                 <!-- 批次7 排课配置（录音：排课前先选好 总课时/一周几节/第几周到第几周）
