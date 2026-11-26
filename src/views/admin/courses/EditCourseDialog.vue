@@ -6,6 +6,7 @@ import {
   updateCourse
 } from '@/api/admin/courses';
 import type { CourseCreateBo } from '@/api/admin/courses';
+import ZkIcon from '@/components/ZkIcon.vue';
 
 /**
  * 编辑课程基础信息（T01-3 · 2026-11-18）
@@ -42,6 +43,9 @@ const emit = defineEmits<{
   (e: 'update:visible', v: boolean): void;
   /** 保存成功后触发（父页面刷新列表与抽屉） */
   (e: 'saved'): void;
+  /** 转去配置教学班（教师 / 班级 / 周次 / 每周节次）：基础信息存完就地给出下一步入口，
+   *  2026-11-26 业主「编辑里面也能配置」。父页面负责关掉本弹窗再打开配置。 */
+  (e: 'config'): void;
 }>();
 
 const visible = computed({
@@ -70,6 +74,8 @@ const form = reactive<CourseCreateBo>({
 });
 /** 打开时的原始编号：判断「编号是否被改动」用 */
 const originNo = ref('');
+/** 打开时的表单快照：判断「有没有未保存的改动」（去配置教学班前提醒用） */
+const initialSnapshot = ref('');
 const saving = ref(false);
 const noChecking = ref(false);
 /** 编号预检失败红字（40901 / 格式）；空串 = 无错误。失败保输入 */
@@ -89,8 +95,27 @@ watch(
     form.courseType = props.course.courseType ?? '';
     form.description = props.course.description ?? '';
     courseNoError.value = '';
+    // 快照用于「去配置教学班」前的未保存提醒（跳走会关本弹窗，输入会丢）
+    initialSnapshot.value = JSON.stringify(form);
   }
 );
+
+/* 打开配置教学班（2026-11-26）：编辑和配置是两件事，但放在同一处才好找。
+ * 基础信息还没保存就跳走会丢输入，所以先确认一句；已保存/没改动就直接跳。 */
+async function goConfig() {
+  if (JSON.stringify(form) !== initialSnapshot.value) {
+    try {
+      await ElMessageBox.confirm(
+        '基础信息还没保存，先去配置教学班？本弹窗里未保存的修改会丢失。',
+        '尚未保存',
+        { type: 'warning', confirmButtonText: '去配置', cancelButtonText: '留在这里' }
+      );
+    } catch {
+      return;
+    }
+  }
+  emit('config');
+}
 
 const rules = {
   courseNo: [
@@ -215,7 +240,12 @@ async function submit() {
         <el-input v-model="form.description" type="textarea" :rows="3" placeholder="可空" />
       </el-form-item>
       <el-form-item label="开课信息">
-        <span class="field-tip">学期 / 教师 / 班级 / 排课节奏属「课程配置」，在详情抽屉的开课记录区块里改</span>
+        <div>
+          <div class="field-tip">学期 / 教师 / 班级 / 排课节奏属「课程配置」，不在本弹窗内</div>
+          <el-button size="small" plain style="margin-top: 6px" @click="goConfig">
+            <ZkIcon name="settings" :size="13" style="margin-right: 4px" />去配置教学班
+          </el-button>
+        </div>
       </el-form-item>
     </el-form>
     <template #footer>

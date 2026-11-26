@@ -66,6 +66,35 @@ function openOfferFor(course: { courseId: string; courseName: string; hours?: nu
   dialogVisible.value = true;
 }
 
+/* 操作列「配置」（2026-11-26 业主：编辑与配置两个入口要挨在一起）：
+ * 「编辑」改的是课程基础信息（编号/名称/学分/学时…），「配置」管的是谁教、教哪些班、几周几节，
+ * 两件事分在两个列位置（操作列 vs 配置徽标列）确实容易找错。现在操作列并列出现。
+ *
+ * 落点按配置进度分三种，统一「点一次就到表单」：
+ * - 没有任何教学班 → 直接开建课向导第 2 步（选学期/教师/班级/节奏），不用先进抽屉；
+ * - 只有 1 条教学班 → 打开抽屉并就地展开该条的教学班设置（教师班级节奏同一块），
+ *   省掉「查看 → 找到那一行 → 编辑教学班」两步；
+ * - 多条 → 只打开抽屉（多条时替业主选哪条是猜，列表也不知道他要改哪个班）。
+ * 无 admin:offerings:add 权限时退化为打开详情，不给死按钮。
+ */
+async function openConfigFor(row: AdminCourseVo) {
+  if (!canOffer.value) {
+    void openDetail(row);
+    return;
+  }
+  // 列表行带 offeringCount；抽屉详情 VO 没有这个字段（见 openEdit 的注释），两种入参都要能用
+  const count = row.offeringCount === null || row.offeringCount === undefined ? null : Number(row.offeringCount);
+  if (count === 0) {
+    // 一条教学班都没有：直接进建课向导第 2 步，不必先开抽屉
+    openOfferFor(row);
+    return;
+  }
+  await openDetail(row);
+  const list = detailData.value?.offerings ?? [];
+  // 列表与详情不一致（别处刚删过）时抽屉本身就是「新增配置」空态，不重复弹向导
+  if (list.length === 1) void openSchedCfg(list[0]);
+}
+
 /** B-7 重新排课（2026-11-10）：对某条开课记录重跑 auto-arrange。失败不影响既有课次 */
 const rearrangingId = ref('');
 async function onRearrange(o: { offeringId: string; termCode?: string }) {
@@ -1189,6 +1218,16 @@ async function onEditSaved() {
   await onOfferingSaved();
 }
 
+/** 编辑弹窗里点「去配置教学班」：先关本弹窗，再走与列表「配置」按钮同一条路
+ *  （未配置 → 向导第 2 步；已配置且只有一条 → 抽屉里直接展开教学班设置）。
+ *  未保存提醒在弹窗内做，这里只负责衔接。 */
+function onEditGoConfig() {
+  const target = editTarget.value;
+  editVisible.value = false;
+  if (!target) return;
+  void openConfigFor(target as unknown as AdminCourseVo);
+}
+
 /* ---------------- 删除课程（C-23 · G5 定案语义，2026-11-06）----------------
  * 后端语义（AdminCourseServiceImpl.deleteCourse 重写后）：查开课记录数与课次数，
  * 任一 > 0 ⇒ 业务码 40904 拒绝（"该课程已有开课记录/课次，不可删除；如需下线请使用停用"）；
@@ -1473,7 +1512,7 @@ onMounted(async () => {
         <el-table-column
           v-if="columnVisible.offeringCount"
           label="配置"
-          width="90"
+          width="104"
           align="center"
           prop="offeringCount"
           :sortable="canServerSort ? 'custom' : false"
@@ -1483,7 +1522,25 @@ onMounted(async () => {
             <!-- 2026-11-16 业主：「除了班级可不选，教师这些是必选，选完才能进入已配置」。
                  offeringCount>0 只代表建过配置；缺教师/缺节奏/（必修缺班级）任一项都算未配置完。
                  旧包不下发 offeringIncomplete（undefined）⇒ 退回只看 offeringCount 的旧口径。 -->
-            <span v-else-if="row.offeringCount > 0 && !row.offeringIncomplete" class="badge badge-success">已配置</span>
+            <!-- 已配置（2026-11-26 业主：已配置外面要能一眼看见）：
+                 ① 视觉加重——实心绿底白字 + 勾选图标，跟旁边灰色的「未配置」形成明显对比；
+                 ② 本身可点，直接进教学班设置。改前已配置是纯静态徽标，想改配置只能先去「查看」，
+                    等于配置完成后入口反而消失了。 -->
+            <el-tooltip
+              v-else-if="row.offeringCount > 0 && !row.offeringIncomplete"
+              :content="canOffer ? '已配置，点此修改教学班（教师 / 班级 / 周次 / 每周节次）' : '已配置'"
+              placement="top"
+            >
+              <button
+                v-if="canOffer"
+                type="button"
+                class="badge badge-config-done"
+                @click.stop="openConfigFor(row)"
+              >
+                <ZkIcon name="check" :size="11" />已配置
+              </button>
+              <span v-else class="badge badge-config-done is-static"><ZkIcon name="check" :size="11" />已配置</span>
+            </el-tooltip>
             <!-- 2026-11-16 业主：「未配置」本身就要能点进去配。
                  改前只能「查看」→ 抽屉里再点「新增配置」，两步且入口不显眼；
                  现在点徽标直接进配置表单（向导第 2 步），抽屉那条路保持不动。
@@ -1530,7 +1587,7 @@ onMounted(async () => {
         </el-table-column>
         <!-- 操作列冻结：规范要求"数据列无法一屏展示时操作列默认冻结"，
              否则窗口一窄就只剩半截「查看」（10-29 实测过 1280 下被裁） -->
-        <el-table-column label="操作" width="264" align="right" fixed="right" class-name="courses-op">
+        <el-table-column label="操作" width="316" align="right" fixed="right" class-name="courses-op">
           <template #default="{ row }">
             <el-button text size="small" @click="openDetail(row)">
               <ZkIcon name="eye" :size="14" style="margin-right: 3px" />查看
@@ -1538,6 +1595,16 @@ onMounted(async () => {
             <el-button v-if="canEdit" text size="small" @click="openEdit(row)">
               <ZkIcon name="pencil" :size="14" style="margin-right: 3px" />编辑
             </el-button>
+            <!-- 与「编辑」并列：基础信息归编辑，教师/班级/节奏归配置（2026-11-26 业主） -->
+            <el-tooltip
+              v-if="canOffer"
+              :content="Number(row.offeringCount) > 0 ? '配置教学班（教师 / 班级 / 周次 / 每周节次）' : '先配置学期 / 授课教师 / 上课班级'"
+              placement="top"
+            >
+              <el-button text size="small" @click="openConfigFor(row)">
+                <ZkIcon name="settings" :size="14" style="margin-right: 3px" />配置
+              </el-button>
+            </el-tooltip>
             <el-button
               v-if="canDisable"
               text
@@ -1939,7 +2006,7 @@ onMounted(async () => {
   <!-- 两步建课向导（T-01）：page-head「新建课程」从第 1 步进；
        抽屉「新增课程配置」带 startCourse 直接进第 2 步 -->
   <CreateCourseDialog v-model:visible="dialogVisible" :start-course="dialogCourse" @created="onOfferingSaved" />
-  <EditCourseDialog v-model:visible="editVisible" :course="editTarget" @saved="onEditSaved" />
+  <EditCourseDialog v-model:visible="editVisible" :course="editTarget" @saved="onEditSaved" @config="onEditGoConfig" />
 </template>
 
 <style scoped>
@@ -1967,6 +2034,46 @@ onMounted(async () => {
 }
 .badge-action:active {
   background: var(--brand-100, #dbe8ff);
+}
+
+/* 「已配置」（2026-11-26 业主：已配置外面要能高亮看见）：
+   改前是 badge-success 浅绿底 + 深绿字，在满屏灰标签里并不显眼，且不可点。
+   现在做成实心绿底白字 + 勾号，和隔壁灰色的「未配置」形成强对比；
+   有权限时整块可点（直接进教学班设置），hover 深一档表示可操作。
+   ★ 不要用 `button.x / span.x` 分状态：产物压缩会把元素类型前缀吃掉，
+     两条规则 specificity 拉平后「静态态」反压到可点按钮上（11-26 实测踩坑），
+     静态变体统一走 .is-static 修饰类。 */
+.badge-config-done {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  /* 3 个汉字 + 勾号在 104px 列里刚好卡满，不锁 nowrap 会被 flex 压成两行（实测「已配/置」） */
+  white-space: nowrap;
+  gap: 3px;
+  padding: 2px 9px 2px 7px;
+  border: 1px solid var(--success, #16a34a);
+  background: var(--success, #16a34a);
+  color: #fff;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.badge-config-done:hover,
+.badge-config-done:focus-visible {
+  background: var(--success-strong, #15803d);
+  border-color: var(--success-strong, #15803d);
+  box-shadow: 0 0 0 3px var(--success-soft, #dcfce7);
+  outline: none;
+}
+/* 无 admin:offerings:add 权限时的只读变体：同款外观，但不给手型、不响应 hover */
+.badge-config-done.is-static,
+.badge-config-done.is-static:hover,
+.badge-config-done.is-static:focus-visible {
+  background: var(--success, #16a34a);
+  border-color: var(--success, #16a34a);
+  box-shadow: none;
+  cursor: default;
 }
 
 /* 失败提示条与空态块：与账号页同款视觉（同类语义在不同页应长得一样） */
