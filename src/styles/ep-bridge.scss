@@ -99,16 +99,15 @@
    于是弹窗最上面那 20px、以及最右 20px 是死区 —— 鼠标放上去没反应，
    用户在弹窗顶部随便一按，感觉「有时能拖、有时拖不动」，热区飘忽。
 
-   做法：header 用负 margin 向上/左右各吃掉 20px 内边距，再自己补回来，
-   标题位置与 body 起始位置都不变，但热区变成「从弹窗顶边到分隔线、左右到边」。
-   分隔线原来是 header 的 border-bottom（只在内边距里侧），改用伪元素画回原来的
-   缩进长度，视觉零变化。
+   做法：只把 header 向上吃掉顶部那 20px（消除顶部死区），左右保持原来的缩进，
+   热区就严格等于标题栏那一条 —— 从弹窗顶边到分隔线、左右各留 20px 内边距。
+   标题位置与 body 起始位置都不变，分隔线改用伪元素画，视觉零变化。
    ------------------------------------------------------------------ */
 .el-dialog.is-draggable .el-dialog__header {
   position: relative;
-  margin: calc(-1 * var(--el-dialog-padding-primary, 20px))
-    calc(-1 * var(--el-dialog-padding-primary, 20px)) 0;
-  padding: var(--el-dialog-padding-primary, 20px) var(--el-dialog-padding-primary, 20px) 16px;
+  margin-right: 0;
+  margin-top: calc(-1 * var(--el-dialog-padding-primary, 20px));
+  padding: var(--el-dialog-padding-primary, 20px) 0 16px;
   border-bottom: 0;
   cursor: move;
   -webkit-user-select: none;
@@ -118,16 +117,11 @@
 .el-dialog.is-draggable .el-dialog__header::after {
   content: '';
   position: absolute;
-  left: var(--el-dialog-padding-primary, 20px);
-  right: var(--el-dialog-padding-primary, 20px);
+  left: 0;
+  right: 0;
   bottom: 0;
   height: 1px;
   background: var(--border);
-}
-
-/* 给右上关闭按钮让位：按钮 48×48，标题最多用到 padding+36 处 */
-.el-dialog.is-draggable .el-dialog__header.show-close {
-  padding-right: calc(var(--el-dialog-padding-primary, 20px) + 36px);
 }
 
 .el-dialog.is-draggable .el-dialog__header:active {
