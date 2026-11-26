@@ -1202,6 +1202,53 @@ interface PoolEntry extends CourseBrief {
   offeringCount?: number;
   /** 还没配排课设置的开课记录数（`AdminCourseVo.offeringUnconfigured`）：卡片角标「未配 1/2」的分子 */
   offeringUnconfigured?: number;
+  /**
+   * 这个教学班在**当前浏览这一周**应上几节（2026-11-26）。
+   *
+   * 用途：判「本周是否已排满」。排满的课不再挂在「待排课程」栏里——业主反馈
+   * 「排过的课为什么还在已配置课程里面」，那栏应当只剩还有节次要排的课。
+   * 口径按逐节单双周（`weekPatterns`）算：本周是双周时，配了 `all,odd` 的课
+   * 本周只上 1 节，排了 1 节就该算满，不能拿 `lessonsPerWeek=2` 当门槛。
+   * `undefined` = 节奏/周号判不出来（旧包、学期没配起点）⇒ 不据此剔除，宁多列不藏课。
+   */
+  weekTarget?: number;
+}
+
+/**
+ * 当前浏览的是**学期第几周**（1 起；0 = 判不出来，例如学期没配起点）。
+ * 与页头「第 N 周」标注同口径（见 `weekNoLabel`），抽出来供待排池判「本周是否已排满」。
+ */
+const browsedWeekNo = computed(() => {
+  const info = termInfoOf(filters.termId || currentTermId.value);
+  const anchor = termAnchorOf(info);
+  if (!anchor) return 0;
+  const weeks = Math.floor((weekStart.value.getTime() - anchor.getTime()) / (7 * 86400000)) + 1;
+  return weeks >= 1 && weeks <= 30 ? weeks : 0;
+});
+
+/**
+ * 某教学班在「第 weekNo 周」应上几节（2026-11-26）。
+ *
+ * `week_patterns` 是**逐节**存的（第 i 项 = 每周第 i 节，all/odd/even），项数不足时按 `all`
+ * 补足——与后端「没写就是每周」的缺省一致。所以配了 `all,odd`、`lessonsPerWeek=2` 的课，
+ * 单周 2 节、双周 1 节，本周排满的门槛要跟着变，不能一律按 2 节卡。
+ *
+ * 周号或节奏拿不到时退回 `lessonsPerWeek` 上限：此刻判不出「满没满」，
+ * 宁可让卡片继续留在待排栏，也不要把还有节次要排的课藏起来（业主最忌讳「课不见了」）。
+ */
+function weekSlotsOf(o: OfferingBrief | undefined, weekNo: number): number | undefined {
+  const lpw = Math.round(Number(o?.lessonsPerWeek ?? 0));
+  if (!Number.isFinite(lpw) || lpw <= 0) return undefined;
+  const raw = String(o?.weekPatterns ?? '').trim();
+  if (!raw || !weekNo) return lpw;
+  const pats = raw.split(',').map(s => s.trim().toLowerCase());
+  const odd = weekNo % 2 === 1;
+  let n = 0;
+  for (let i = 0; i < lpw; i++) {
+    const p = pats[i] || 'all';
+    if (p === 'all' || (p === 'odd' && odd) || (p === 'even' && !odd)) n += 1;
+  }
+  return n;
 }
 
 /**
@@ -1284,6 +1331,8 @@ function buildPoolEntries(): PoolEntry[] {
           //   会让没排过的那个班也挂上「已在课表」，看起来像两个班都排好了。
           inSchedule: seat > 0,
           weekPlaced: seat,
+          // 本周应排几节（单双周口径）：与 weekPlaced 比出「是否已排满」，排满的移出待排栏
+          weekTarget: weekSlotsOf(o, browsedWeekNo.value),
           cfg: v.cfg,
           cfgGaps: v.gaps,
           missingRhythm: v.missingRhythm
@@ -1360,7 +1409,9 @@ function buildPoolEntries(): PoolEntry[] {
       //   **整条不进池**，于是「1~16 周每周都有课」的课在任何一周都看不到，像课程丢了。
       //   还能在池里看到的课，靠的其实是历史上「放回」留下的软删残影签（有签才走上面的分支），
       //   所以出现了「别的课都在、就这门没有」的错觉。
-      //   现在一律列出，已排的只做标记（weekPlaced）——池子既是待排来源，也是课程全量清单。
+      // ★ 2026-11-26：这里仍然**全量出卡**（含本周已排满的），是否展示交给 `isWeekFilled`
+      //   在 poolColumns 里判——池子全集还要供自动排课/筛选计数用，不能在这里就丢数据；
+      //   左栏只保留还没排满的，排满的由池子头报数。
       const seat = cells.length;
       const v = verdict(c);
       out.push({
@@ -1368,6 +1419,8 @@ function buildPoolEntries(): PoolEntry[] {
         key: `course-${c.courseId}`,
         inSchedule: seat > 0 || used.has(String(c.courseId)),
         weekPlaced: seat,
+        // 单教学班的课：节奏取它唯一那条配置（明细没拉到 ⇒ undefined，卡片继续留在待排栏）
+        weekTarget: weekSlotsOf(offs?.[0], browsedWeekNo.value),
         cfg: v.cfg,
         cfgGaps: v.gaps,
         missingRhythm: v.missingRhythm
@@ -1453,21 +1506,40 @@ const onlyClazzFiltering = computed(() =>
   !!filters.clazzName && !filters.courseId && !filters.teacherId && !filters.major
 );
 
-/* ---------- 待排池两栏（2026-11-16 业主口径）：已配置课程 / 未配置课程 ----------
+/* ---------- 待排池两栏：待排课程 / 未配置课程 ----------
  * 为什么分两栏：以前 20 多条签混在一行里，管理员看不出「哪些课排不进去是因为没配节奏」，
  * 每次自动排课都要先在弹窗里读一遍「N 条未配置」才知道；把配置状态搬到池子外面，
  * 一眼就能看出缺什么、该先去补哪门课的排课设置。
  * 分工（别混）：
- *   · 已配置栏 = **全部开课记录都配完**的课，也是自动排课的唯一候选来源；
+ *   · 待排栏（原「已配置课程」，2026-11-26 业主改名）= 全部开课记录都配完、**且本周还没排满**的课，
+ *     也是自动排课的唯一候选来源。已排满的不列卡片，只在池子头 + 栏脚报数；
  *   · 未配置栏 = 没配 / 只配了一部分 / 还没有开课记录的课——只能手动排课。
  *     ★ 业主 11-16 明确：「只有全部配置完成才进已配置」。partial 以前挂在已配置栏里
  *       靠「部分未配」角标提示，看起来像已配置却排不全，语义更乱，现一律归未配置。
  * 栏内筛选与搜索是**各栏独立**的（管理员常在未配置栏里找某门课去补配置，
- * 已配置栏的筛选不该影响它）；外层工具栏的筛选则两栏同时生效，这一层不重复做。
+ * 待排栏的筛选不该影响它）；外层工具栏的筛选则两栏同时生效，这一层不重复做。
  */
 /** 是否算「已配置课程」：配齐了（ready），或旧包拿不到字段时的兜底（unknown） */
 function isCfgReady(cfg: PoolEntry['cfg'] | undefined) {
   return cfg === 'ready' || cfg === 'unknown';
+}
+
+/**
+ * 本周这个教学班是否已经排满（2026-11-26 业主口径）。
+ *
+ * 业主原话：「排过的课为什么还在已配置课程里面」。池子是按周看的待排来源，
+ * 本周该上的节数已经排进课表后，它就不再是「待排」，留在栏里只会让人以为还要再拖一次。
+ *
+ * 三条边界：
+ *   · 未配置的课不按进度剔除——右栏本职是提醒去补教师/节奏/班级，与排没排无关；
+ *   · `weekTarget` 判不出来（旧包、学期没配起点）⇒ 保留，宁多列不藏课；
+ *   · `weekTarget === 0`（本校单双周里本周不上课）⇒ 同样算「没有待排」，一并移出。
+ *     它本来就排不了，留在栏里只能拖出「教师/教室冲突」的报错。
+ */
+function isWeekFilled(e: PoolEntry) {
+  if (!isCfgReady(e.cfg)) return false;
+  if (e.weekTarget === undefined) return false;
+  return (e.weekPlaced ?? 0) >= e.weekTarget;
 }
 const poolConfigured = computed(() => poolEntries.value.filter(e => isCfgReady(e.cfg)));
 const poolUnconfigured = computed(() => poolEntries.value.filter(e => !isCfgReady(e.cfg)));
@@ -1504,6 +1576,15 @@ function groupChips(list: PoolEntry[]): PoolChip[] {
   return out;
 }
 
+/** 本周已排满、因此**不在**「待排课程」栏里的教学班（2026-11-26）。
+ *  单独算出来是为了在池子头上报数——卡片被剔出栏后，管理员第一反应是「课丢了」，
+ *  报一句「另有 N 个本周已排满」就能把疑虑答掉。 */
+const poolWeekDone = computed(() => groupChips(poolConfigured.value.filter(e => isWeekFilled(e))));
+const poolWeekDoneStats = computed(() => ({
+  cards: poolWeekDone.value.length,
+  slots: poolWeekDone.value.reduce((n, c) => n + c.count, 0)
+}));
+
 type PoolColKey = 'configured' | 'unconfigured';
 /** 栏内筛选状态：关键字（课程名 / 教师名）+ 教师下拉 */
 const poolColKeyword = reactive<Record<PoolColKey, string>>({ configured: '', unconfigured: '' });
@@ -1522,19 +1603,23 @@ function matchPoolColumn(e: PoolEntry, col: PoolColKey) {
 
 const poolColumns = computed(() => {
   const total = poolEntries.value.length;
-  const cfgChips = groupChips(poolConfigured.value);
+  // ★ 2026-11-26 业主口径：左栏是「待排」，不是课程清单——本周已排满的教学班（含本周不上课的）
+  //   不再列出，只在池子头上报数（见 poolWeekDoneStats），避免「课怎么没了」的误解。
+  const cfgChips = groupChips(poolConfigured.value.filter(e => !isWeekFilled(e)));
   const unChips = groupChips(poolUnconfigured.value);
   return [
     {
       key: 'configured' as PoolColKey,
-      title: '已配置课程',
-      hint: '教师、排课设置齐（必修课还要面向班级），可自动排课',
+      title: '待排课程',
+      hint: '本周还没排满的教学班，可自动排课或直接拖到课表',
       icon: 'check',
       blank: !total
         ? '本周课程已全部排入课表'
         : cfgChips.length
           ? '没有匹配的课程（清掉栏内搜索/筛选）'
-          : '没有已配置的课——都在右栏，先去补教师 / 排课设置（必修课补班级）',
+          : poolWeekDoneStats.value.cards
+            ? `本周 ${poolWeekDoneStats.value.cards} 个教学班都已排满，没有待排的课`
+            : '没有可自动排的课——都在右栏，先去补教师 / 排课设置（必修课补班级）',
       // 徽标数 = 门（一张卡一门），不是节；节的条数在池子 head 上统一报
       count: cfgChips.length,
       entries: cfgChips.filter(e => matchPoolColumn(e, 'configured'))
@@ -1651,14 +1736,20 @@ const poolGapSummary = computed(() => {
   if (noOffering) parts.push(`无开课记录 ${noOffering} 条`);
   // 各项会重叠（一门课可能同时缺班级与排课设置），不注明的话 16+13 > 19 会让人以为数错了
   const overlap = parts.length > 1 ? '（同一条可能同时缺多项）' : '';
-  return `右栏 ${chips.length} 条未配置：${parts.join(' · ')}${overlap}——补齐后自动进「已配置课程」`;
+  return `右栏 ${chips.length} 条未配置：${parts.join(' · ')}${overlap}——补齐后自动进「待排课程」`;
 });
 
 /** 两栏各多少张卡（池子 head 上一句话报清；拆教学班后一卡 = 一个教学班，与「共 N 个教学班」同一量纲） */
 const poolCfgCounts = computed(() => ({
-  ready: groupChips(poolConfigured.value).length,
+  // 与左栏同口径剔除本周排满的（2026-11-26），否则 head 上的数会比栏里多，看着像丢卡
+  ready: groupChips(poolConfigured.value.filter(e => !isWeekFilled(e))).length,
   unready: groupChips(poolUnconfigured.value).length
 }));
+
+/** head 上的「N 节待排」：扣掉本周已排满的那些签（它们已经不在待排栏里了） */
+const poolPendingSlots = computed(() =>
+  Math.max(0, poolEntries.value.length - poolWeekDoneStats.value.slots)
+);
 
 /** 两栏里被栏内搜索/筛选挡掉的条数（head 上如实报，避免"课怎么少了"） */
 const poolColumnFiltered = computed(() =>
@@ -1715,7 +1806,7 @@ function cfgGapTip(e: PoolEntry): string {
     ? '节奏、教师两项齐备（选修课不要求面向班级）'
     : '节奏、教师、班级三项齐备';
   return (
-    `未配置课程：${parts.join('、')} ⇒ 自动排课不收录（${rule}才进「已配置课程」）；` +
+    `未配置课程：${parts.join('、')} ⇒ 自动排课不收录（${rule}才进「待排课程」）；` +
     '手动排课不受影响。补：课程管理 → 课程详情 → 课程配置 → 该条记录的「编辑教学班」（教师 / 班级 / 节奏都在里面）'
   );
 }
@@ -5637,12 +5728,15 @@ watch(
       <ZkIcon name="undo-2" :size="16" />松手放回待排课程
     </span>
     <div class="pool-head">
-      <span class="card-title"><ZkIcon name="list-checks" :size="16" />待排课程</span>
+      <!-- 卡片标题改「课程池」（2026-11-26）：左栏本身已叫「待排课程」，两处同名会让人
+           以为标题在重复标注同一栏；这块实际是「待排 + 未配置」的合集。 -->
+      <span class="card-title"><ZkIcon name="list-checks" :size="16" />课程池</span>
       <span class="small muted">
         <!-- 计数单位是「教学班」而不是「门课」：2026-11-23 起一门课多个教学班（教师/班级不同）
              会拆成多张卡，写「N 门课」与实际卡数对不上 -->
-        共 {{ poolChipCount }} 个教学班 / {{ poolEntries.length }} 节待排（已配置 {{ poolCfgCounts.ready }} · 未配置
-        {{ poolCfgCounts.unready }}）
+        待排 {{ poolChipCount }} 个教学班 · {{ poolPendingSlots }} 节（可自动排 {{ poolCfgCounts.ready }} · 未配置
+        {{ poolCfgCounts.unready }}）<template v-if="poolWeekDoneStats.cards">
+          · 另有 {{ poolWeekDoneStats.cards }} 个教学班本周已排满</template>
         <template v-if="poolFilterExcluded">· 另有 {{ poolFilterExcluded }} 节被筛选排除</template>
         <template v-if="poolColumnFiltered">· 栏内筛选再挡掉 {{ poolColumnFiltered }} 张</template>
         —— 拖到下方课表格子完成排课
@@ -5789,6 +5883,14 @@ watch(
         <div v-if="col.key === 'configured' && poolGapSummary" class="pool-gap-foot">
           <ZkIcon name="info" :size="12" />
           <span>{{ poolGapSummary }}</span>
+        </div>
+        <!-- 本周已排满的教学班不再列卡片（2026-11-26 业主要求「排过的别留在待排里」）：
+             只报数并指明去哪改，否则管理员第一反应是「这门课丢了」。 -->
+        <div v-if="col.key === 'configured' && poolWeekDoneStats.cards" class="pool-gap-foot">
+          <ZkIcon name="check" :size="12" />
+          <span>
+            本周已排满 {{ poolWeekDoneStats.cards }} 个教学班，已移出待排 —— 要改时间请到右侧课表拖动，或把那一节放回待排
+          </span>
         </div>
       </section>
     </div>
