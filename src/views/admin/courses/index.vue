@@ -1812,6 +1812,15 @@ onMounted(async () => {
                   排课设置：<span style="color: var(--text, #344054)">{{ schedCfgLabel(o) }}</span>
                 </div>
                 <div v-if="schedCfgId === o.offeringId" class="cfg-block">
+                  <!-- 2026-11-26 业主口径：选修课先不开放学生自选 ⇒ 名单只按「面向班级」生成。
+                       不选班级不是「面向全校」，而是这门课没有任何学生（学生端课表也匹配不到）。 -->
+                  <div
+                    v-if="isElectiveType(detailCourse?.courseType) && !(schedCfgForm.clazzIds ?? []).length"
+                    class="small"
+                    style="color: var(--el-color-warning); margin-bottom: 6px"
+                  >
+                    选修课已不开放学生自选：不选班级就没有上课名单，学生也看不到这门课。
+                  </div>
                   <!-- 抽屉只有 ~240px 可用宽，改成单列「定宽标签 + 数字框」网格：
                        填三个值即可，结束周与节次数由总学时自动派生（不再有「按学时算」按钮）。 -->
                   <div class="cfg-grid">
@@ -1829,7 +1838,7 @@ onMounted(async () => {
                         clearable
                         class="cfg-num"
                         :loading="pickersLoading"
-                        placeholder="可不选（选修课常不绑班级）"
+                        placeholder="选修课也请选班级：名单按班级生成（学生暂不能自选）"
                       >
                         <el-option v-for="c in clazzPicker" :key="c.value" :label="c.label" :value="c.value" />
                       </el-select>

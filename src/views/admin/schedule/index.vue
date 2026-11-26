@@ -1802,8 +1802,9 @@ function cfgGapTip(e: PoolEntry): string {
   if (gaps.includes('teacher')) parts.push('授课教师未选');
   if (gaps.includes('clazz')) parts.push('面向班级未选');
   // 判定规则随课程性质不同（2026-11-16）：选修课免班级要求，说明里不能再说成「三项齐备」
+  // 2026-11-26 补充：选修课不再开放学生自选，没选班级就没有名单 —— 免的是配置门槛，不是后果
   const rule = isElectiveCourse(e.courseType)
-    ? '节奏、教师两项齐备（选修课不要求面向班级）'
+    ? '节奏、教师两项齐备（选修课不要求面向班级，但没班级就没有学生名单）'
     : '节奏、教师、班级三项齐备';
   return (
     `未配置课程：${parts.join('、')} ⇒ 自动排课不收录（${rule}才进「待排课程」）；` +
