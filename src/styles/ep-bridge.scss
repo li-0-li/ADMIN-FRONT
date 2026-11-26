@@ -109,7 +109,8 @@
   margin-top: calc(-1 * var(--el-dialog-padding-primary, 20px));
   padding: var(--el-dialog-padding-primary, 20px) 0 16px;
   border-bottom: 0;
-  cursor: move;
+  /* EP 自带 cursor: move / :active grabbing，业主明确不要 —— 显式改回普通箭头 */
+  cursor: default;
   -webkit-user-select: none;
   user-select: none;
 }
@@ -124,9 +125,7 @@
   background: var(--border);
 }
 
-.el-dialog.is-draggable .el-dialog__header:active {
-  cursor: grabbing;
-}
+/* 标题栏不做光标提示（业主明确不要四向箭头/抓取手势），保持普通箭头 */
 
 /* 关闭按钮仍是「可点」：手型光标；mousedown 已在 ZkDialog 里拦掉，不会连带拖动 */
 .el-dialog.is-draggable .el-dialog__headerbtn,
