@@ -1438,6 +1438,11 @@ function buildPoolEntries(): PoolEntry[] {
           ...c,
           key: `lesson-${r.scheduleId}`,
           inSchedule: used.has(String(r.courseId)),
+          // 整学期进度（2026-11-27 修）：放回签原来不带这两个字段，`isCourseDone` 永远判 false，
+          // 于是一旦某门课留过一条软删残影签、而它整学期课时又已经排完，这张签就会**永久挂在待排栏**
+          // （实测 3 门选修：16/16 已排，却仍显示「本周还没排满」，点排到本周后端幂等跳过、纹丝不动）。
+          totalLessons: Number(offs?.[0]?.totalLessons ?? 0) || undefined,
+          scheduleCount: Number(offs?.[0]?.scheduleCount ?? 0),
           cfg: v.cfg,
           cfgGaps: v.gaps,
           missingRhythm: v.missingRhythm,
