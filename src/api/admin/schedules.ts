@@ -203,6 +203,9 @@ export async function autoArrange(body: AutoArrangeBody) {
   >({
     url: `${SCHEDULE_BASE}/auto-arrange`,
     method: 'post',
+    // 2026-11-27：自动排课是长任务（整学期逐周铺课），实测单教学班可达 60~90 秒，
+    // 沿用全局 30 秒必然 timeout。这里单独放宽到 3 分钟；失败由页面逐条报「未排入」。
+    timeout: 180000,
     data: {
       ...(body.offeringId !== undefined ? { offeringId: String(body.offeringId) } : {}),
       ...(body.courseId !== undefined ? { courseId: String(body.courseId) } : {}),
