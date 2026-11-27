@@ -3543,6 +3543,8 @@ async function applyOfferingToForm(o: OfferingBrief) {
   cfgBackfilling.value = true;
   repeatForm.weekFrom = Number(o.weekFrom ?? 1);
   repeatForm.weekly = Math.max(1, Number(o.lessonsPerWeek ?? 1));
+  // 逐节单双周回填（2026-11-27）：库里存的是逗号串（all,even），第 i 项 = 每周第 i 节
+  cfgPatterns.value = patternsOf(repeatForm.weekly, String(o.weekPatterns ?? '').split(','));
   repeatForm.weekTo = Math.min(createWeekMax.value, repeatForm.weekFrom + Number(o.weekCount ?? 1) - 1);
   if (o.totalLessons) repeatForm.total = Number(o.totalLessons);
   await nextTick();
@@ -3559,6 +3561,8 @@ async function loadConfigOffering() {
   formClazzNames.value = [];
   // 学时输入框以课程总览现值起算（换课后重置，不带上一门课的输入）
   cfgHoursInput.value = cfgOverviewHours.value || null;
+  // 逐节单双周也随课程/教学班重来，避免把上一门课的节奏带过来
+  cfgPatterns.value = [];
   if (!form.courseId || createPresetCell.value) return;
   try {
     const list = (await listCourseOfferings(form.courseId)) ?? [];
@@ -3598,6 +3602,8 @@ function startNewConfigOffering() {
   formClazzNames.value = [];
   form.clazzName = '';
   form.teacherId = '';
+  // 新教学班的节奏从「每周」起步，不继承上一条的隔周方案
+  cfgPatterns.value = patternsOf(cfgPerWeek.value);
 }
 
 /** 「课程配置」保存（2026-11-17 业主终口径）：只存配置不进课表。 */
@@ -3620,7 +3626,7 @@ async function submitConfigOnly() {
   // 放在「选课/选教师」之前：这是纯节奏问题，先让用户把节奏调对，别再依次报一串必填。
   if (cfgOverflowLessons.value > 0) {
     ElMessage.warning(
-      `本课 ${cfgCourseHours.value} 学时（${cfgLessonCount.value} 节次）在本学期排不下：第 ${repeatForm.weekFrom}~${cfgWeekTo.value} 周最多 ${cfgPerWeek.value * (cfgWeekTo.value - repeatForm.weekFrom + 1)} 节次，还差 ${cfgOverflowLessons.value} 节次——请加大每周节数，或把起始周提前`
+      `本课 ${cfgCourseHours.value} 学时（${cfgLessonCount.value} 节次）在本学期排不下：第 ${repeatForm.weekFrom}~${cfgWeekTo.value} 周最多 ${cfgWindowCapacity.value} 节次，还差 ${cfgOverflowLessons.value} 节次——请加大每周节数、把隔周节次改回「每周」，或把起始周提前`
     );
     return;
   }
@@ -3688,12 +3694,16 @@ async function submitConfigOnly() {
       weekCount: number;
       lessonsPerWeek: number;
       totalLessons?: number | null;
+      weekPatterns?: Array<'all' | 'odd' | 'even'>;
       teacherId?: string;
       clazzIds?: string[];
     } = {
       weekFrom: repeatForm.weekFrom,
       weekCount,
       lessonsPerWeek,
+      // 逐节单双周（2026-11-27）：长度按每周节数归一，全「每周」也照传——业主在这个弹窗里改过的节奏要落库，
+      // 否则「单周 1 节 / 双周 2 节」只存在于课程总览那条入口，排课这边保存一次就被覆盖回每周。
+      weekPatterns: normalizeCfgPatterns(lessonsPerWeek),
       // 2026-11-20：总节次 = ⌈课程学时 ÷ 2⌉（学时来自课程总览，只读），不再取用户手填值
       totalLessons: cfgLessonCount.value
     };
@@ -3732,7 +3742,7 @@ async function submitConfigOnly() {
     const teachingTouched = !!(payload.teacherId || payload.clazzIds);
     ElMessage.success(
       configExisting.value
-        ? `配置已更新（第 ${repeatForm.weekFrom}~${repeatForm.weekTo} 周 · 每周 ${lessonsPerWeek} 节）${
+        ? `配置已更新（第 ${repeatForm.weekFrom}~${repeatForm.weekTo} 周 · ${cfgRhythmText(lessonsPerWeek)}）${
             hoursSynced ? '；学时已同步到课程总览' : ''
           }${teachingTouched ? '；教师/班级变更已同步到已排课次' : ''}`
         : `课程配置已保存${hoursSynced ? '；学时已同步到课程总览' : ''}`
@@ -4421,6 +4431,66 @@ const effectiveRepeatTimes = computed(() => {
  *   · 学时留空 ⇒ 不派生、拦保存
  * ★ 拖拽排课模式（createPresetCell）不参与：那里总课时仍是用户手填，口径不变。 */
 const cfgPerWeek = computed(() => Math.max(1, Math.round(Number(repeatForm.weekly) || 1)));
+/**
+ * 逐节单双周（2026-11-27 业主：单周 1 节、双周 2 节。
+ * 口径与课程总览「编辑教学班」完全一致：第 i 项 = 每周第 i 节，all/odd/even。
+ * 原来这个弹窗只有「每周 N 节」一个整数，设 1 就报「16 周最多 16 节次，还差 8 节次」，
+ * 一套「单周 1 双周 2」的节奏在这里根本表达不出来。保存时写进 course_offering.week_patterns。
+ */
+const cfgPatterns = ref<Array<'all' | 'odd' | 'even'>>([]);
+/** 纯函数版：按长度补齐/截断逐节方案（computed 里不能改响应式状态，用这个） */
+function patternsOf(len: number, src: readonly string[] = cfgPatterns.value) {
+  const out: Array<'all' | 'odd' | 'even'> = [];
+  for (let i = 0; i < Math.max(1, len); i++) {
+    const v = String(src[i] ?? '').trim().toLowerCase();
+    out.push(v === 'odd' || v === 'even' ? v : 'all');
+  }
+  return out;
+}
+/** 把逐节方案对齐到当前每周节数（改「每周节数」后多余的截掉、缺的补「每周」） */
+function normalizeCfgPatterns(len = cfgPerWeek.value) {
+  const out = patternsOf(len);
+  if (out.join(',') !== cfgPatterns.value.join(',')) cfgPatterns.value = out;
+  return out;
+}
+/** 改第 i 节的重复方式（每周/单周/双周）⇒ 结束周与「还差多少节次」立刻重算 */
+function setCfgPattern(i: number, v: string) {
+  const out = patternsOf(cfgPerWeek.value);
+  if (i >= 0 && i < out.length) out[i] = v === 'odd' || v === 'even' ? v : 'all';
+  cfgPatterns.value = out;
+  syncCfgWeekToFromLessons();
+}
+/** 节奏文案（2026-11-27）：全「每周」写「每周 2 节」；有隔周就写成「每周 2 节（1 节每周 · 1 节双周）」，
+ *  否则保存成功的提示只说「每周 2 节」，业主看不出自己刚设的单双周有没有存上。 */
+function cfgRhythmText(perWeek = cfgPerWeek.value, pats: readonly string[] = cfgPatterns.value) {
+  const arr = patternsOf(perWeek, pats);
+  const odd = arr.filter(p => p === 'odd').length;
+  const even = arr.filter(p => p === 'even').length;
+  if (!odd && !even) return `每周 ${perWeek} 节`;
+  const bits: string[] = [];
+  const allN = perWeek - odd - even;
+  if (allN > 0) bits.push(`${allN} 节每周`);
+  if (odd) bits.push(`${odd} 节单周`);
+  if (even) bits.push(`${even} 节双周`);
+  return `每周 ${perWeek} 节（${bits.join(' · ')}）`;
+}
+/** 某周按逐节方案实际排几节（单周只上 all+odd，双周只上 all+even） */
+function activeSlotsOf(weekNo: number, pats: readonly string[]) {
+  const isOdd = weekNo % 2 === 1;
+  let n = 0;
+  for (let i = 0; i < cfgPerWeek.value; i++) {
+    const p = pats[i] || 'all';
+    if (p === 'all' || (p === 'odd' && isOdd) || (p === 'even' && !isOdd)) n += 1;
+  }
+  return n;
+}
+/** from~to 周的容量：**逐周累加**（有单双周时每周节数不同，「每周节数 × 周数」会算错） */
+function cfgCapacity(from: number, to: number, pats: readonly string[] = cfgPatterns.value) {
+  let n = 0;
+  for (let w = Math.max(1, from); w <= to; w++) n += activeSlotsOf(w, pats);
+  return n;
+}
+
 /** 学时输入（2026-11-20 业主终口径：**可编辑**——保存时若与课程总览不一致，同步回课程总览） */
 const cfgHoursInput = ref<number | null>(null);
 /** 课程总览当前学时（只用于展示「总览原设置 N 学时」的参照） */
@@ -4435,10 +4505,22 @@ const cfgCourseHours = computed(() =>
 const cfgHoursKnown = computed(() => cfgCourseHours.value > 0);
 /** 学时换算成节次：1 节次 = 110 分钟 = 2 学时（未填学时 = 0，不参与派生） */
 const cfgLessonCount = computed(() => (cfgHoursKnown.value ? Math.ceil(cfgCourseHours.value / 2) : 0));
-/** 铺完这些节次需要几周（学时未知 = 0，不派生） */
-const cfgWeeksNeeded = computed(() =>
-  cfgLessonCount.value > 0 ? Math.max(1, Math.ceil(cfgLessonCount.value / cfgPerWeek.value)) : 0
-);
+/** 铺完这些节次需要几周（学时未知 = 0，不派生）。
+ *  ★ 2026-11-27：有单双周时每周节数是浮动的，只能从起始周起**逐周累加**到够数，
+ *    不能再「⌈节次 ÷ 每周节数⌉」——那会把「单周 1 双周 2」的 24 节次算成 12 周。 */
+const cfgWeeksNeeded = computed(() => {
+  if (cfgLessonCount.value <= 0) return 0;
+  const wf = Math.max(1, Math.round(Number(repeatForm.weekFrom) || 1));
+  const pats = patternsOf(cfgPerWeek.value);
+  let acc = 0;
+  let w = wf;
+  while (w <= createWeekMax.value) {
+    acc += activeSlotsOf(w, pats);
+    if (acc >= cfgLessonCount.value) break;
+    w += 1;
+  }
+  return Math.max(1, Math.min(createWeekMax.value, w) - wf + 1);
+});
 /** 派生结束周（已按学期/教学周上限收敛；学时未知时保持当前值不动） */
 const cfgWeekTo = computed(() => {
   if (cfgWeeksNeeded.value <= 0) return Math.max(1, Math.round(Number(repeatForm.weekTo) || 1));
@@ -4449,9 +4531,16 @@ const cfgWeekTo = computed(() => {
 const cfgOverflowLessons = computed(() => {
   if (cfgLessonCount.value <= 0) return 0;
   const wf = Math.max(1, Math.round(Number(repeatForm.weekFrom) || 1));
-  const capacity = Math.max(0, cfgWeekTo.value - wf + 1) * cfgPerWeek.value;
+  const capacity = cfgCapacity(wf, cfgWeekTo.value);
   return Math.max(0, cfgLessonCount.value - capacity);
 });
+/** 当前窗口能排下多少节次（逐节单双周口径；红字与拦截文案共用，避免两处各算一遍） */
+const cfgWindowCapacity = computed(() =>
+  cfgCapacity(
+    Math.max(1, Math.round(Number(repeatForm.weekFrom) || 1)),
+    cfgWeekTo.value
+  )
+);
 /** 已有配置回填期间暂停派生（否则回填出来的原样窗口会被「按课时重算」改掉） */
 const cfgBackfilling = ref(false);
 /** 「每周节数」上限（2026-11-20 业主：取消写死的 5 节）：
@@ -4504,6 +4593,7 @@ function syncCfgWeekToFromLessons() {
 /** 每周节数变化：拖拽模式把总课时补到满额；配置模式学时固定、只重算结束周 */
 function syncRepeatTotal() {
   if (!createPresetCell.value) {
+    normalizeCfgPatterns();
     syncCfgWeekToFromLessons();
     return;
   }
@@ -6868,6 +6958,27 @@ watch(
           {{ createCfgWeekLessons }}（第 2 节起需指定星期），或分多次拖到别的格子。
         </div>
       </el-form-item>
+      <!-- 逐节单双周（2026-11-27 业主：要排「单周 1 节、双周 2 节」的课）：
+           口径与课程总览「编辑教学班」完全一致——每周第 i 节单独定 每周/单周/双周。
+           单周 = 学期第 1、3、5… 周，双周 = 第 2、4、6… 周；结束周与容量按逐周累加算，
+           不再用「每周节数 × 周数」（那会把 24 节次算成 16 节次、报「还差 8 节次」）。 -->
+      <el-form-item v-if="!createPresetCell && cfgPerWeek > 1" label="单双周">
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap">
+          <div v-for="i in cfgPerWeek" :key="'cfg-pat-' + i" style="display: flex; align-items: center; gap: 4px">
+            <span class="small muted">第{{ i }}节</span>
+            <el-select
+              :model-value="cfgPatterns[i - 1] || 'all'"
+              style="width: 92px"
+              @update:model-value="(v: string) => setCfgPattern(i - 1, v)"
+            >
+              <el-option label="每周" value="all" />
+              <el-option label="单周" value="odd" />
+              <el-option label="双周" value="even" />
+            </el-select>
+          </div>
+          <span class="small muted">单周 1 节 / 双周 2 节 = 第 1 节「每周」+ 第 2 节「双周」</span>
+        </div>
+      </el-form-item>
       <el-form-item
         v-for="(s, i) in extraSlotList"
         :key="'extra-slot-' + i"
@@ -6967,7 +7078,7 @@ watch(
             <span v-if="cfgOverviewHours > 0" class="small muted">总览原设置 {{ cfgOverviewHours }} 学时</span>
             <span v-if="cfgOverflowLessons > 0" class="small" style="color: var(--error, #d92d20)">
               第 {{ repeatForm.weekFrom }}~{{ cfgWeekTo }} 周最多排
-              {{ cfgPerWeek * (cfgWeekTo - repeatForm.weekFrom + 1) }} 节次，还差 {{ cfgOverflowLessons }} 节次
+              {{ cfgWindowCapacity }} 节次，还差 {{ cfgOverflowLessons }} 节次
             </span>
           </template>
           <span v-else class="small muted">未填写</span>
