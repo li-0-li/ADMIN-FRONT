@@ -173,13 +173,14 @@ export interface AutoArrangeBody {
   /** 与 weekFrom 配用；缺省 1 */
   weekCount?: number;
   /**
-   * 排课规则开关（2026-11-27 业主「规则我自己选」）：不传 = 全部开启（后端 null 视为开启）。
-   * 只有 requiredNoEvening 是硬约束（候选节次里摘掉 9-10 节），其余都是软偏好、排不满时会让步。
+   * 排课规则开关（2026-11-27 后端能力）：不传 = 全部开启（后端 null 视为开启）。
+   * ★ 前端弹窗已按业主要求撤掉勾选（2026-11-27「算了，规则不在里面选了」），
+   *   目前**不传**这个字段，规则固定全开；保留类型供其它端/后续需要时直传。
    */
   rules?: AutoArrangeRules;
 }
 
-/** 自动排课的六条规则（弹窗里逐条勾选，直接影响后端四轮铺课的放宽策略） */
+/** 自动排课的软规则开关（后端四轮铺课的放宽策略，可选；前端当前不传 = 全开） */
 export interface AutoArrangeRules {
   /** 必修课不排晚课（9-10 节） */
   requiredNoEvening?: boolean;
