@@ -758,7 +758,32 @@ function syncQueryState() {
   if (onlyConflicts.value) next.conflict = '1';
   if (viewMode.value) next.view = viewMode.value;
   if (rosterFocus.value) next.focus = rosterFocus.value;
-  void router.replace({ query: next });
+  /* 2026-11-27 业主反馈：点「上一周」页面就跳回顶部。
+   * 原因不在本页：翻周会把 week 写进 URL（router.replace），而 `src/router/index.ts`
+   * 的 `scrollBehavior` 固定返回 `{ left: 0, top: 0 }`（该文件注明禁改），于是每次
+   * 导航都把窗口拉回顶部——站在第 5~10 节看课时，翻一周就得重新滚一次。
+   * 做法：记住切走时的位置，导航结束后还回去。
+   * ★ 时机只能落在宏任务上（setTimeout），两种更"快"的写法实测都不行：
+   *   - `nextTick`/`.then` 微任务：vue-router 的滚动也在微任务里应用，此时 scrollY
+   *     还是旧值 ⇒ 判"没变化"直接跳过，紧接着它才把页面拉回 0；
+   *   - `requestAnimationFrame`：标签页在后台/不可见时**永不触发**（实测 visibility
+   *     为 hidden 时 300ms 都不回调），用户切回来一看已经回到顶部。
+   *   setTimeout(0) 排在微任务之后、通常赶在同一帧绘制前 ⇒ 用户看不到跳动；
+   *   80ms 那次只是兜底（万一首帧已绘制）。两次都是幂等的"位置不对才写"。 */
+  const keepY = window.scrollY;
+  void router
+    .replace({ query: next })
+    .then(() => {
+      if (keepY <= 0) return;
+      const restore = () => {
+        if (Math.abs(window.scrollY - keepY) > 1) window.scrollTo({ top: keepY });
+      };
+      setTimeout(restore, 0);
+      setTimeout(restore, 80);
+    })
+    .catch(() => {
+      /* 导航被取消/重复 replace 时忽略：位置由下一次成功的导航自己还原 */
+    });
 }
 applyQueryState();
 watch([weekStart, filters, onlyConflicts, viewMode, rosterFocus], syncQueryState, { deep: true });
