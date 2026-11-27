@@ -259,6 +259,11 @@ export interface OfferingBrief {
   /** 一共多少课时（节次口径；null = 按周数×每周节次自然铺满；2026-11-17 配置弹窗回填用） */
   totalLessons?: number | null;
   /**
+   * 该开课名下**已排的课次数**（`schedule.offering_id` 且 deleted=0，后端 T-01 起就下发）。
+   * 2026-11-27 用：与 `totalLessons` 比出「整学期课时是否已排完」——已上完的课不该再挂在待排池。
+   */
+  scheduleCount?: number | null;
+  /**
    * 逐节单双周（`course_offering.week_patterns`，2026-11-19）：逗号分隔的 all/odd/even，
    * 第 i 项 = 每周第 i 节。自动排课弹窗据此回填上次选的隔周方案。
    */

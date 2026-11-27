@@ -1239,6 +1239,19 @@ interface PoolEntry extends CourseBrief {
    * `undefined` = 节奏/周号判不出来（旧包、学期没配起点）⇒ 不据此剔除，宁多列不藏课。
    */
   weekTarget?: number;
+  /**
+   * 该教学班整学期的排课进度（2026-11-27）。
+   *
+   * `totalLessons` = 配好的总课时（节次口径），`scheduleCount` = 已排课次数
+   * （后端 `AdminOfferingVo.scheduleCount`，按 offering_id 数 deleted=0 的行）。
+   *
+   * 用途：判「这门课这学期是不是已经上完了」。48 学时 = 24 节次、每周 2 节 ⇒ 第 12 周就结课，
+   * 但 `weekTarget` 只按「本周该上几节」算，第 13 周之后照样判「本周没排满」，于是这些已经
+   * 结课的班长期挂在待排栏；点「自动排课」后端走 `已达总课时` 幂等跳过，排完数字纹丝不动
+   * ——业主实测「这 35 节排了一次怎么还是 35 节」就是它。
+   */
+  totalLessons?: number;
+  scheduleCount?: number;
 }
 
 /**
@@ -1360,6 +1373,9 @@ function buildPoolEntries(): PoolEntry[] {
           weekPlaced: seat,
           // 本周应排几节（单双周口径）：与 weekPlaced 比出「是否已排满」，排满的移出待排栏
           weekTarget: weekSlotsOf(o, browsedWeekNo.value),
+          // 整学期进度（2026-11-27）：总课时与已排节数，用来判「这门课是不是已经上完」
+          totalLessons: Number(o.totalLessons ?? 0) || undefined,
+          scheduleCount: Number(o.scheduleCount ?? 0),
           cfg: v.cfg,
           cfgGaps: v.gaps,
           missingRhythm: v.missingRhythm
@@ -1448,6 +1464,9 @@ function buildPoolEntries(): PoolEntry[] {
         weekPlaced: seat,
         // 单教学班的课：节奏取它唯一那条配置（明细没拉到 ⇒ undefined，卡片继续留在待排栏）
         weekTarget: weekSlotsOf(offs?.[0], browsedWeekNo.value),
+        // 整学期进度（2026-11-27）：明细没拉到就不判「已上完」，宁多列不藏课
+        totalLessons: Number(offs?.[0]?.totalLessons ?? 0) || undefined,
+        scheduleCount: Number(offs?.[0]?.scheduleCount ?? 0),
         cfg: v.cfg,
         cfgGaps: v.gaps,
         missingRhythm: v.missingRhythm
@@ -1565,8 +1584,26 @@ function isCfgReady(cfg: PoolEntry['cfg'] | undefined) {
  *   · `weekTarget === 0`（本校单双周里本周不上课）⇒ 同样算「没有待排」，一并移出。
  *     它本来就排不了，留在栏里只能拖出「教师/教室冲突」的报错。
  */
+
+/**
+ * 这个教学班整学期的课时是否已经排满（2026-11-27）。
+ *
+ * `scheduleCount` 是后端按 offering 数出来的已排课次数，`totalLessons` 是配置的总课时；
+ * 两者齐备且已排 ≥ 总课时 ⇒ 本学期这门课已经上完，后续周次本来就没有课。
+ * 拿不到其一（旧包不给 scheduleCount / 没配总课时）一律判 false —— 宁可多列，不藏课。
+ */
+function isCourseDone(e: PoolEntry) {
+  const total = Number(e.totalLessons ?? 0);
+  const done = Number(e.scheduleCount ?? 0);
+  return total > 0 && done >= total;
+}
+
 function isWeekFilled(e: PoolEntry) {
   if (!isCfgReady(e.cfg)) return false;
+  // 整学期课时已经排满 ⇒ 这门课本学期上完了，本周本来就没课，不该再算「待排」（2026-11-27）。
+  // 判据优先于周内节数：总课时 24 节 × 每周 2 节 = 12 周上完，第 13 周起 weekTarget 仍是 2、
+  // weekPlaced 是 0，只看这两个数会永远判「没排满」，课就永远赖在待排栏里。
+  if (isCourseDone(e)) return true;
   if (e.weekTarget === undefined) return false;
   return (e.weekPlaced ?? 0) >= e.weekTarget;
 }
@@ -1613,6 +1650,14 @@ const poolWeekDoneStats = computed(() => ({
   cards: poolWeekDone.value.length,
   slots: poolWeekDone.value.reduce((n, c) => n + c.count, 0)
 }));
+/**
+ * 上面那批「已移出待排」里，有多少是**整学期课时已排完**（2026-11-27）。
+ * 单独报数是因为两者性质不同：一个是「本周排满了、下周还要上」，一个是「这门课上完了」；
+ * 混成一句「本周已排满」会让管理员以为下周还得回来排它。
+ */
+const poolCourseDoneCards = computed(
+  () => groupChips(poolConfigured.value.filter(e => isCourseDone(e))).length
+);
 
 type PoolColKey = 'configured' | 'unconfigured';
 /** 栏内筛选状态：关键字（课程名 / 教师名）+ 教师下拉 */
@@ -1647,7 +1692,7 @@ const poolColumns = computed(() => {
         : cfgChips.length
           ? '没有匹配的课程（清掉栏内搜索/筛选）'
           : poolWeekDoneStats.value.cards
-            ? `本周 ${poolWeekDoneStats.value.cards} 个教学班都已排满，没有待排的课`
+            ? `本周 ${poolWeekDoneStats.value.cards} 个教学班都已排满或已结课，没有待排的课`
             : '没有可自动排的课——都在右栏，先去补教师 / 排课设置（必修课补班级）',
       // 徽标数 = 门（一张卡一门），不是节；节的条数在池子 head 上统一报
       count: cfgChips.length,
@@ -4768,7 +4813,10 @@ const autoIncludeScheduled = ref(false);
  */
 const autoEntries = computed(() =>
   poolEntries.value
-    .filter(e => (autoIncludeScheduled.value || !e.inSchedule) && isCfgReady(e.cfg))
+    // ★ 2026-11-27：整学期课时已排满的教学班不进候选 —— 后端对这种班会直接
+    //   「已达总课时 N 节，剩余 X 周不再排」幂等跳过，列在弹窗里只会让人以为
+    //   「勾了 35 条却一条没排进去」。业主实测「排了一次还是 35 节」就是这个。
+    .filter(e => !isCourseDone(e) && (autoIncludeScheduled.value || !e.inSchedule) && isCfgReady(e.cfg))
     .sort((a, b) => (isElectiveCourse(a.courseType) ? 1 : 0) - (isElectiveCourse(b.courseType) ? 1 : 0))
 );
 /** 被护栏挡下的签数（设置视图上说明，不静默吞） */
@@ -5773,7 +5821,8 @@ watch(
              会拆成多张卡，写「N 门课」与实际卡数对不上 -->
         待排 {{ poolChipCount }} 个教学班 · {{ poolPendingSlots }} 节（可自动排 {{ poolCfgCounts.ready }} · 未配置
         {{ poolCfgCounts.unready }}）<template v-if="poolWeekDoneStats.cards">
-          · 另有 {{ poolWeekDoneStats.cards }} 个教学班本周已排满</template>
+          · 另有 {{ poolWeekDoneStats.cards }} 个教学班不在待排<template v-if="poolCourseDoneCards">（其中
+          {{ poolCourseDoneCards }} 个整学期课时已排完）</template></template>
         <template v-if="poolFilterExcluded">· 另有 {{ poolFilterExcluded }} 节被筛选排除</template>
         <template v-if="poolColumnFiltered">· 栏内筛选再挡掉 {{ poolColumnFiltered }} 张</template>
         —— 拖到下方课表格子完成排课
@@ -5926,7 +5975,7 @@ watch(
         <div v-if="col.key === 'configured' && poolWeekDoneStats.cards" class="pool-gap-foot">
           <ZkIcon name="check" :size="12" />
           <span>
-            本周已排满 {{ poolWeekDoneStats.cards }} 个教学班，已移出待排 —— 要改时间请到右侧课表拖动，或把那一节放回待排
+            {{ poolWeekDoneStats.cards }} 个教学班不在待排（本周已排满<template v-if="poolCourseDoneCards">或整学期课时已排完</template>）—— 要改时间请到右侧课表拖动，或把那一节放回待排
           </span>
         </div>
       </section>
