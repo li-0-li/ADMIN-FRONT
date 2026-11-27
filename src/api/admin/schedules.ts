@@ -172,6 +172,29 @@ export interface AutoArrangeBody {
   weekFrom?: number;
   /** 与 weekFrom 配用；缺省 1 */
   weekCount?: number;
+  /**
+   * 排课规则开关（2026-11-27 业主「规则我自己选」）：不传 = 全部开启（后端 null 视为开启）。
+   * 只有 requiredNoEvening 是硬约束（候选节次里摘掉 9-10 节），其余都是软偏好、排不满时会让步。
+   */
+  rules?: AutoArrangeRules;
+}
+
+/** 自动排课的六条规则（弹窗里逐条勾选，直接影响后端四轮铺课的放宽策略） */
+export interface AutoArrangeRules {
+  /** 必修课不排晚课（9-10 节） */
+  requiredNoEvening?: boolean;
+  /** 同一门课同一天只排一节 */
+  avoidSameDay?: boolean;
+  /** 同一门课不排连续两天的同一节 */
+  avoidCourseConsecDay?: boolean;
+  /** 同一门课同天连排时尽量不相邻 */
+  avoidCourseAdjacent?: boolean;
+  /** 教师不连堂 */
+  avoidTeacherAdjacent?: boolean;
+  /** 教师不连续两天早八 */
+  avoidTeacherConsecFirst?: boolean;
+  /** 教师当天课时软上限 */
+  avoidTeacherDayCap?: boolean;
 }
 export async function autoArrange(body: AutoArrangeBody) {
   return request<
@@ -191,7 +214,8 @@ export async function autoArrange(body: AutoArrangeBody) {
       ...(body.weekCount !== undefined ? { weekCount: body.weekCount } : {}),
       ...(body.preferredClassroomId !== undefined && body.preferredClassroomId !== ''
         ? { preferredClassroomId: String(body.preferredClassroomId) }
-        : {})
+        : {}),
+      ...(body.rules ?? {})
     }
   });
 }

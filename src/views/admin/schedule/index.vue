@@ -4752,6 +4752,28 @@ const autoReport = ref<AutoReport | null>(null);
  * 真实需求如果是「整门课换时间」，正确操作是把该课全部节次放回（used 里没它了 → inSchedule 自动变 false）。
  */
 const autoIncludeScheduled = ref(false);
+
+/**
+ * 自动排课规则（2026-11-27 业主「规则我自己选」）：弹窗里逐条勾选，直传后端四轮铺课。
+ * 全部默认开启；只有「必修不排晚课」是硬约束，其余关掉就等于该规则永不生效，
+ * 开启的仍然「先按规则试、排不满再逐轮让步」。
+ */
+const autoRules = reactive({
+  /** 必修课不排晚课（9-10 节） */
+  requiredNoEvening: true,
+  /** 同一门课同一天只排一节 */
+  avoidSameDay: true,
+  /** 同一门课不排连续两天的同一节 */
+  avoidCourseConsecDay: true,
+  /** 同一门课同天连排时尽量不相邻 */
+  avoidCourseAdjacent: true,
+  /** 教师不连堂 */
+  avoidTeacherAdjacent: true,
+  /** 教师不连续两天早八 */
+  avoidTeacherConsecFirst: true,
+  /** 教师当天课时软上限 */
+  avoidTeacherDayCap: true
+});
 /**
  * 本次自动排课实际参与的签。
  * ★ 2026-11-16 业主口径：**只收「已配置课程」**（开课记录全部配齐，见 `isCfgReady`）。
@@ -5114,7 +5136,9 @@ async function runAuto() {
           // 这样把某门课从「隔周」改回「每周」后重排，后端才会覆盖掉上次存的方案。
           weekPatterns: autoPatterns[e.key]?.length ? autoPatterns[e.key] : undefined,
           // 只排当前学期（2026-11-13）：不传时后端也会排除已结束学期，但显式传更准
-          termId: filters.termId || currentTermId.value || undefined
+          termId: filters.termId || currentTermId.value || undefined,
+          // 排课规则（2026-11-27 业主「规则我自己选」）：逐条开关直传后端，null 视为开启
+          rules: { ...autoRules }
         });
         for (const r of rows ?? []) {
           const name = r.courseName || e.courseName;
@@ -6960,19 +6984,22 @@ watch(
   <!-- 自动排课（批次2 统一口径）：逐门调后端 auto-arrange（幂等），结束出报告 -->
   <el-dialog draggable v-model="autoVisible" title="自动排课" width="560px" :close-on-click-modal="!autoRunning">
     <template v-if="!autoReport">
-      <p class="small" style="margin-top: 0">把「待排课程」排进空位；<b>课表上已有的课不动</b>。</p>
-      <!-- 排课规则说明（2026-11-02，第六版）：历次反馈「模糊 → 罗嗦 → AI 味 → 长句 → 再精简」。
-           本版只留动作，形容词与限定词全部去掉（「可选时段最少」→「时段最少」、「挑时段和教室」→
-           「找空档」、「最合适的」→「按人数挑」、「单独列出原因」→「列出原因」）。权重仍挂 title 悬停。 -->
-      <p class="small muted" style="margin: 6px 0 2px; line-height: 1.75">
-        逐门交给后端统一排课引擎铺满本学期：教师时间冲突、教室占用、授课资格都在后端校验；
-        已有课次的周自动跳过（重复执行不产生重复课）。排不上的周会在结果里列出原因。
-      </p>
-      <!-- 时段偏好（2026-11-26 业主口径）：必修禁晚课是硬约束、其余是尽量，必须写在开跑之前 -->
-      <p class="small muted" style="margin: 0 0 2px; line-height: 1.75">
-        <b>必修课先排、且不排晚课（9-10 节）</b>；选修课尽量排白天，白天占满时才用晚课兜底。
-        同一门课尽量不排到连续两天的同一节（只是尽量，排不下时会让步）。
-      </p>
+      <!-- 2026-11-27 业主：顶部那几段说明「太影响美观」全部去掉，改成逐条可勾选的规则（业主：规则我自己选）。
+           勾选 = 这条规则生效；取消勾选 = 四轮铺课里都不用它。只有「必修不排晚课」是硬约束。 -->
+      <div class="detail-row" style="margin-top: 0">
+        <span class="detail-k">规则</span>
+        <div style="flex: 1; min-width: 0">
+          <div class="rule-chips">
+            <el-checkbox v-model="autoRules.requiredNoEvening" size="small" border>必修不排晚课</el-checkbox>
+            <el-checkbox v-model="autoRules.avoidSameDay" size="small" border>同课一天一节</el-checkbox>
+            <el-checkbox v-model="autoRules.avoidCourseConsecDay" size="small" border>不连续两天同节</el-checkbox>
+            <el-checkbox v-model="autoRules.avoidCourseAdjacent" size="small" border>同课不连排</el-checkbox>
+            <el-checkbox v-model="autoRules.avoidTeacherAdjacent" size="small" border>教师不连堂</el-checkbox>
+            <el-checkbox v-model="autoRules.avoidTeacherConsecFirst" size="small" border>教师不连日早八</el-checkbox>
+            <el-checkbox v-model="autoRules.avoidTeacherDayCap" size="small" border>教师日课时上限</el-checkbox>
+          </div>
+        </div>
+      </div>
       <!-- 外层筛选对候选课的作用（2026-11-03 业主需求：被筛选排除的课不参与自动排课）。
            必须显式报数：筛了某门课/某位老师后候选只剩 1~2 条，不提示会以为要排的课本来就这么少，
            排完就当排完了。这里同时给一个就地清筛选的出口。
@@ -7025,10 +7052,7 @@ watch(
            避免「排完才发现只覆盖一半学期」——原实现从当前浏览周起算、写死 18 周，正是这个坑 -->
       <div class="detail-row">
         <span class="detail-k">范围</span>
-        <div class="small" style="flex: 1; min-width: 0">
-          {{ autoTermRangeLabel }}；每门课按自己的排课设置铺（每周节次、逐节单双周），
-          「同课同天只排一节」只是优先，排不满时才叠到同一天
-        </div>
+        <div class="small" style="flex: 1; min-width: 0">{{ autoTermRangeLabel }}</div>
       </div>
       <!-- 排课规则说明已上移到弹窗开头（紧跟「把待排课程…」那句）：夹在「范围」与「预警」中间会打断信息流 -->
       <!-- 未配置课程（2026-11-16 业主口径）：不进自动排课候选；手动排课照常可用 -->
@@ -8594,6 +8618,29 @@ watch(
   width: 56px;
   color: var(--ink-500);
   flex: none;
+}
+/* 排课规则勾选条（2026-11-27）：一行能放下的就一行，放不下自动换行，不做滚动 */
+.rule-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.rule-chips :deep(.el-checkbox.is-bordered) {
+  margin-right: 0;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 6px;
+}
+.rule-chips :deep(.el-checkbox__label) {
+  font-size: 12px;
+  padding-left: 6px;
+}
+/* 规则对齐用顶对齐，避免复选框和「规则」二字一高一低 */
+.detail-row:has(.rule-chips) {
+  align-items: flex-start;
+}
+.detail-row:has(.rule-chips) > .detail-k {
+  padding-top: 5px;
 }
 /* 参与排课列表头（2026-11-02）：计数靠左、全选/清空靠右，用一条虚线跟列表分开。
    原来两个文字按钮直接跟在计数文本后面，一旦有「未选 N 条」就把按钮挤到第二行。 */
